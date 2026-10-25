@@ -4,6 +4,100 @@
 
 独立项目（原 `paper_downloader/cookie_pool/`，2026-10-25 拆出）：自己的依赖和 venv，配置是项目根目录的 `config.toml`，不依赖 `paper_downloader` 的任何代码，也不用 PostgreSQL。
 
+## 快速开始
+
+需要：Python ≥ 3.11、Redis、一个短效代理提取接口（每次返回一个新 IP，青果格式）。
+
+```bash
+git clone https://github.com/huangpd/PaperLite.git && cd PaperLite
+uv sync                                   # 国内服务器：uv venv && uv pip install -e . --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+cp config.example.toml config.toml        # 填 [proxy] 的提取接口和代理账号密码（config.toml 已在 .gitignore）
+
+# Redis：只监听本机、不落盘（身份 10 分钟就过期，不需要持久化）
+docker run -d --name cf-redis -p 127.0.0.1:6379:6379 redis:latest redis-server --save "" --appendonly no
+
+# 导入并开跑：一个站点一个输出目录，下载完自动退出
+uv run paperlite run --out pdfs/acm --urls data/acm.txt --workers 20
+```
+
+运行中每 30 秒打印一行进度（已处理条数、PDF 篇数、身份池、近 30 秒速度）。随时 Ctrl+C，在途任务会放回 pending，再执行同一条命令就从断点继续。
+
+下面的 `paperlite` 都指项目 venv 里的命令：`uv run paperlite ...`，或先 `source .venv/bin/activate`，或在项目根目录 `python -m paperlite ...`。
+
+## 命令一览
+
+| 命令 | 作用 |
+|---|---|
+| `paperlite import --out <目录> --urls <文件>` | 导入任务。txt 一行一个链接，或带 `pdf_url` 列（可选 `paper_uid` / `source` / `batch_no`）的 CSV。重复导入不重置已有任务；一个库只能有一个主机 |
+| `paperlite run --out <目录> [--urls <文件>] [--workers 20]` | 同进程生产身份 + 下载，下载完退出 |
+| `paperlite produce --out <目录>`（或 `--host dl.acm.org`）`[--keep N]` | 只生产身份，常驻 |
+| `paperlite download --out <目录> [--workers 20]` | 只下载，需有生产者在跑 |
+| `paperlite status --out <目录>` | 各状态数量、失败 / non_pdf 按 `error_kind` 分组、被停卷期、身份池 |
+| `paperlite retry --out <目录> --status failed [--kind network]` | 把失败（或 `non_pdf`）重置为 pending |
+| `paperlite retry --out <目录> --stopped-volumes` | 重新核实按卷期停掉的任务 |
+| `paperlite export --out <目录> [--status non_pdf] [--file x.csv]` | 导出任务表为 CSV（默认输出到标准输出） |
+
+所有命令都支持 `--db <路径>` 单独指定任务库（默认 `<--out>/tasks.db`），`import` / `status` / `retry` / `export` / `produce` 只给 `--db` 也行。全局参数：`--config <文件>`、`--log-level`、`--version`。
+
+## 常见场景
+
+**PDF 存到 goofys / s3fs 等对象存储挂载上**：任务库必须用 `--db` 放本地盘。SQLite 要随机写、文件锁和 mmap，FUSE 挂载不支持；PDF 是顺序写入，可以放在挂载上（每篇最后的改名在 S3 上是一次复制 + 删除）。
+
+```bash
+paperlite run --out /mnt/goofys/acm --db /data/paperlite/acm.db --urls data/acm.txt --workers 20
+paperlite status --db /data/paperlite/acm.db
+```
+
+**后台运行与停止**：
+
+```bash
+setsid nohup .venv/bin/paperlite run --out pdfs/acm --workers 20 > logs/acm.log 2>&1 < /dev/null &
+tail -f logs/acm.log
+kill <pid>                                # 或 pkill -f "paperlite run"
+```
+
+SIGTERM 与 Ctrl+C 一样优雅退出：在途任务放回 pending、在用身份还回池里、生产者关掉浏览器并释放生产者锁。注意 `pkill -f` 的匹配串若也出现在执行它的 shell 命令行里（如 `ssh host '...paperlite run...; pkill -f paperlite'`），会连那个 shell 一起杀掉。
+
+**生产与下载分开跑**：生产者常驻，下载进程随用随开；多台机器的下载进程可以共用一个 Redis（`redis_url` 指向同一台；默认只监听本机，跨机器要改监听地址并加密码）。同一主机同时只有一个生产者干活，多开的待命，前一个退出或崩溃后 15 秒内接手。
+
+**省掉冷启动**：第一个身份要等一次过盾（约 20 秒）。下载前一两分钟先 `paperlite produce --out pdfs/acm --keep 20` 养着身份，代价是没人下载时也在消耗 IP。
+
+**重跑**：`retry --status failed` 重跑失败的（可加 `--kind network` / `challenge_failed` 只重跑某一类）；`retry --stopped-volumes` 让被停掉的卷期重新抽样核实。
+
+**换别的站点**：在 `config.toml` 的 `[landing]` 加一行该主机的落地页（任意会触发挑战的普通页面），`[proxy] check_url` 换成该站可达的地址；`classify.py` 里的 non_pdf 判断是按 ACM 页面写的，换站点要看一下。
+
+## 主要配置（config.toml）
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `[proxy] api_url` / `username` / `password` | | 提取接口与代理鉴权（必填） |
+| `max_browsers` | 20 | 同时过盾的浏览器上限 |
+| `max_identities` / `min_identities` | 20 / 0 | 健康身份上限 / 没人下载时也养着的身份数；实际按在线下载线程数生产 |
+| `pass_timeout_s` / `hedge_after_s` | 90 / 45 | 单次过盾上限 / 过盾超过这么久就另开一个补位 |
+| `request_gap_s` | [3, 5] | 同一 IP 两次请求的随机间隔 |
+| `download_timeout_s` | 120 | 卡顿超时：连续这么久收不到数据才算超时（不限总时长） |
+| `max_file_size_mb` | 200 | 单个 PDF 上限，超过中止 |
+| `max_tries` | 3 | 网络错误重试次数（cookie 被拒不计） |
+| `max_url_challenges` | 3 | 单条 URL 带有效 cookie 仍被挑战满这么多次 → `challenge_failed` |
+| `volume_stop_after` | 3 | 同一卷期接连这么多篇没有 PDF 就停掉该卷期其余任务；0 关闭 |
+| `max_fresh_rejects` / `breaker_pause_s` | 5 / 600 | 新身份接连一用就被拒时熔断暂停生产 |
+| `debug_dir` | 空 | 过盾失败截图目录 |
+
+完整列表和注释见 `config.example.toml`。配置查找顺序：`--config` > 环境变量 `PAPERLITE_CONFIG` > 当前目录的 `config.toml`。
+
+## 速度与 IP 用量（ACM 实测）
+
+- 20 个下载线程：稳定后每分钟处理 120–160 条（PDF 约 140 篇），单篇下载平均 2.6 秒；线程数只影响速度，不影响 IP 用量。
+- 每个身份（IP + cookie）用约 9 分钟，下 60–70 篇；加上过盾失败（成功率 60%–90%），**每 1 万篇约需 180–300 个 IP**。
+- 换成 30 分钟时效的 IP，同样篇数只要约 1/3 的 IP。
+
+## 测试
+
+```bash
+uv run pytest                                              # Redis 相关的会跳过
+PAPERLITE_TEST_REDIS=redis://127.0.0.1:6379/0 uv run pytest   # 连真实 Redis 全跑
+```
+
 ## 为什么这样设计
 
 - **cf_clearance 绑定 IP + UA**：同 IP 带 cookie → 200 PDF；同 IP 不带 cookie → 403；cookie 换到别的 IP → 403。所以身份 = IP + cookie + UA，三者一起存、一起用。
@@ -49,43 +143,6 @@ Redis 键（`{prefix}:{host}:...`）：`id:{id}` 身份 hash（EXPIREAT 到期�
 生产者只看两个数：健康身份数（剩余寿命 > `refill_before_s` 的空闲+占用）和在线下载线程数。所以：
 - 在用身份临近过期前就会开始生产替补，下载线程几乎不空等；
 - 下载结束、线程注销后目标降为 `min_identities`，不再白白过盾。
-
-## 用法
-
-```bash
-cd PaperLite
-uv sync                                               # 或 pip install -e .（国内服务器可加 --index-url 清华源）
-cp config.example.toml config.toml                    # 填 [proxy]，含密码，已在 .gitignore
-
-# Redis（hw1 上已有容器 cf-redis，只监听 127.0.0.1:6379，不落盘）
-docker run -d --name cf-redis -p 127.0.0.1:6379:6379 redis:latest redis-server --save "" --appendonly no
-
-# 1. 导入任务：一个站点一个输出目录；txt 一行一个链接，或带 pdf_url 列（可选 paper_uid/source/batch_no）的 CSV
-paperlite import --out pdfs/acm --urls data/acm.txt
-
-# 2a. 分开跑：生产者常驻，下载进程随用随开
-paperlite produce  --out pdfs/acm            # 或 --host dl.acm.org；--keep N 先养着 N 个身份
-paperlite download --out pdfs/acm --workers 20
-
-# 2b. 一起跑：同进程生产 + 消费，下载完退出（--urls 可顺便导入）
-paperlite run --out pdfs/acm --workers 20
-
-# 3. 查看、重跑、导出
-paperlite status --out pdfs/acm              # 各状态数量、失败/非 PDF 按 error_kind 分组、身份池
-paperlite retry  --out pdfs/acm --status failed [--kind network]   # 或 --stopped-volumes 重新核实被停卷期
-paperlite export --out pdfs/acm --status non_pdf --file non_pdf.csv
-
-# 测试（Redis 部分需设置 PAPERLITE_TEST_REDIS）
-uv run pytest            # 或 uv run python -m unittest discover -s tests
-```
-
-- 下面的 `paperlite` 命令在项目 venv 里（`uv run paperlite ...` 或先 `source .venv/bin/activate`）；也可在项目根目录用 `python -m paperlite ...`。
-- 配置查找顺序：`--config` > 环境变量 `PAPERLITE_CONFIG` > 当前目录的 `config.toml`。在项目根目录运行不用指定。
-- 任务库默认是 `<--out>/tasks.db`，`--db` 可单独指定（各子命令都支持；import / status / retry / export / produce 只给 `--db` 也行）。**输出目录在 goofys、s3fs 这类对象存储挂载上时，任务库必须用 `--db` 放本地盘**：SQLite 要随机写、文件锁和 mmap，FUSE 挂载不支持；PDF 本身是顺序写入，可以放在挂载上（每篇改名在 S3 上是一次复制 + 删除）。例：`paperlite run --out /mnt/goofys/acm --db /data/paperlite/acm.db`
-- 一个任务库只能有一个主机（第一次导入时记下）；重复导入同一链接不会重置已有任务。
-- 同一个库同时只允许一个下载进程；启动时把上次中断残留的 `running` 放回 `pending`，随时 Ctrl+C 再重跑即可续上。
-- 停止：前台 Ctrl+C；后台进程用 `kill <pid>` 或 `pkill -f "paperlite produce"`（SIGTERM，与 Ctrl+C 一样优雅退出：在途任务放回 pending，在用身份还回池里，生产者关掉浏览器并释放生产者锁）。注意 `pkill -f` 的匹配串若也出现在执行它的 shell 命令行里（如 `ssh host '... cookie_pool produce ...; pkill -f ...'`），会连那个 shell 一起杀掉。
-- 换别的站点：在 `[landing]` 加一行该主机的落地页（任意会触发挑战的普通页面），`[proxy] check_url` 换成该站可达的地址。
 
 ## 任务库 tasks.db
 
