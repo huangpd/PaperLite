@@ -30,6 +30,7 @@ def resolve_path(explicit: str | None = None) -> Path:
 @dataclass(frozen=True)
 class PoolConfig:
     redis_url: str = "redis://127.0.0.1:6379/0"
+    out_root: str = "pdfs"            # 不给 --out 时的输出根目录：每个站点 <out_root>/<主机>
     db_dir: str = ""                  # 任务库目录；设置后任务库放这里（<目录>/<输出目录名>-<路径哈希>.db），不放输出目录
     key_prefix: str = "paperlite"
     # 生产

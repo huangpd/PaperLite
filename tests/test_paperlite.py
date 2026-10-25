@@ -240,6 +240,20 @@ class VolumeStopTest(unittest.TestCase):
 class CliDbOptionTest(unittest.TestCase):
     """--db 让任务库和输出目录分开（输出目录在 goofys 等对象存储挂载上时，任务库放本地盘）。"""
 
+    def setUp(self):
+        # 在空的临时目录里跑：不读项目根目录的 config.toml，也不会把那里的 pdfs/ 当成"唯一的站点"
+        self._cwd = os.getcwd()
+        self._tmp_cwd = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp_cwd.name)
+        self._env = mock.patch.dict(os.environ)
+        self._env.start()
+        os.environ.pop("PAPERLITE_CONFIG", None)
+
+    def tearDown(self):
+        self._env.stop()
+        os.chdir(self._cwd)
+        self._tmp_cwd.cleanup()
+
     def run_cli(self, *argv):
         from paperlite import cli
         with mock.patch("sys.argv", ["paperlite", *argv]):
@@ -260,6 +274,30 @@ class CliDbOptionTest(unittest.TestCase):
             self.assertEqual(len(csv_path.read_text().strip().splitlines()), 3)
             with self.assertRaises(SystemExit):
                 self.run_cli("export", "--file", str(csv_path))            # 两个都没给
+
+    def test_import_without_out_uses_host_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = tmp / "c.toml"
+            cfg.write_text(f'[pool]\nout_root = "{tmp / "pdfs"}"\n')
+            acm, other = tmp / "acm.txt", tmp / "other.txt"
+            acm.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\n")
+            other.write_text("https://example.org/a.pdf\n")
+            c = ["--config", str(cfg)]
+            self.run_cli(*c, "import", "--urls", str(acm))
+            self.assertTrue((tmp / "pdfs" / "dl.acm.org" / "tasks.db").exists())     # 输出目录按主机自动建
+            out_csv = tmp / "x.csv"
+            self.run_cli(*c, "export", "--file", str(out_csv))                      # 只有一个站点：不用指定
+            self.assertEqual(len(out_csv.read_text().strip().splitlines()), 2)
+            self.run_cli(*c, "import", "--urls", str(other))
+            with self.assertRaises(SystemExit) as e:
+                self.run_cli(*c, "export", "--file", str(out_csv))                  # 两个站点：要指定
+            self.assertIn("多个站点", str(e.exception))
+            self.run_cli(*c, "export", "--host", "example.org", "--file", str(out_csv))
+            self.assertIn("example.org", out_csv.read_text())
+            with self.assertRaises(SystemExit):
+                self.run_cli(*c, "retry", "--host", "nope.org", "--status", "failed")   # 不存在的站点不会凭空建库
+            self.assertFalse((tmp / "pdfs" / "nope.org").exists())
 
     def test_task_db_path_precedence(self):
         from paperlite.config import task_db_path

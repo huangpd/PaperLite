@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PaperLite 命令行。一个站点一个输出目录，任务库是其中的 tasks.db（SQLite）。
+PaperLite 命令行。一个站点（主机）一个输出目录，默认 <out_root>/<主机>（out_root 默认 pdfs），任务库是其中的 tasks.db。
 生产与消费可以分开跑（不同进程，只共享 Redis），也可以 run 一起跑。
 
-  paperlite import   --out pdfs/acm --urls acm.txt        # 导入任务（txt 一行一个，或带 pdf_url 列的 CSV）
-  paperlite produce  --out pdfs/acm                       # 只生产身份，常驻（也可 --host dl.acm.org）
-  paperlite download --out pdfs/acm --workers 20          # 只消费（需有生产者在跑）
-  paperlite run      --out pdfs/acm --workers 20          # 同进程生产 + 消费，下载完退出
-  paperlite status   --out pdfs/acm                       # 任务统计 + 身份池
-  paperlite retry    --out pdfs/acm --status failed       # 把失败的重置为 pending
-  paperlite export   --out pdfs/acm --status non_pdf > non_pdf.csv
+  paperlite import   --urls acm.txt                 # 导入任务（txt 一行一个，或带 pdf_url 列的 CSV）→ pdfs/dl.acm.org/
+  paperlite run      --workers 20                   # 同进程生产 + 消费，下载完退出
+  paperlite produce                                 # 只生产身份，常驻
+  paperlite download --workers 20                   # 只消费（需有生产者在跑）
+  paperlite status                                  # 任务统计 + 身份池
+  paperlite retry    --status failed                # 把失败的重置为 pending
+  paperlite export   --status non_pdf > non_pdf.csv
 
-任务库位置：--db > 配置 [pool] db_dir > <--out>/tasks.db；单独指定任务库（例如 PDF 输出到 goofys / s3fs 这类对象存储挂载时，
+站点：--out > --host / --urls 的主机 / --db 记录的主机 → <out_root>/<主机> > out_root 下唯一的站点；多个站点时须指定。
+任务库：--db > 配置 [pool] db_dir > <输出目录>/tasks.db（PDF 输出到 goofys / s3fs 这类对象存储挂载时，
 任务库必须放本地盘：SQLite 要随机写、文件锁和 mmap，FUSE 挂载不支持）。
 
 配置查找顺序：--config > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml（从 config.example.toml 复制）。
@@ -38,7 +39,7 @@ from paperlite.consumer import Downloader
 from paperlite.producer import Producer
 from paperlite.proxy import IpSource, ProxySettings
 from paperlite.store import IdentityStore
-from paperlite.tasks import ERROR_KINDS, Status, TaskDB
+from paperlite.tasks import ERROR_KINDS, Status, TaskDB, url_host
 
 logger = logging.getLogger("paperlite")
 
@@ -53,22 +54,54 @@ def _load(path: str | None) -> tuple[PoolConfig, ProxySettings]:
         raise SystemExit(f"配置错误: {e}")
 
 
-def _db(args) -> TaskDB:
-    """--db > 配置 [pool] db_dir > <--out>/tasks.db。没有配置文件时只看前后两者。"""
-    db_dir = ""
-    if not getattr(args, "db", None):
-        try:
-            db_dir = config_mod.load_pool(config_mod.resolve_path(args.config)).db_dir
-        except FileNotFoundError:
-            pass
-        except (TypeError, ValueError) as e:
-            raise SystemExit(f"配置错误: {e}")
+def _pool_cfg(args) -> PoolConfig:
+    """只读 [pool]（out_root / db_dir 等）；没有配置文件时用默认值，import / status / retry / export 不必有代理配置。"""
     try:
-        path = config_mod.task_db_path(getattr(args, "out", None), getattr(args, "db", None), db_dir)
-    except ValueError as e:
-        raise SystemExit(str(e))
-    logger.debug("任务库 %s", path)
-    return TaskDB(path)
+        return config_mod.load_pool(config_mod.resolve_path(args.config))
+    except FileNotFoundError:
+        return PoolConfig()
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"配置错误: {e}")
+
+
+def _host_from_urls(path: str | None) -> str | None:
+    if not path:
+        return None
+    first = next(iter(_read_url_file(path)), None)
+    return url_host(first["pdf_url"]) if first else None
+
+
+def _resolve_out(args, pool: PoolConfig) -> Path:
+    """站点输出目录：--out > --host / --urls / --db 的主机 → <out_root>/<主机> > out_root 下唯一的站点。"""
+    if getattr(args, "out", None):
+        return Path(args.out).expanduser()
+    host = getattr(args, "host", None) or _host_from_urls(getattr(args, "urls", None))
+    if not host and getattr(args, "db", None) and Path(args.db).expanduser().exists():
+        db = TaskDB(Path(args.db).expanduser())
+        host = db.host()
+        db.close()
+    root = Path(pool.out_root).expanduser()
+    if host:
+        return root / host
+    sites = sorted(d.name for d in root.iterdir() if d.is_dir()) if root.is_dir() else []
+    if len(sites) == 1:
+        return root / sites[0]
+    if not sites:
+        raise SystemExit(f"{root.resolve()} 下还没有站点：先 import --urls <文件>，或用 --out 指定输出目录")
+    raise SystemExit(f"{root.resolve()} 下有多个站点：{', '.join(sites)}；用 --host 或 --out 指定")
+
+
+def _open_site(args, create: bool = False) -> tuple[Path, TaskDB]:
+    """返回 (输出目录, 任务库)。create=True（import / download / run）时建好输出目录。"""
+    pool = _pool_cfg(args)
+    out = _resolve_out(args, pool)
+    path = config_mod.task_db_path(str(out), getattr(args, "db", None), pool.db_dir)
+    if create:
+        out.mkdir(parents=True, exist_ok=True)
+    elif not path.exists():
+        raise SystemExit(f"任务库不存在: {path}（输出目录 {out}）；先 import，或检查 --out / --db / db_dir")
+    logger.debug("输出目录 %s，任务库 %s", out, path)
+    return out, TaskDB(path)
 
 
 def _read_url_file(path: str):
@@ -114,7 +147,7 @@ class _ProducerThread:
 
 
 def _download(args, cfg, proxy, store, with_producer: bool) -> None:
-    db = _db(args)
+    out, db = _open_site(args, create=True)
     if args.urls:
         _import(db, args.urls)
     try:
@@ -124,10 +157,11 @@ def _download(args, cfg, proxy, store, with_producer: bool) -> None:
     if reclaimed:
         logger.info("上次中断残留的 %d 个 running 任务已放回 pending", reclaimed)
     try:
-        dl = Downloader(cfg, store, proxy, db, Path(args.out), args.workers)
+        dl = Downloader(cfg, store, proxy, db, out, args.workers)
     except ValueError as e:
         raise SystemExit(str(e))
     c = db.counts()
+    logger.info("输出目录 %s，任务库 %s", out, db.path)
     logger.info("%s：待下载 %d，已成功 %d，non_pdf %d，失败 %d；下载线程 %d", dl.host, c[Status.PENDING],
                 c[Status.SUCCESS], c[Status.NON_PDF], c[Status.FAILED], args.workers)
     if not c[Status.PENDING]:
@@ -170,8 +204,14 @@ def _report(dl: Downloader, store: IdentityStore, cfg: PoolConfig, stop: threadi
 
 def _status(args, cfg) -> None:
     host = args.host
-    if args.out or args.db:
-        db = _db(args)
+    try:
+        _, db = _open_site(args)
+    except SystemExit as e:
+        if not host:                      # 只给了 --host 而本地没有这个站点的任务库：只看身份池
+            raise
+        print(e)
+        db = None
+    if db is not None:
         host = host or db.host()
         c = db.counts()
         print(f"任务库 {db.path}（{host or '空'}）: 共 {sum(c.values())}  " +
@@ -199,7 +239,7 @@ def _status(args, cfg) -> None:
 
 
 def _export(args) -> None:
-    db = _db(args)
+    _, db = _open_site(args)
     rows = db.rows(args.status)
     out = open(args.file, "w", newline="", encoding="utf-8") if args.file != "-" else sys.stdout
     w = csv.writer(out)
@@ -223,43 +263,38 @@ def main() -> None:
     ap.add_argument("--log-level", default="INFO")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    out_help = "站点输出目录：PDF、non_pdf/ 都在这里；不指定 --db 时任务库也在这里（tasks.db）"
-    db_help = ("任务库路径（优先于配置 db_dir；都没有时为 <--out>/tasks.db）；"
-               "输出目录在 goofys 等对象存储挂载上时须在本地盘")
+    def site_args(p, out_required: bool = False):
+        p.add_argument("--out", required=out_required,
+                       help="站点输出目录（PDF、non_pdf/；默认 <out_root>/<主机>，见配置 out_root）")
+        p.add_argument("--host", help="站点主机，如 dl.acm.org（输出目录取 <out_root>/<主机>）")
+        p.add_argument("--db", help="任务库路径（优先于配置 db_dir；默认 <输出目录>/tasks.db）；"
+                                    "输出目录在 goofys 等对象存储挂载上时须在本地盘")
+
     p = sub.add_parser("import", help="导入任务")
-    p.add_argument("--out", help=out_help)
-    p.add_argument("--db", help=db_help)
     p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 pdf_url 列的 CSV；须同一主机")
+    site_args(p)
     p.add_argument("--source", default="")
     p.add_argument("--batch", default="", help="写入 batch_no")
     p = sub.add_parser("produce", help="只生产身份（常驻，Ctrl+C / SIGTERM 退出）")
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--host")
-    g.add_argument("--out", help="取该任务库的主机")
-    g.add_argument("--db", help="取该任务库的主机（同 --out，直接给任务库路径）")
+    site_args(p)
     p.add_argument("--keep", type=int, help="没有下载线程时也养着这么多身份（覆盖 min_identities），"
                                             "下载前一两分钟先启动可省掉冷启动的过盾等待")
     for name in ("download", "run"):
         p = sub.add_parser(name, help="只消费" if name == "download" else "生产 + 消费，下载完退出")
-        p.add_argument("--out", required=True, help=out_help)
-        p.add_argument("--db", help=db_help)
+        site_args(p)
         p.add_argument("--urls", help="先导入这个文件（可选）")
         p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数")
     p = sub.add_parser("status", help="任务统计与身份池")
-    p.add_argument("--out")
-    p.add_argument("--db", help=db_help)
-    p.add_argument("--host")
+    site_args(p)
     p = sub.add_parser("retry", help="把 failed / non_pdf 的任务重置为 pending")
-    p.add_argument("--out")
-    p.add_argument("--db", help=db_help)
+    site_args(p)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--status", choices=[Status.FAILED, Status.NON_PDF])
     g.add_argument("--stopped-volumes", action="store_true",
                    help="重新核实按卷期停掉的：这些卷期的 non_pdf（样本 + 推断）全部放回 pending")
     p.add_argument("--kind", choices=ERROR_KINDS, help="配合 --status，只重置该 error_kind")
     p = sub.add_parser("export", help="导出任务为 CSV")
-    p.add_argument("--out")
-    p.add_argument("--db", help=db_help)
+    site_args(p)
     p.add_argument("--status", choices=Status.ALL)
     p.add_argument("--file", default="-", help="输出文件，默认标准输出")
     args = ap.parse_args()
@@ -275,12 +310,13 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _raise_interrupt)
 
     if args.cmd == "import":
-        db = _db(args)
+        out, db = _open_site(args, create=True)
         _import(db, args.urls, args.source, args.batch)
+        logger.info("输出目录 %s，任务库 %s", out, db.path)
         db.close()
         return
     if args.cmd == "retry":
-        db = _db(args)
+        _, db = _open_site(args)
         if args.stopped_volumes:
             v, n = db.reset_stopped_volumes()
             print(f"已重置 {v} 个被停卷期的 {n} 个任务为 pending")
@@ -294,8 +330,6 @@ def main() -> None:
 
     cfg, proxy = _load(args.config)
     if args.cmd == "status":
-        if not (args.out or args.db or args.host):
-            raise SystemExit("status 需要 --out / --db 或 --host")
         _status(args, cfg)
         return
 
@@ -303,8 +337,8 @@ def main() -> None:
     store.ping()
     if args.cmd == "produce":
         host = args.host
-        if args.out or args.db:
-            db = _db(args)
+        if not host:
+            _, db = _open_site(args)
             host = db.host()
             db.close()
             if not host:

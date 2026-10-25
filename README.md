@@ -16,8 +16,9 @@ cp config.example.toml config.toml        # 填 [proxy] 的提取接口和代理
 # Redis：只监听本机、不落盘（身份 10 分钟就过期，不需要持久化）
 docker run -d --name cf-redis -p 127.0.0.1:6379:6379 redis:latest redis-server --save "" --appendonly no
 
-# 导入并开跑：一个站点一个输出目录，下载完自动退出
-uv run paperlite run --out pdfs/acm --urls data/acm.txt --workers 20
+# 导入并开跑：输出目录按主机自动定为 pdfs/dl.acm.org，下载完自动退出
+uv run paperlite import --urls data/acm.txt
+uv run paperlite run --workers 20
 ```
 
 运行中每 30 秒打印一行进度（已处理条数、PDF 篇数、身份池、近 30 秒速度）。随时 Ctrl+C，在途任务会放回 pending，再执行同一条命令就从断点继续。
@@ -25,10 +26,10 @@ uv run paperlite run --out pdfs/acm --urls data/acm.txt --workers 20
 `paperlite` 是安装时生成在 `.venv/bin/` 里的命令（`pyproject.toml` 的 `[project.scripts]`），后面的 `run` / `import` / `status` 是它的子命令。下面统一写成 `uv run paperlite ...`，这几种写法等价：
 
 ```bash
-uv run paperlite status --out pdfs/acm            # uv 自动用项目 venv，不用激活
-.venv/bin/paperlite status --out pdfs/acm         # 直接调 venv 里的命令（服务器上推荐，见下）
-source .venv/bin/activate && paperlite status --out pdfs/acm
-.venv/bin/python -m paperlite status --out pdfs/acm
+uv run paperlite status                           # uv 自动用项目 venv，不用激活
+.venv/bin/paperlite status                         # 直接调 venv 里的命令（服务器上推荐，见下）
+source .venv/bin/activate && paperlite status
+.venv/bin/python -m paperlite status
 ```
 
 用清华源手动装的环境（`uv pip install`，不是 `uv sync`）请用 `.venv/bin/paperlite`：`uv run` 会按 `uv.lock` 去官方源重新同步依赖，国内服务器上会卡住。
@@ -37,16 +38,19 @@ source .venv/bin/activate && paperlite status --out pdfs/acm
 
 | 命令 | 作用 |
 |---|---|
-| `uv run paperlite import --out <目录> --urls <文件>` | 导入任务。txt 一行一个链接，或带 `pdf_url` 列（可选 `paper_uid` / `source` / `batch_no`）的 CSV。重复导入不重置已有任务；一个库只能有一个主机 |
-| `uv run paperlite run --out <目录> [--urls <文件>] [--workers 20]` | 同进程生产身份 + 下载，下载完退出 |
-| `uv run paperlite produce --out <目录>`（或 `--host dl.acm.org`）`[--keep N]` | 只生产身份，常驻 |
-| `uv run paperlite download --out <目录> [--workers 20]` | 只下载，需有生产者在跑 |
-| `uv run paperlite status --out <目录>` | 各状态数量、失败 / non_pdf 按 `error_kind` 分组、被停卷期、身份池 |
-| `uv run paperlite retry --out <目录> --status failed [--kind network]` | 把失败（或 `non_pdf`）重置为 pending |
-| `uv run paperlite retry --out <目录> --stopped-volumes` | 重新核实按卷期停掉的任务 |
-| `uv run paperlite export --out <目录> [--status non_pdf] [--file x.csv]` | 导出任务表为 CSV（默认输出到标准输出） |
+| `uv run paperlite import --urls <文件>` | 导入任务。txt 一行一个链接，或带 `pdf_url` 列（可选 `paper_uid` / `source` / `batch_no`）的 CSV。重复导入不重置已有任务；一个库只能有一个主机 |
+| `uv run paperlite run [--urls <文件>] [--workers 20]` | 同进程生产身份 + 下载，下载完退出 |
+| `uv run paperlite produce [--keep N]` | 只生产身份，常驻 |
+| `uv run paperlite download [--workers 20]` | 只下载，需有生产者在跑 |
+| `uv run paperlite status` | 各状态数量、失败 / non_pdf 按 `error_kind` 分组、被停卷期、身份池 |
+| `uv run paperlite retry --status failed [--kind network]` | 把失败（或 `non_pdf`）重置为 pending |
+| `uv run paperlite retry --stopped-volumes` | 重新核实按卷期停掉的任务 |
+| `uv run paperlite export [--status non_pdf] [--file x.csv]` | 导出任务表为 CSV（默认输出到标准输出） |
 
-任务库位置：`--db <路径>` > 配置 `[pool] db_dir` > `<--out>/tasks.db`。所有命令都支持 `--db`，`import` / `status` / `retry` / `export` / `produce` 只给 `--db` 也行。全局参数：`--config <文件>`、`--log-level`、`--version`。
+所有命令都可以加 `--out` / `--host` / `--db` 指定站点和任务库；只有一个站点时都不用写：
+
+- **站点输出目录**：`--out` > `--host`、`--urls` 里链接的主机、`--db` 记录的主机 → `<out_root>/<主机>`（`out_root` 默认 `pdfs`）> `out_root` 下唯一的站点。有多个站点时会列出来，用 `--host dl.acm.org` 选一个。
+- **任务库**：`--db` > 配置 `[pool] db_dir`（`<db_dir>/<输出目录名>-<路径哈希>.db`）> `<输出目录>/tasks.db`。全局参数：`--config <文件>`、`--log-level`、`--version`。
 
 ## 常见场景
 
@@ -58,8 +62,8 @@ db_dir = "/data/paperlite/db"   # 任务库自动放这里：<目录>/<输出目
 ```
 
 ```bash
-uv run paperlite run --out /mnt/goofys/acm --urls data/acm.txt --workers 20
-uv run paperlite status --out /mnt/goofys/acm
+uv run paperlite import --urls data/acm.txt --out /mnt/goofys/acm
+uv run paperlite run --out /mnt/goofys/acm --workers 20      # 或在配置里设 out_root = "/mnt/goofys"，之后不用写 --out
 ```
 
 也可以不改配置、每次用 `--db /data/paperlite/acm.db` 指定（优先于 `db_dir`）。
@@ -67,7 +71,7 @@ uv run paperlite status --out /mnt/goofys/acm
 **后台运行与停止**：
 
 ```bash
-setsid nohup .venv/bin/paperlite run --out pdfs/acm --workers 20 > logs/acm.log 2>&1 < /dev/null &
+setsid nohup .venv/bin/paperlite run --workers 20 > logs/acm.log 2>&1 < /dev/null &
 tail -f logs/acm.log
 kill <pid>                                # 或 pkill -f "paperlite run"
 ```
@@ -76,7 +80,7 @@ SIGTERM 与 Ctrl+C 一样优雅退出：在途任务放回 pending、在用身�
 
 **生产与下载分开跑**：生产者常驻，下载进程随用随开；多台机器的下载进程可以共用一个 Redis（`redis_url` 指向同一台；默认只监听本机，跨机器要改监听地址并加密码）。同一主机同时只有一个生产者干活，多开的待命，前一个退出或崩溃后 15 秒内接手。
 
-**省掉冷启动**：第一个身份要等一次过盾（约 20 秒）。下载前一两分钟先 `uv run paperlite produce --out pdfs/acm --keep 20` 养着身份，代价是没人下载时也在消耗 IP。
+**省掉冷启动**：第一个身份要等一次过盾（约 20 秒）。下载前一两分钟先 `uv run paperlite produce --keep 20` 养着身份，代价是没人下载时也在消耗 IP。
 
 **重跑**：`retry --status failed` 重跑失败的（可加 `--kind network` / `challenge_failed` 只重跑某一类）；`retry --stopped-volumes` 让被停掉的卷期重新抽样核实。
 
@@ -87,6 +91,7 @@ SIGTERM 与 Ctrl+C 一样优雅退出：在途任务放回 pending、在用身�
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `[proxy] api_url` / `username` / `password` | | 提取接口与代理鉴权（必填） |
+| `out_root` | `pdfs` | 不给 `--out` 时的输出根目录，站点目录为 `<out_root>/<主机>` |
 | `db_dir` | 空 | 任务库目录（本地盘）；留空则放 `<--out>/tasks.db`。输出目录在对象存储挂载上时必须设置 |
 | `max_browsers` | 20 | 同时过盾的浏览器上限 |
 | `max_identities` / `min_identities` | 20 / 0 | 健康身份上限 / 没人下载时也养着的身份数；实际按在线下载线程数生产 |
@@ -125,7 +130,7 @@ PAPERLITE_TEST_REDIS=redis://127.0.0.1:6379/0 uv run pytest   # 连真实 Redis 
 - **站点会单独盯上某些 URL**（2026-10-25 实测）：同一个新 cookie、同一 IP，`1010832.*` 正常拿到 PDF，`1005062.*`（14 篇，连摘要页）一律 403 挑战，多半是前一晚在这几条上反复请求了几百次。原先把"被挑战"一律当成 cookie 坏了：丢身份、任务放回队首，于是每个新身份第一次请求都撞上它们，一篇也下不了。现在遇到挑战先用落地页验身份：落地页正常 → 只是这条 URL 被盯上，`challenge_count+1` 排到后面；落地页也被挑战 → 身份坏了才丢。不用"下一条也被挑战"来判身份，因为被盯上的论文往往成批相邻，会把好身份接连误杀。
 - **代理偶尔成批断连**：2026-10-25 00:28 有 13 个不同 IP 在 28 秒内先后报 `curl: (56) Connection closed abruptly`，原先一律丢身份，健康身份从 17 掉到 7、补了约 1.5 分钟。现在 (56) 先用同一身份重试一次。
 - **收尾不再白补身份**：只剩别的线程的在途任务时，空等的下载线程注销需求并把身份还回池里（之前最后 1 条重试时生产者仍按 20 个线程补身份，停止时池里空闲 20 个）。
-- **冷启动**：第一个身份要等一次过盾（实测约 20 秒）。想省掉就在下载前一两分钟先 `uv run paperlite produce --out <目录> --keep 20`，代价是没人下载时也在消耗 IP。
+- **冷启动**：第一个身份要等一次过盾（实测约 20 秒）。想省掉就在下载前一两分钟先 `uv run paperlite produce --keep 20`，代价是没人下载时也在消耗 IP。
 - **流式下载**：超时是卡顿超时（`download_timeout_s`：连续这么久收不到数据），不是总时长，2 Mbps 的代理上大文件也不会被掐断；内存里最多一个 256KB 的块。`%PDF-` 须在前 1024 字节内、之前只允许空白 / BOM（写盘时去掉），与 paper_downloader 一致；小于 `min_file_size`（1024 字节）计一次重试，超过 `max_file_size_mb`（200）中止判 `failed / extract_failed`。
 - **熔断**：2026-10-24 22:38 实测，新过盾的身份全部一篇没下成就被 403 挑战（原因待查，同时代理配额耗尽），没有保护时 1 分钟烧掉 16 个 IP。现在连续 `max_fresh_rejects`（5）个新身份一用就被拒，生产者暂停 `breaker_pause_s`（600s）并告警，之后放一个身份试探，再被拒立刻重新暂停。网络错误不计入。
 - **过盾失败直接换 IP**：同一 IP 重试很少成功，换 IP 更快。
@@ -193,7 +198,7 @@ ACM 的 404 和"没有 PDF"基本按卷期整组出现（2671 条实测：9 个 
 - 卷期还没下到过 PDF 时，同时最多放 `volume_stop_after`（默认 3）篇出去，其余线程去领别的卷期（同卷期的任务在表里挨着，不限流的话 20 个线程会同时冲进同一卷期）。
 - 这几篇都是 `not_found` / `paywall` / `landing_page` → 停掉该卷期其余 pending：记 `non_pdf`、`inferred = 1`，`error_kind` 取样本里最多的类别，`error_message` 写明"按卷期推断…未请求"。
 - 下到过一篇 PDF 的卷期永远不停；网络错误、被挑战不计。
-- `uv run paperlite retry --out <目录> --stopped-volumes` 重新核实：被停卷期的 non_pdf（样本 + 推断）全部放回 pending，重新抽 3 篇。只放回推断的那部分没用，样本还在会立刻再停。
+- `uv run paperlite retry --stopped-volumes` 重新核实：被停卷期的 non_pdf（样本 + 推断）全部放回 pending，重新抽 3 篇。只放回推断的那部分没用，样本还在会立刻再停。
 - `volume_stop_after = 0` 关闭。
 
 70 万条 ACM 实测：导入 7.9 秒，63.7 万条有卷期号、22,926 个卷期；领取一次 0.5–5 ms。

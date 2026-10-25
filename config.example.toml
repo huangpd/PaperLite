@@ -11,6 +11,7 @@ check_url = "https://dl.acm.org/robots.txt"   # 新 IP 体检地址，收到任�
 
 [pool]
 redis_url = "redis://127.0.0.1:6379/0"
+out_root = "pdfs"             # 不给 --out 时，站点输出目录为 <out_root>/<主机>，如 pdfs/dl.acm.org
 db_dir = ""                   # 任务库目录（本地盘）。设置后任务库放这里：<目录>/<输出目录名>-<路径哈希>.db；
                               # 留空则放输出目录里的 tasks.db。PDF 输出到 goofys 等挂载上时必须设置（或每次用 --db）
 max_browsers = 20             # 同时运行的浏览器上限
