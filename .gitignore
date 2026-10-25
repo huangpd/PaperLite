@@ -1,0 +1,22 @@
+# 环境
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# 本地配置（含代理密码）
+config.toml
+
+# 数据与运行产物
+data/
+pdfs/
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store

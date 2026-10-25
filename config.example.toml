@@ -1,0 +1,30 @@
+# PaperLite 配置。复制为 config.toml 再填写（在项目根目录运行时自动读取；别处运行用 --config 或 PAPERLITE_CONFIG）。
+# config.toml 含代理密码，已在 .gitignore 里，不要提交、不要同步到别处公开。
+
+[proxy]
+api_url = ""                  # 短效代理提取接口（每次返回一个 IP，青果格式 JSON），必填
+scheme = "http"
+username = ""
+password = ""
+lease_s = 600                 # 单个 IP 最长使用时间（秒），与接口返回的 deadline 取较早者
+check_url = "https://dl.acm.org/robots.txt"   # 新 IP 体检地址，收到任意 HTTP 响应即合格
+
+[pool]
+redis_url = "redis://127.0.0.1:6379/0"
+max_browsers = 20             # 同时运行的浏览器上限
+max_identities = 20           # 健康身份上限；实际按在线下载线程数生产
+min_identities = 0            # 没有下载线程时也保持的预热身份数
+refill_before_s = 90          # 身份剩余寿命低于此值就提前生产替补
+pass_timeout_s = 90           # 单次过盾等待上限
+hedge_after_s = 45            # 过盾超过此时长还没成功，就另开一个浏览器补位（成功的多在 30s 内）
+debug_dir = ""                # 过盾失败截图目录，空则不截图
+max_fresh_rejects = 5         # 连续这么多个新身份一篇没下成就被拒 → 暂停生产（站点规则变了，别烧代理配额）
+breaker_pause_s = 600         # 暂停时长（秒），之后放一个身份试探
+request_gap_s = [3, 5]        # 同一 IP 两次请求的随机间隔（秒）
+download_timeout_s = 120
+max_tries = 3                 # 单条 URL 网络错误重试次数（cookie 被拒不计）
+max_url_challenges = 3        # 单条 URL 带有效 cookie 仍被挑战满这么多次 → failed / challenge_failed
+volume_stop_after = 3         # 同一卷期（DOI 点号前那段）还没下到 PDF、已有这么多篇 404/订阅/摘要页 → 停掉该卷期其余任务；0 关闭
+
+[landing]                     # 各主机的过盾落地页（任意会触发挑战的普通页面）；未配置的用主机首页
+"dl.acm.org" = "https://dl.acm.org/doi/10.1145/3779295"
