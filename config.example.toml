@@ -11,6 +11,8 @@ check_url = "https://dl.acm.org/robots.txt"   # 新 IP 体检地址，收到任�
 
 [pool]
 redis_url = "redis://127.0.0.1:6379/0"
+db_dir = ""                   # 任务库目录（本地盘）。设置后任务库放这里：<目录>/<输出目录名>-<路径哈希>.db；
+                              # 留空则放输出目录里的 tasks.db。PDF 输出到 goofys 等挂载上时必须设置（或每次用 --db）
 max_browsers = 20             # 同时运行的浏览器上限
 max_identities = 20           # 健康身份上限；实际按在线下载线程数生产
 min_identities = 0            # 没有下载线程时也保持的预热身份数

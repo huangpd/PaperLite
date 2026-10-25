@@ -9,6 +9,7 @@ paperlite/config.py
   [landing]  主机 → 过盾落地页
 """
 
+import hashlib
 import os
 import tomllib
 from dataclasses import dataclass, field, fields
@@ -29,6 +30,7 @@ def resolve_path(explicit: str | None = None) -> Path:
 @dataclass(frozen=True)
 class PoolConfig:
     redis_url: str = "redis://127.0.0.1:6379/0"
+    db_dir: str = ""                  # 任务库目录；设置后任务库放这里（<目录>/<输出目录名>-<路径哈希>.db），不放输出目录
     key_prefix: str = "paperlite"
     # 生产
     max_browsers: int = 20            # 同时运行的浏览器上限
@@ -77,16 +79,39 @@ def proxy_settings(raw: dict[str, Any]) -> ProxySettings:
     return ProxySettings(**raw)
 
 
-def load(path: Path | None = None) -> tuple[PoolConfig, ProxySettings]:
-    path = path or resolve_path()
+def _read(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"配置文件不存在: {path.resolve()}（从 config.example.toml 复制；"
                                 f"或用 --config / 环境变量 {CONFIG_ENV} 指定）")
     with open(path, "rb") as f:
         raw = tomllib.load(f)
     _reject_unknown("顶层", raw, None, allowed={"proxy", "pool", "landing"})
+    return raw
+
+
+def load(path: Path | None = None) -> tuple[PoolConfig, ProxySettings]:
+    raw = _read(path or resolve_path())
     return (PoolConfig.from_dict(raw.get("pool", {}), raw.get("landing", {})),
             proxy_settings(raw.get("proxy", {})))
+
+
+def load_pool(path: Path | None = None) -> PoolConfig:
+    """只读 [pool]，不校验代理（import / retry / export 只需要 db_dir 这类设置）。"""
+    raw = _read(path or resolve_path())
+    return PoolConfig.from_dict(raw.get("pool", {}), raw.get("landing", {}))
+
+
+def task_db_path(out: str | None, db: str | None, db_dir: str = "") -> Path:
+    """任务库位置：--db > 配置 db_dir（<db_dir>/<输出目录名>-<完整路径哈希前 6 位>.db）> <--out>/tasks.db。"""
+    if db:
+        return Path(db).expanduser()
+    if not out:
+        raise ValueError("需要 --db 或 --out 指定任务库")
+    if db_dir:
+        full = Path(out).expanduser().resolve()
+        tag = hashlib.sha256(str(full).encode("utf-8")).hexdigest()[:6]
+        return Path(db_dir).expanduser() / f"{full.name or 'root'}-{tag}.db"
+    return Path(out) / "tasks.db"
 
 
 def _reject_unknown(section: str, raw: dict, cls, allowed: set[str] | None = None) -> None:

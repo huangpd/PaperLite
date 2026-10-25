@@ -261,6 +261,30 @@ class CliDbOptionTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.run_cli("export", "--file", str(csv_path))            # 两个都没给
 
+    def test_task_db_path_precedence(self):
+        from paperlite.config import task_db_path
+        self.assertEqual(task_db_path("/mnt/g/acm", "/x/a.db", "/data/db"), Path("/x/a.db"))       # --db 最优先
+        p1 = task_db_path("/mnt/g/acm", None, "/data/db")
+        p2 = task_db_path("/mnt/h/acm", None, "/data/db")
+        self.assertEqual((p1.parent, p1.name[:4], p1.suffix), (Path("/data/db"), "acm-", ".db"))  # 配置 db_dir
+        self.assertNotEqual(p1, p2)                                                               # 同名输出目录不撞
+        self.assertEqual(task_db_path("/mnt/g/acm", None, ""), Path("/mnt/g/acm/tasks.db"))        # 默认
+        with self.assertRaises(ValueError):
+            task_db_path(None, None, "/data/db")
+
+    def test_db_dir_from_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = tmp / "c.toml"
+            cfg.write_text(f'[pool]\ndb_dir = "{tmp / "local"}"\n')         # import 只读 [pool]，不要求 [proxy]
+            urls = tmp / "u.txt"
+            urls.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\n")
+            out = tmp / "mnt" / "acm"
+            self.run_cli("--config", str(cfg), "import", "--out", str(out), "--urls", str(urls))
+            dbs = list((tmp / "local").glob("acm-*.db"))
+            self.assertEqual(len(dbs), 1)
+            self.assertFalse((out / "tasks.db").exists())
+
 
 class ProducerTargetTest(unittest.TestCase):
     def test_target_follows_workers(self):

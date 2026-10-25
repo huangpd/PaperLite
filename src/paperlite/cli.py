@@ -12,7 +12,7 @@ PaperLite 命令行。一个站点一个输出目录，任务库是其中的 tas
   paperlite retry    --out pdfs/acm --status failed       # 把失败的重置为 pending
   paperlite export   --out pdfs/acm --status non_pdf > non_pdf.csv
 
-任务库默认是 <--out>/tasks.db；--db 可单独指定（例如 PDF 输出到 goofys / s3fs 这类对象存储挂载时，
+任务库位置：--db > 配置 [pool] db_dir > <--out>/tasks.db；单独指定任务库（例如 PDF 输出到 goofys / s3fs 这类对象存储挂载时，
 任务库必须放本地盘：SQLite 要随机写、文件锁和 mmap，FUSE 挂载不支持）。
 
 配置查找顺序：--config > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml（从 config.example.toml 复制）。
@@ -42,7 +42,6 @@ from paperlite.tasks import ERROR_KINDS, Status, TaskDB
 
 logger = logging.getLogger("paperlite")
 
-DB_NAME = "tasks.db"
 
 
 def _load(path: str | None) -> tuple[PoolConfig, ProxySettings]:
@@ -55,12 +54,21 @@ def _load(path: str | None) -> tuple[PoolConfig, ProxySettings]:
 
 
 def _db(args) -> TaskDB:
-    """--db 优先，否则 <--out>/tasks.db。"""
-    if getattr(args, "db", None):
-        return TaskDB(Path(args.db).expanduser())
-    if getattr(args, "out", None):
-        return TaskDB(Path(args.out) / DB_NAME)
-    raise SystemExit("需要 --db 或 --out 指定任务库")
+    """--db > 配置 [pool] db_dir > <--out>/tasks.db。没有配置文件时只看前后两者。"""
+    db_dir = ""
+    if not getattr(args, "db", None):
+        try:
+            db_dir = config_mod.load_pool(config_mod.resolve_path(args.config)).db_dir
+        except FileNotFoundError:
+            pass
+        except (TypeError, ValueError) as e:
+            raise SystemExit(f"配置错误: {e}")
+    try:
+        path = config_mod.task_db_path(getattr(args, "out", None), getattr(args, "db", None), db_dir)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    logger.debug("任务库 %s", path)
+    return TaskDB(path)
 
 
 def _read_url_file(path: str):
@@ -216,7 +224,8 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     out_help = "站点输出目录：PDF、non_pdf/ 都在这里；不指定 --db 时任务库也在这里（tasks.db）"
-    db_help = "任务库路径（默认 <--out>/tasks.db）；输出目录在 goofys 等对象存储挂载上时须指向本地盘"
+    db_help = ("任务库路径（优先于配置 db_dir；都没有时为 <--out>/tasks.db）；"
+               "输出目录在 goofys 等对象存储挂载上时须在本地盘")
     p = sub.add_parser("import", help="导入任务")
     p.add_argument("--out", help=out_help)
     p.add_argument("--db", help=db_help)
