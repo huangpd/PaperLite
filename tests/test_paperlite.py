@@ -15,6 +15,7 @@ from paperlite.proxy import Lease, ProxySettings, parse_deadline
 from paperlite.store import Identity
 from paperlite.tasks import Status, TaskDB, derive_paper_uid, derive_volume, pdf_path, url_key
 
+FAKE_PDF = b"%PDF-1.4\n" + b"0" * 2048          # 超过最小文件大小（1024 字节）
 PROXY = ProxySettings(api_url="https://api.example/get?key=k", username="u", password="p@ss")
 
 
@@ -296,8 +297,21 @@ class ProducerBreakerTest(unittest.TestCase):
 
 
 class Resp:
-    def __init__(self, status, body, headers=None):
+    """curl_cffi 响应替身：支持 stream=True 的 iter_content / close。fail_after 字节后模拟断流。"""
+
+    def __init__(self, status, body, headers=None, fail_after=None):
         self.status_code, self.content, self.headers = status, body, headers or {}
+        self.fail_after = fail_after
+        self.closed = False
+
+    def iter_content(self, chunk_size=1024):
+        for i in range(0, len(self.content), 100):          # 小块，覆盖"首块不够 1024 字节"的情况
+            if self.fail_after is not None and i >= self.fail_after:
+                raise ConnectionError("curl: (56) Connection closed abruptly")
+            yield self.content[i:i + 100]
+
+    def close(self):
+        self.closed = True
 
 
 class FakeStore:
@@ -368,7 +382,7 @@ class DownloaderTest(unittest.TestCase):
         urls = ["https://dl.acm.org/doi/pdf/10.1145/1", "https://dl.acm.org/doi/pdf/10.1145/2"]
         dl = self.run_with(store, {
             "1.1.1.1": lambda u: Resp(403, b"<html>challenge-platform</html>", {"cf-mitigated": "challenge"}),
-            "2.2.2.2": lambda u: Resp(200, b"%PDF-1.4 ..."),
+            "2.2.2.2": lambda u: Resp(200, FAKE_PDF),
         }, urls)
         self.assertEqual((dl.stats.success, dl.stats.failed, dl.stats.rejected), (2, 0, 1))
         self.assertEqual(store.discarded, ["1.1.1.1"])
@@ -392,7 +406,7 @@ class DownloaderTest(unittest.TestCase):
         store = FakeStore([ident(exit_ip="1.1.1.1"), ident(exit_ip="2.2.2.2")])
         url = "https://dl.acm.org/doi/pdf/10.1145/1"
         dl = self.run_with(store, {"1.1.1.1": lambda u: Resp(403, b"<title>ACM Error: IP blocked</title>"),
-                                   "2.2.2.2": lambda u: Resp(200, b"%PDF-1.4")}, [url])
+                                   "2.2.2.2": lambda u: Resp(200, FAKE_PDF)}, [url])
         self.assertEqual((dl.stats.success, dl.stats.rejected, store.discarded), (1, 1, ["1.1.1.1"]))
 
     def test_fresh_rejects_counted_but_not_network_errors(self):
@@ -411,7 +425,7 @@ class DownloaderTest(unittest.TestCase):
         def site(u):
             if "bad" in u:
                 return Resp(403, b"challenge-platform", {"cf-mitigated": "challenge"})
-            return Resp(200, b"<title>landing</title>") if "/doi/pdf/" not in u else Resp(200, b"%PDF-1.4")
+            return Resp(200, b"<title>landing</title>") if "/doi/pdf/" not in u else Resp(200, FAKE_PDF)
         store = FakeStore([ident()])
         self.cfg = PoolConfig(request_gap_s=(0, 0), max_url_challenges=2,
                               landing={"dl.acm.org": "https://dl.acm.org/doi/10.1145/landing"})
@@ -430,7 +444,7 @@ class DownloaderTest(unittest.TestCase):
             calls.append(u)
             if len(calls) == 1:
                 raise ConnectionError("curl: (56) Connection closed abruptly")
-            return Resp(200, b"%PDF-1.4")
+            return Resp(200, FAKE_PDF)
         store = FakeStore([ident()])
         with mock.patch("paperlite.consumer._RESET_RETRY_WAIT_S", 0):
             dl = self.run_with(store, {"1.2.3.4": flaky}, ["https://dl.acm.org/doi/pdf/10.1145/1"])
@@ -461,6 +475,42 @@ class DownloaderTest(unittest.TestCase):
         dl = self.run_with(FakeStore([ident()]), {"1.2.3.4": site}, urls)
         self.assertEqual(len(calls), 3)                     # 11 篇只请求了 3 篇
         self.assertEqual((dl.stats.non_pdf, dl.stats.volumes_stopped, dl.stats.inferred), (3, 1, 8))
+
+    def test_streamed_pdf_strips_leading_junk(self):
+        body = b"\r\n\xef\xbb\xbf%PDF-1.7\n" + b"x" * 5000
+        url = "https://dl.acm.org/doi/pdf/10.1145/1"
+        dl = self.run_with(FakeStore([ident()]), {"1.2.3.4": lambda u: Resp(200, body)}, [url])
+        r = self.row(url)
+        data = Path(r["file_path"]).read_bytes()
+        self.assertTrue(data.startswith(b"%PDF-1.7"))          # 前导换行和 BOM 已去掉
+        self.assertEqual((dl.stats.success, r["file_size"], len(data)), (1, len(body) - 5, len(body) - 5))
+        self.assertFalse(list(self.out.rglob("*.part")))
+
+    def test_too_large_pdf_aborted(self):
+        self.cfg = PoolConfig(request_gap_s=(0, 0), max_file_size_mb=1)
+        url = "https://dl.acm.org/doi/pdf/10.1145/big"
+        dl = self.run_with(FakeStore([ident()]), {"1.2.3.4": lambda u: Resp(200, b"%PDF-1.4" + b"x" * (1024 * 1024 + 10))}, [url])
+        r = self.row(url)
+        self.assertEqual((r["status"], r["error_kind"], dl.stats.failed), ("failed", "extract_failed", 1))
+        self.assertFalse(list(self.out.rglob("*.pdf")) + list(self.out.rglob("*.part")))
+
+    def test_mid_stream_reset_retried_and_no_partial_left(self):
+        calls = []
+
+        def site(u):
+            calls.append(u)
+            return Resp(200, b"%PDF-1.4" + b"x" * 5000, fail_after=2000 if len(calls) == 1 else None)
+        with mock.patch("paperlite.consumer._RESET_RETRY_WAIT_S", 0):
+            dl = self.run_with(FakeStore([ident()]), {"1.2.3.4": site}, ["https://dl.acm.org/doi/pdf/10.1145/1"])
+        self.assertEqual((dl.stats.success, len(calls)), (1, 2))
+        self.assertFalse(list(self.out.rglob("*.part")))
+
+    def test_html_read_is_capped(self):
+        url = "https://dl.acm.org/doi/pdf/10.1145/huge-html"
+        dl = self.run_with(FakeStore([ident()]),
+                           {"1.2.3.4": lambda u: Resp(200, b"<title>Paper</title>" + b"a" * (1024 * 1024))}, [url])
+        self.assertEqual(dl.stats.non_pdf, 1)
+        self.assertLessEqual(self.row(url)["file_size"], 256 * 1024)
 
     def test_network_error_retries_then_fails(self):
         def boom(u):

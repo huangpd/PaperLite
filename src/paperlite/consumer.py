@@ -14,6 +14,9 @@ paperlite/consumer.py
 - 连接被断（IP 掉线）/ IP 被站点封禁 / 寿命不足 min_left_s → 丢弃身份换下一个，任务放回且不计重试；
 - 连接被断（curl 56）先用同一身份重试一次（代理偶尔成批断连，见 README）；
 - 超时、5xx 计一次重试，满 max_tries 判 failed；
+- 流式下载：先读够 1024 字节判文件头（%PDF- 前允许空白 / BOM，写盘时去掉），是 PDF 就边下边写 .part，
+  超过 max_file_size_mb 中止，完成后原子改名；不是 PDF 只读前 256KB 用于判挑战和分类。
+  超时是卡顿超时（连续 download_timeout_s 秒收不到数据），慢代理上的大文件不会被总时长掐断；
 - 返回 HTML 的判 non_pdf（error_kind 见 classify.py），原始页面存到 <out>/non_pdf/；
   同一卷期接连 volume_stop_after 篇没有 PDF 就停掉该卷期其余任务（逻辑在 tasks.py）。
 """
@@ -41,6 +44,10 @@ from paperlite.tasks import Status, Task, TaskDB, pdf_path
 logger = logging.getLogger(__name__)
 
 _IDLE_WAIT_S = 2.0
+_CHUNK = 256 * 1024
+_PDF_HEADER_WINDOW = 1024                      # %PDF- 须在前 1024 字节内（PDF 规范）
+_PDF_LEADING_JUNK = b" \t\r\n\x00\x0c\xef\xbb\xbf"  # 之前只允许这些（有的 PHP 下载脚本会输出前导换行）
+_HTML_LIMIT = 256 * 1024                       # 非 PDF 响应最多读这么多
 _RESET_RETRY_WAIT_S = 2.0      # curl (56) 后同一身份重试前的等待
 
 
@@ -60,8 +67,33 @@ def impersonate_for(user_agent: str) -> str:
     return "chrome"
 
 
-def is_challenge(resp) -> bool:
-    return bool(resp.headers.get("cf-mitigated")) or b"challenge-platform" in resp.content[:20000]
+def is_challenge(headers, body: bytes) -> bool:
+    return bool(headers.get("cf-mitigated")) or b"challenge-platform" in body[:20000]
+
+
+def pdf_offset(head: bytes) -> Optional[int]:
+    """%PDF- 在前 1024 字节内、之前只有空白或 BOM 时返回它的位置；否则不是 PDF（与 paper_downloader 一致）。"""
+    i = head.find(b"%PDF-", 0, _PDF_HEADER_WINDOW)
+    if i < 0 or head[:i].strip(_PDF_LEADING_JUNK):
+        return None
+    return i
+
+
+class BadPdf(Exception):
+    """拿到了 PDF 但过小（不完整）或超过大小上限。"""
+
+    def __init__(self, message: str, retry: bool) -> None:
+        super().__init__(message)
+        self.retry = retry
+
+
+@dataclass
+class Fetched:
+    code: int
+    headers: dict
+    saved: Optional[Path]     # 是 PDF 时已写好的文件
+    size: int
+    body: bytes               # 不是 PDF 时响应的开头（≤ _HTML_LIMIT）
 
 
 @dataclass
@@ -190,15 +222,69 @@ class Downloader:
         s.headers["user-agent"] = ident.user_agent
         return s
 
+    def _fetch(self, url: str, ident: Identity, session, dest: Path) -> Fetched:
+        """流式请求一次。是 PDF 就写到 dest（先写 .part 再原子改名），否则只留响应开头。网络异常原样抛出。"""
+        resp = session.get(url, stream=True, proxy=self.proxy.url_for(ident.proxy_server), allow_redirects=True,
+                           timeout=(self.cfg.connect_timeout_s, self.cfg.download_timeout_s))
+        try:
+            chunks = resp.iter_content(chunk_size=_CHUNK)
+            head = b""
+            for chunk in chunks:
+                head += chunk
+                if len(head) >= _PDF_HEADER_WINDOW:
+                    break
+            offset = pdf_offset(head)
+            if offset is None:
+                body = bytearray(head)
+                for chunk in chunks:
+                    body += chunk
+                    if len(body) >= _HTML_LIMIT:
+                        break
+                body = body[:_HTML_LIMIT]
+                return Fetched(resp.status_code, dict(resp.headers), None, len(body), bytes(body))
+
+            limit = self.cfg.max_file_size_mb * 1024 * 1024
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + ".part")
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(head[offset:])
+                    size = len(head) - offset
+                    for chunk in chunks:
+                        size += len(chunk)
+                        if size > limit:
+                            raise BadPdf(f"超过 {self.cfg.max_file_size_mb} MB 上限，已中止", retry=False)
+                        f.write(chunk)
+                if size < self.cfg.min_file_size:
+                    raise BadPdf(f"文件过小（{size} 字节），可能不完整", retry=True)
+                tmp.replace(dest)
+            finally:
+                tmp.unlink(missing_ok=True)
+            return Fetched(resp.status_code, dict(resp.headers), dest, size, b"")
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
     def _download(self, task: Task, ident: Identity, session) -> tuple[bool, str]:
         """下载一个任务并写结果；返回 (身份是否还能继续用, 结果: pdf / rejected / challenged / other)。"""
         t0 = time.monotonic()
         elapsed_ms = lambda: int((time.monotonic() - t0) * 1000)
+        dest = pdf_path(self.out, task.paper_uid)
         for attempt in (1, 2):
             try:
-                resp = session.get(task.pdf_url, proxy=self.proxy.url_for(ident.proxy_server),
-                                   timeout=self.cfg.download_timeout_s, allow_redirects=True)
+                got = self._fetch(task.pdf_url, ident, session, dest)
                 break
+            except BadPdf as e:
+                if e.retry:
+                    self._retry_or_fail(task, ident, "extract_failed", str(e))
+                else:
+                    self.db.finish(task, Status.FAILED, exit_ip=ident.exit_ip, error_kind="extract_failed",
+                                   error_message=str(e), elapsed_ms=elapsed_ms())
+                    self.stats.add("failed")
+                    logger.warning("下载失败 %s: %s", task.pdf_url, e)
+                return True, "other"
             except Exception as e:
                 err = f"{type(e).__name__}: {str(e).splitlines()[0][:160] if str(e) else ''}"
                 if attempt == 1 and "(56)" in err:
@@ -208,18 +294,13 @@ class Downloader:
                 self._retry_or_fail(task, ident, "network", err)
                 return "(28)" in err, "other"       # 超时保留身份；连接再次被断/被拒多半是 IP 掉线，换身份
 
-        code, body = resp.status_code, resp.content
-        if body[:4] == b"%PDF":
-            path = pdf_path(self.out, task.paper_uid)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(path.name + ".part")
-            tmp.write_bytes(body)
-            tmp.replace(path)
-            self.db.finish(task, Status.SUCCESS, http_status=code, file_path=str(path), file_size=len(body),
+        code = got.code
+        if got.saved is not None:
+            self.db.finish(task, Status.SUCCESS, http_status=code, file_path=str(got.saved), file_size=got.size,
                            elapsed_ms=elapsed_ms(), exit_ip=ident.exit_ip)
             self.stats.add("success")
             return True, "pdf"
-        if is_challenge(resp):
+        if is_challenge(got.headers, got.body):
             if not self._identity_alive(ident, session):
                 return self._drop_identity(task, ident, f"HTTP {code} 挑战，落地页也被挑战，cookie 被拒"), "rejected"
             self.stats.add("challenged")
@@ -233,13 +314,13 @@ class Downloader:
             self._retry_or_fail(task, ident, "server_error", f"HTTP {code}", http_status=code)
             return True, "other"
 
-        html = body.decode("utf-8", "replace")
+        html = got.body.decode("utf-8", "replace")
         kind, title = classify_html(html), page_title(html)[:200]
         if kind == "blocked":
             return self._drop_identity(task, ident, f"IP 被站点封禁: {title}"), "rejected"
         self.non_pdf_dir.mkdir(parents=True, exist_ok=True)
-        (self.non_pdf_dir / (pdf_path(self.out, task.paper_uid).stem + ".html")).write_bytes(body)
-        stopped = self.db.finish(task, Status.NON_PDF, http_status=code, file_size=len(body),
+        (self.non_pdf_dir / (dest.stem + ".html")).write_bytes(got.body)
+        stopped = self.db.finish(task, Status.NON_PDF, http_status=code, file_size=got.size,
                                  elapsed_ms=elapsed_ms(), exit_ip=ident.exit_ip, error_kind=kind,
                                  error_message=title or None)
         self.stats.add("non_pdf")
@@ -261,7 +342,7 @@ class Downloader:
         except Exception as e:
             logger.info("验身份时请求落地页出错 %s: %s", ident.exit_ip, type(e).__name__)
             return False
-        return resp.status_code < 400 and not is_challenge(resp)
+        return resp.status_code < 400 and not is_challenge(resp.headers, resp.content)
 
     def _drop_identity(self, task: Task, ident: Identity, reason: str) -> bool:
         self.stats.add("rejected")

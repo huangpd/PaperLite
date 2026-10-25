@@ -15,6 +15,7 @@
 - **代理偶尔成批断连**：2026-10-25 00:28 有 13 个不同 IP 在 28 秒内先后报 `curl: (56) Connection closed abruptly`，原先一律丢身份，健康身份从 17 掉到 7、补了约 1.5 分钟。现在 (56) 先用同一身份重试一次。
 - **收尾不再白补身份**：只剩别的线程的在途任务时，空等的下载线程注销需求并把身份还回池里（之前最后 1 条重试时生产者仍按 20 个线程补身份，停止时池里空闲 20 个）。
 - **冷启动**：第一个身份要等一次过盾（实测约 20 秒）。想省掉就在下载前一两分钟先 `paperlite produce --out <目录> --keep 20`，代价是没人下载时也在消耗 IP。
+- **流式下载**：超时是卡顿超时（`download_timeout_s`：连续这么久收不到数据），不是总时长，2 Mbps 的代理上大文件也不会被掐断；内存里最多一个 256KB 的块。`%PDF-` 须在前 1024 字节内、之前只允许空白 / BOM（写盘时去掉），与 paper_downloader 一致；小于 `min_file_size`（1024 字节）计一次重试，超过 `max_file_size_mb`（200）中止判 `failed / extract_failed`。
 - **熔断**：2026-10-24 22:38 实测，新过盾的身份全部一篇没下成就被 403 挑战（原因待查，同时代理配额耗尽），没有保护时 1 分钟烧掉 16 个 IP。现在连续 `max_fresh_rejects`（5）个新身份一用就被拒，生产者暂停 `breaker_pause_s`（600s）并告警，之后放一个身份试探，再被拒立刻重新暂停。网络错误不计入。
 - **过盾失败直接换 IP**：同一 IP 重试很少成功，换 IP 更快。
 
@@ -36,7 +37,7 @@ PaperLite/
 | `store.py` | Redis 身份池：`add` / `claim`（Lua 原子领用，独占）/ `heartbeat` / `release` / `discard` / `reap` / `stats` |
 | `producer.py` | 按需生产：目标健康身份数 = clamp(在线下载线程数, `min_identities`, `max_identities`)，最多 `max_browsers` 个浏览器同时过盾 |
 | `browser.py` | 一次过盾：独立 CloakBrowser 进程（一 IP 一指纹）经代理打开落地页，等挑战消失并拿到 `cf_clearance` |
-| `consumer.py` | 下载线程：从任务库领任务、从身份池领身份，同 IP 请求间隔 `request_gap_s`；cookie 被拒/IP 封禁/IP 掉线/寿命将尽就丢弃身份，任务放回不计重试 |
+| `consumer.py` | 下载线程：从任务库领任务、从身份池领身份，同 IP 请求间隔 `request_gap_s`；**流式下载**（先读 1024 字节判文件头，是 PDF 就边下边写 `.part`、完成后原子改名；不是 PDF 只读前 256KB）；cookie 被拒/IP 封禁/IP 掉线/寿命将尽就丢弃身份，任务放回不计重试 |
 | `tasks.py` | SQLite 任务库（表结构见下） |
 | `proxy.py` | 调短效代理提取接口拿新 IP 并体检（每个身份一个 IP，用完即弃） |
 | `classify.py` | PDF 链接返回 HTML 时判 `error_kind`：`not_found` / `blocked` / `paywall` / `landing_page` |
@@ -97,7 +98,7 @@ uv run pytest            # 或 uv run python -m unittest discover -s tests
 | `pdf_url` / `source` / `batch_no` | 导入时的原值 |
 | `volume` | DOI 后缀点号前的卷期号（`10.1145/1012326.1012328` → `1012326`），导入时提取；新式纯数字 DOI 为空，不参与卷期停止 |
 | `status` | `pending` → `running` → `success` / `non_pdf` / `failed`（CHECK 约束） |
-| `error_kind` | 最近一次没成功的类别：`not_found` / `paywall` / `landing_page`（non_pdf）；`network` / `server_error`（failed 或重试中）；`challenge_failed`（URL 被单独挑战满次数）；`blocked` 只用于丢弃身份，不落到最终结果 |
+| `error_kind` | 最近一次没成功的类别：`not_found` / `paywall` / `landing_page`（non_pdf）；`network` / `server_error` / `extract_failed`（过小或超过大小上限）；`challenge_failed`（URL 被单独挑战满次数）；`blocked` 只用于丢弃身份，不落到最终结果 |
 | `error_message` | non_pdf 时是页面标题；失败时是错误信息 |
 | `http_status` / `file_size` / `elapsed_ms` | 最近一次尝试的 HTTP 状态、响应字节数、耗时（毫秒） |
 | `exit_ip` | 最近一次尝试用的出口 IP（paper_downloader 没有这列） |

@@ -46,7 +46,10 @@ class PoolConfig:
     min_left_s: float = 20            # 身份剩余寿命低于此值不再发请求
     lease_ttl_s: float = 120          # 下载线程占用身份的心跳 TTL；进程崩溃后到期自动归还
     request_gap_s: tuple[float, float] = (3.0, 5.0)   # 同一 IP 两次请求的随机间隔
-    download_timeout_s: float = 120
+    connect_timeout_s: float = 15
+    download_timeout_s: float = 120   # 流式下载的卡顿超时：连续这么久收不到数据才算超时（不是总时长上限）
+    min_file_size: int = 1024         # PDF 小于此字节数视为不完整，计一次重试
+    max_file_size_mb: int = 200       # 超过就中止，判 failed / extract_failed
     max_tries: int = 3                # 单条 URL 的网络错误重试次数（cookie 被拒不计）
     max_url_challenges: int = 3       # 单条 URL 带有效 cookie 仍被挑战满这么多次 → failed / challenge_failed
     volume_stop_after: int = 3        # 同一卷期还没下到 PDF、已有这么多篇 404/订阅/摘要页 → 停掉该卷期其余任务；0 关闭

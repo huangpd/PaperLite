@@ -14,7 +14,7 @@ SQLite 任务库：一个站点一个库（<out>/tasks.db），存任务与结�
   - volume：DOI 后缀点号前的卷期号（10.1145/1012326.1012328 → 1012326），新式纯数字 DOI 为空；
     同一卷期还没下到过 PDF 时最多同时放 volume_stop_after 篇出去，这几篇都是 404 / 订阅 / 摘要页
     就停掉该卷期其余任务：记 non_pdf、inferred = 1，不再请求（见 volume_stops 表）
-  - error_kind 用 paper_downloader 站点监控的类别：not_found / paywall / landing_page / blocked / network / server_error
+  - error_kind 用 paper_downloader 站点监控的类别（extract_failed = 拿到了 PDF 但过小 / 超过大小上限）：not_found / paywall / landing_page / blocked / network / server_error
   - created_at / updated_at 为北京时间文本 'YYYY-MM-DD HH:MM:SS'
 paper_downloader 的 host 生成列、fetched_via 不需要：一个库只有一个主机、只走 cookie 路线；多了 exit_ip。
 
@@ -45,7 +45,8 @@ class Status:
 
 
 # 与 paper_downloader monitor/classify.py 同名类别
-ERROR_KINDS = ("not_found", "paywall", "landing_page", "blocked", "network", "server_error", "challenge_failed")
+ERROR_KINDS = ("not_found", "paywall", "landing_page", "blocked", "network", "server_error", "challenge_failed",
+               "extract_failed")
 # 计入卷期停止的"没有 PDF"类别（实测 ACM 的订阅页和摘要页都没有 PDF 入口，只差一条横幅）
 NO_PDF_KINDS = ("not_found", "paywall", "landing_page")
 
