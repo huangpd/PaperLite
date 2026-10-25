@@ -12,6 +12,9 @@ PaperLite 命令行。一个站点一个输出目录，任务库是其中的 tas
   paperlite retry    --out pdfs/acm --status failed       # 把失败的重置为 pending
   paperlite export   --out pdfs/acm --status non_pdf > non_pdf.csv
 
+任务库默认是 <--out>/tasks.db；--db 可单独指定（例如 PDF 输出到 goofys / s3fs 这类对象存储挂载时，
+任务库必须放本地盘：SQLite 要随机写、文件锁和 mmap，FUSE 挂载不支持）。
+
 配置查找顺序：--config > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml（从 config.example.toml 复制）。
 也可以 python -m paperlite ...。
 """
@@ -51,8 +54,13 @@ def _load(path: str | None) -> tuple[PoolConfig, ProxySettings]:
         raise SystemExit(f"配置错误: {e}")
 
 
-def _db(out: str) -> TaskDB:
-    return TaskDB(Path(out) / DB_NAME)
+def _db(args) -> TaskDB:
+    """--db 优先，否则 <--out>/tasks.db。"""
+    if getattr(args, "db", None):
+        return TaskDB(Path(args.db).expanduser())
+    if getattr(args, "out", None):
+        return TaskDB(Path(args.out) / DB_NAME)
+    raise SystemExit("需要 --db 或 --out 指定任务库")
 
 
 def _read_url_file(path: str):
@@ -98,7 +106,7 @@ class _ProducerThread:
 
 
 def _download(args, cfg, proxy, store, with_producer: bool) -> None:
-    db = _db(args.out)
+    db = _db(args)
     if args.urls:
         _import(db, args.urls)
     try:
@@ -154,8 +162,8 @@ def _report(dl: Downloader, store: IdentityStore, cfg: PoolConfig, stop: threadi
 
 def _status(args, cfg) -> None:
     host = args.host
-    if args.out:
-        db = _db(args.out)
+    if args.out or args.db:
+        db = _db(args)
         host = host or db.host()
         c = db.counts()
         print(f"任务库 {db.path}（{host or '空'}）: 共 {sum(c.values())}  " +
@@ -183,7 +191,7 @@ def _status(args, cfg) -> None:
 
 
 def _export(args) -> None:
-    db = _db(args.out)
+    db = _db(args)
     rows = db.rows(args.status)
     out = open(args.file, "w", newline="", encoding="utf-8") if args.file != "-" else sys.stdout
     w = csv.writer(out)
@@ -207,9 +215,11 @@ def main() -> None:
     ap.add_argument("--log-level", default="INFO")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    out_help = "站点输出目录：PDF、tasks.db、non_pdf/ 都在这里"
+    out_help = "站点输出目录：PDF、non_pdf/ 都在这里；不指定 --db 时任务库也在这里（tasks.db）"
+    db_help = "任务库路径（默认 <--out>/tasks.db）；输出目录在 goofys 等对象存储挂载上时须指向本地盘"
     p = sub.add_parser("import", help="导入任务")
-    p.add_argument("--out", required=True, help=out_help)
+    p.add_argument("--out", help=out_help)
+    p.add_argument("--db", help=db_help)
     p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 pdf_url 列的 CSV；须同一主机")
     p.add_argument("--source", default="")
     p.add_argument("--batch", default="", help="写入 batch_no")
@@ -217,25 +227,30 @@ def main() -> None:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--host")
     g.add_argument("--out", help="取该任务库的主机")
+    g.add_argument("--db", help="取该任务库的主机（同 --out，直接给任务库路径）")
     p.add_argument("--keep", type=int, help="没有下载线程时也养着这么多身份（覆盖 min_identities），"
                                             "下载前一两分钟先启动可省掉冷启动的过盾等待")
     for name in ("download", "run"):
         p = sub.add_parser(name, help="只消费" if name == "download" else "生产 + 消费，下载完退出")
         p.add_argument("--out", required=True, help=out_help)
+        p.add_argument("--db", help=db_help)
         p.add_argument("--urls", help="先导入这个文件（可选）")
         p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数")
     p = sub.add_parser("status", help="任务统计与身份池")
     p.add_argument("--out")
+    p.add_argument("--db", help=db_help)
     p.add_argument("--host")
     p = sub.add_parser("retry", help="把 failed / non_pdf 的任务重置为 pending")
-    p.add_argument("--out", required=True)
+    p.add_argument("--out")
+    p.add_argument("--db", help=db_help)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--status", choices=[Status.FAILED, Status.NON_PDF])
     g.add_argument("--stopped-volumes", action="store_true",
                    help="重新核实按卷期停掉的：这些卷期的 non_pdf（样本 + 推断）全部放回 pending")
     p.add_argument("--kind", choices=ERROR_KINDS, help="配合 --status，只重置该 error_kind")
     p = sub.add_parser("export", help="导出任务为 CSV")
-    p.add_argument("--out", required=True)
+    p.add_argument("--out")
+    p.add_argument("--db", help=db_help)
     p.add_argument("--status", choices=Status.ALL)
     p.add_argument("--file", default="-", help="输出文件，默认标准输出")
     args = ap.parse_args()
@@ -251,12 +266,12 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _raise_interrupt)
 
     if args.cmd == "import":
-        db = _db(args.out)
+        db = _db(args)
         _import(db, args.urls, args.source, args.batch)
         db.close()
         return
     if args.cmd == "retry":
-        db = _db(args.out)
+        db = _db(args)
         if args.stopped_volumes:
             v, n = db.reset_stopped_volumes()
             print(f"已重置 {v} 个被停卷期的 {n} 个任务为 pending")
@@ -270,8 +285,8 @@ def main() -> None:
 
     cfg, proxy = _load(args.config)
     if args.cmd == "status":
-        if not (args.out or args.host):
-            raise SystemExit("status 需要 --out 或 --host")
+        if not (args.out or args.db or args.host):
+            raise SystemExit("status 需要 --out / --db 或 --host")
         _status(args, cfg)
         return
 
@@ -279,8 +294,8 @@ def main() -> None:
     store.ping()
     if args.cmd == "produce":
         host = args.host
-        if args.out:
-            db = _db(args.out)
+        if args.out or args.db:
+            db = _db(args)
             host = db.host()
             db.close()
             if not host:

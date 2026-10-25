@@ -81,6 +81,7 @@ uv run pytest            # 或 uv run python -m unittest discover -s tests
 
 - 下面的 `paperlite` 命令在项目 venv 里（`uv run paperlite ...` 或先 `source .venv/bin/activate`）；也可在项目根目录用 `python -m paperlite ...`。
 - 配置查找顺序：`--config` > 环境变量 `PAPERLITE_CONFIG` > 当前目录的 `config.toml`。在项目根目录运行不用指定。
+- 任务库默认是 `<--out>/tasks.db`，`--db` 可单独指定（各子命令都支持；import / status / retry / export / produce 只给 `--db` 也行）。**输出目录在 goofys、s3fs 这类对象存储挂载上时，任务库必须用 `--db` 放本地盘**：SQLite 要随机写、文件锁和 mmap，FUSE 挂载不支持；PDF 本身是顺序写入，可以放在挂载上（每篇改名在 S3 上是一次复制 + 删除）。例：`paperlite run --out /mnt/goofys/acm --db /data/paperlite/acm.db`
 - 一个任务库只能有一个主机（第一次导入时记下）；重复导入同一链接不会重置已有任务。
 - 同一个库同时只允许一个下载进程；启动时把上次中断残留的 `running` 放回 `pending`，随时 Ctrl+C 再重跑即可续上。
 - 停止：前台 Ctrl+C；后台进程用 `kill <pid>` 或 `pkill -f "paperlite produce"`（SIGTERM，与 Ctrl+C 一样优雅退出：在途任务放回 pending，在用身份还回池里，生产者关掉浏览器并释放生产者锁）。注意 `pkill -f` 的匹配串若也出现在执行它的 shell 命令行里（如 `ssh host '... cookie_pool produce ...; pkill -f ...'`），会连那个 shell 一起杀掉。

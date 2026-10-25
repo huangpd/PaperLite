@@ -237,6 +237,31 @@ class VolumeStopTest(unittest.TestCase):
         self.assertEqual(len([self.db.claim("w") for _ in range(4)]), 4)
 
 
+class CliDbOptionTest(unittest.TestCase):
+    """--db 让任务库和输出目录分开（输出目录在 goofys 等对象存储挂载上时，任务库放本地盘）。"""
+
+    def run_cli(self, *argv):
+        from paperlite import cli
+        with mock.patch("sys.argv", ["paperlite", *argv]):
+            cli.main()
+
+    def test_db_separate_from_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            urls = tmp / "urls.txt"
+            urls.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\nhttps://dl.acm.org/doi/pdf/10.1145/1.3\n")
+            out, db = tmp / "mnt" / "pdfs", tmp / "local" / "acm.db"
+            self.run_cli("import", "--out", str(out), "--db", str(db), "--urls", str(urls))
+            self.assertTrue(db.exists())
+            self.assertFalse((out / "tasks.db").exists())                 # 输出目录里没有任务库
+            self.run_cli("retry", "--db", str(db), "--status", "failed")  # 只给 --db 也行
+            csv_path = tmp / "x.csv"
+            self.run_cli("export", "--db", str(db), "--file", str(csv_path))
+            self.assertEqual(len(csv_path.read_text().strip().splitlines()), 3)
+            with self.assertRaises(SystemExit):
+                self.run_cli("export", "--file", str(csv_path))            # 两个都没给
+
+
 class ProducerTargetTest(unittest.TestCase):
     def test_target_follows_workers(self):
         p = Producer(PoolConfig(max_identities=20, min_identities=2), mock.Mock(), mock.Mock(), "dl.acm.org")
