@@ -1,6 +1,6 @@
 [project]
 name = "paperlite"
-version = "0.1.0"
+version = "0.1.1"
 description = "大批量 PDF 下载：浏览器过盾 cookie 池（Redis）+ curl_cffi + SQLite 任务库"
 readme = "README.md"
 requires-python = ">=3.11"
