@@ -257,12 +257,70 @@ def _raise_interrupt(signum, frame):
     raise KeyboardInterrupt
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(prog="paperlite", description="浏览器过盾 cookie 池 + curl_cffi 批量下载")
+# 顶层帮助里的命令清单（按常用顺序）
+_COMMANDS = {
+    "init": "在当前目录生成配置模板 config.toml",
+    "import": "导入任务（txt 一行一个链接，或带 pdf_url 列的 CSV）",
+    "run": "生产身份 + 下载，下载完退出",
+    "produce": "只生产身份，常驻",
+    "download": "只下载，需有生产者在跑",
+    "status": "任务统计、失败分类、身份池",
+    "retry": "把 failed / non_pdf 的任务重置为 pending",
+    "export": "导出任务为 CSV",
+    "help": "显示某个命令的帮助",
+}
+
+_DESCRIPTION = "浏览器过盾 cookie 池 + curl_cffi，单站点大批量下载 PDF\n\n命令:\n" + \
+    "\n".join(f"  {k:<10}{v}" for k, v in _COMMANDS.items())
+
+_EPILOG = """示例:
+  paperlite init                         # 生成 config.toml，填好代理
+  paperlite import --urls acm.txt        # 导入 → pdfs/dl.acm.org/
+  paperlite run --workers 20             # 开跑，Ctrl+C 随时停，再执行从断点继续
+  paperlite status
+
+用 paperlite help <命令> 查看某个命令的参数。"""
+
+
+class _Formatter(argparse.RawDescriptionHelpFormatter):
+    def add_usage(self, usage, actions, groups, prefix=None):
+        super().add_usage(usage, actions, groups, prefix="用法: ")
+
+
+class _Parser(argparse.ArgumentParser):
+    _ERRORS = {"argument <命令>: invalid choice": "未知命令", "choose from": "可选", "the following arguments are required": "缺少必填参数", "unrecognized arguments": "无法识别的参数",
+               "invalid choice": "无效的选项", "expected one argument": "需要一个值",
+               "not allowed with argument": "不能与此参数同时使用",
+               "one of the arguments": "必须给出其中之一", "is required": ""}
+
+    def error(self, message):
+        for en, zh in self._ERRORS.items():
+            message = message.replace(en, zh)
+        self.print_usage(sys.stderr)
+        sys.exit(f"错误: {message.strip()}\n用 paperlite help {self.prog.split()[-1]} 查看参数"
+                 if " " in self.prog else f"错误: {message.strip()}\n用 paperlite -h 查看用法")
+
+
+def _new_parser(factory, *args, **kw) -> argparse.ArgumentParser:
+    p = factory(*args, add_help=False, formatter_class=_Formatter, **kw)
+    p._optionals.title = "选项"
+    p.add_argument("-h", "--help", action="help", help="显示帮助")
+    return p
+
+
+def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
+    ap = _new_parser(_Parser, prog="paperlite", usage="%(prog)s [选项] <命令> [参数]",
+                     description=_DESCRIPTION, epilog=_EPILOG)
     ap.add_argument("--config", help=f"配置文件，默认取环境变量 {config_mod.CONFIG_ENV}，再默认当前目录的 config.toml")
-    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    ap.add_argument("--log-level", default="INFO")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("--log-level", default="INFO", help="日志级别，默认 INFO")
+    ap.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}", help="显示版本")
+    sub = ap.add_subparsers(dest="cmd", metavar="<命令>", help=argparse.SUPPRESS)
+    parsers: dict[str, argparse.ArgumentParser] = {}
+
+    def cmd(name: str) -> argparse.ArgumentParser:
+        parsers[name] = _new_parser(sub.add_parser, name, prog=f"paperlite {name}",
+                                    description=_COMMANDS[name])
+        return parsers[name]
 
     def site_args(p, out_required: bool = False):
         p.add_argument("--out", required=out_required,
@@ -271,36 +329,49 @@ def main() -> None:
         p.add_argument("--db", help="任务库路径（优先于配置 db_dir；默认 <输出目录>/tasks.db）；"
                                     "输出目录在 goofys 等对象存储挂载上时须在本地盘")
 
-    p = sub.add_parser("init", help="生成配置模板（默认 ./config.toml，或 --config 指定的路径）")
+    p = cmd("init")
     p.add_argument("--force", action="store_true", help="已存在也覆盖")
-    p = sub.add_parser("import", help="导入任务")
+    p = cmd("import")
     p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 pdf_url 列的 CSV；须同一主机")
     site_args(p)
-    p.add_argument("--source", default="")
+    p.add_argument("--source", default="", help="写入 source")
     p.add_argument("--batch", default="", help="写入 batch_no")
-    p = sub.add_parser("produce", help="只生产身份（常驻，Ctrl+C / SIGTERM 退出）")
+    p = cmd("produce")
     site_args(p)
     p.add_argument("--keep", type=int, help="没有下载线程时也养着这么多身份（覆盖 min_identities），"
                                             "下载前一两分钟先启动可省掉冷启动的过盾等待")
     for name in ("download", "run"):
-        p = sub.add_parser(name, help="只消费" if name == "download" else "生产 + 消费，下载完退出")
+        p = cmd(name)
         site_args(p)
         p.add_argument("--urls", help="先导入这个文件（可选）")
-        p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数")
-    p = sub.add_parser("status", help="任务统计与身份池")
+        p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数，默认 20")
+    p = cmd("status")
     site_args(p)
-    p = sub.add_parser("retry", help="把 failed / non_pdf 的任务重置为 pending")
+    p = cmd("retry")
     site_args(p)
     g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--status", choices=[Status.FAILED, Status.NON_PDF])
+    g.add_argument("--status", choices=[Status.FAILED, Status.NON_PDF], help="重置该状态的任务")
     g.add_argument("--stopped-volumes", action="store_true",
                    help="重新核实按卷期停掉的：这些卷期的 non_pdf（样本 + 推断）全部放回 pending")
     p.add_argument("--kind", choices=ERROR_KINDS, help="配合 --status，只重置该 error_kind")
-    p = sub.add_parser("export", help="导出任务为 CSV")
+    p = cmd("export")
     site_args(p)
-    p.add_argument("--status", choices=Status.ALL)
+    p.add_argument("--status", choices=Status.ALL, help="只导出该状态")
     p.add_argument("--file", default="-", help="输出文件，默认标准输出")
+    p = cmd("help")
+    p.add_argument("command", nargs="?", choices=[c for c in _COMMANDS if c != "help"], metavar="<命令>")
+    return ap, parsers
+
+
+def main() -> None:
+    ap, parsers = _build_parser()
     args = ap.parse_args()
+    if args.cmd is None:                     # 只敲 paperlite：像 uv 一样打印用法，不报错
+        ap.print_help()
+        return
+    if args.cmd == "help":
+        (parsers[args.command] if args.command else ap).print_help()
+        return
 
     logging.basicConfig(level=args.log_level.upper(), stream=sys.stderr if args.cmd == "export" else sys.stdout,
                         format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s", datefmt="%H:%M:%S")

@@ -1,0 +1,39 @@
+# 推送 v* 标签 → 测试 → 构建 → 用 PyPI Trusted Publishing 发布（不需要 token）
+# PyPI 端配置：https://pypi.org/manage/account/publishing/
+#   PyPI Project Name: paperlite   Owner: huangpd   Repository: PaperLite
+#   Workflow name: publish.yml     Environment name: pypi
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: 标签须与 pyproject 版本一致
+        run: |
+          v=$(uv version --short)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "标签 $GITHUB_REF_NAME 与版本 $v 不一致"; exit 1; }
+      - run: uv run --python 3.12 pytest -q
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write          # Trusted Publishing 必需
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

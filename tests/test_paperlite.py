@@ -260,6 +260,14 @@ class CliDbOptionTest(unittest.TestCase):
         with mock.patch("sys.argv", ["paperlite", *argv]):
             cli.main()
 
+    def test_no_command_prints_help(self):
+        import contextlib, io
+        for argv in ((), ("help",), ("help", "run")):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.run_cli(*argv)                             # 不抛 SystemExit
+            self.assertIn("用法: paperlite", buf.getvalue())
+
     def test_init_writes_template(self):
         self.run_cli("init")
         cfg = Path("config.toml")
