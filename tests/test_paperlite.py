@@ -1,5 +1,6 @@
 import os
 import tempfile
+import tomllib
 import threading
 import time
 import unittest
@@ -258,6 +259,17 @@ class CliDbOptionTest(unittest.TestCase):
         from paperlite import cli
         with mock.patch("sys.argv", ["paperlite", *argv]):
             cli.main()
+
+    def test_init_writes_template(self):
+        self.run_cli("init")
+        cfg = Path("config.toml")
+        self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
+        with open(cfg, "rb") as f:
+            raw = tomllib.load(f)
+        self.assertEqual(set(raw), {"proxy", "pool", "landing"})
+        with self.assertRaises(SystemExit):                     # 已存在不覆盖
+            self.run_cli("init")
+        self.run_cli("init", "--force")
 
     def test_db_separate_from_out(self):
         with tempfile.TemporaryDirectory() as tmp:

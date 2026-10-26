@@ -4,6 +4,7 @@
 PaperLite 命令行。一个站点（主机）一个输出目录，默认 <out_root>/<主机>（out_root 默认 pdfs），任务库是其中的 tasks.db。
 生产与消费可以分开跑（不同进程，只共享 Redis），也可以 run 一起跑。
 
+  paperlite init                                    # 在当前目录生成 config.toml 模板
   paperlite import   --urls acm.txt                 # 导入任务（txt 一行一个，或带 pdf_url 列的 CSV）→ pdfs/dl.acm.org/
   paperlite run      --workers 20                   # 同进程生产 + 消费，下载完退出
   paperlite produce                                 # 只生产身份，常驻
@@ -16,7 +17,7 @@ PaperLite 命令行。一个站点（主机）一个输出目录，默认 <out_r
 任务库：--db > 配置 [pool] db_dir > <输出目录>/tasks.db（PDF 输出到 goofys / s3fs 这类对象存储挂载时，
 任务库必须放本地盘：SQLite 要随机写、文件锁和 mmap，FUSE 挂载不支持）。
 
-配置查找顺序：--config > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml（从 config.example.toml 复制）。
+配置查找顺序：--config > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml（paperlite init 生成）。
 也可以 python -m paperlite ...。
 """
 
@@ -270,6 +271,8 @@ def main() -> None:
         p.add_argument("--db", help="任务库路径（优先于配置 db_dir；默认 <输出目录>/tasks.db）；"
                                     "输出目录在 goofys 等对象存储挂载上时须在本地盘")
 
+    p = sub.add_parser("init", help="生成配置模板（默认 ./config.toml，或 --config 指定的路径）")
+    p.add_argument("--force", action="store_true", help="已存在也覆盖")
     p = sub.add_parser("import", help="导入任务")
     p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 pdf_url 列的 CSV；须同一主机")
     site_args(p)
@@ -309,6 +312,14 @@ def main() -> None:
     signal.signal(signal.SIGINT, signal.default_int_handler)
     signal.signal(signal.SIGTERM, _raise_interrupt)
 
+    if args.cmd == "init":
+        path = config_mod.resolve_path(args.config)
+        try:
+            config_mod.write_example(path, args.force)
+        except FileExistsError as e:
+            sys.exit(str(e))
+        logger.info("已生成 %s：填好 [proxy] 的提取接口和代理账号密码再用", path.resolve())
+        return
     if args.cmd == "import":
         out, db = _open_site(args, create=True)
         _import(db, args.urls, args.source, args.batch)

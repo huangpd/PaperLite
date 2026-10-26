@@ -1,15 +1,35 @@
 [project]
 name = "paperlite"
 version = "0.1.0"
-description = "单站点大批量 PDF 下载：浏览器过盾 cookie 池（Redis）+ curl_cffi + SQLite 任务库"
+description = "大批量 PDF 下载：浏览器过盾 cookie 池（Redis）+ curl_cffi + SQLite 任务库"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "huangpd", email = "1655979823@qq.com" }]
+keywords = ["pdf", "downloader", "cloudflare", "curl_cffi", "cookie-pool", "scraping"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+]
 dependencies = [
     "cloakbrowser>=0.6.2",
     "curl-cffi>=0.15.0",
     "redis>=5.0",
     "certifi>=2024.2.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/huangpd/PaperLite"
+Repository = "https://github.com/huangpd/PaperLite"
+Issues = "https://github.com/huangpd/PaperLite/issues"
 
 [project.scripts]
 paperlite = "paperlite.cli:main"
@@ -18,11 +38,15 @@ paperlite = "paperlite.cli:main"
 dev = ["pytest>=8"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/paperlite"]
+
+# sdist 只放这些：项目目录里的 config.toml（含代理密码）、data/、db/、pdfs/ 绝不能进包
+[tool.hatch.build.targets.sdist]
+only-include = ["src/paperlite", "tests", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

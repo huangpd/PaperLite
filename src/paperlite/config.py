@@ -3,7 +3,7 @@
 """
 paperlite/config.py
 ─────────────────────
-读 config.toml（见 config.example.toml）。查找顺序：--config 参数 > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml。
+读 config.toml（模板见包内 config.example.toml，paperlite init 生成）。查找顺序：--config 参数 > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml。
   [proxy]    代理提取接口与鉴权
   [pool]     生产 / 消费参数
   [landing]  主机 → 过盾落地页
@@ -12,6 +12,7 @@ paperlite/config.py
 import hashlib
 import os
 import tomllib
+from importlib import resources
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,16 @@ CONFIG_NAME = "config.toml"
 def resolve_path(explicit: str | None = None) -> Path:
     """--config 参数 > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml。"""
     return Path(explicit or os.environ.get(CONFIG_ENV) or CONFIG_NAME).expanduser()
+
+
+def write_example(path: Path, force: bool = False) -> None:
+    """把包内的配置模板写到 path（含代理密码的文件，权限 600）。已存在且没给 force 就报错。"""
+    if path.exists() and not force:
+        raise FileExistsError(f"{path} 已存在（覆盖用 --force）")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(resources.files("paperlite").joinpath("config.example.toml").read_text(encoding="utf-8"),
+                    encoding="utf-8")
+    path.chmod(0o600)
 
 
 @dataclass(frozen=True)
@@ -82,7 +93,7 @@ def proxy_settings(raw: dict[str, Any]) -> ProxySettings:
 
 def _read(path: Path) -> dict[str, Any]:
     if not path.exists():
-        raise FileNotFoundError(f"配置文件不存在: {path.resolve()}（从 config.example.toml 复制；"
+        raise FileNotFoundError(f"配置文件不存在: {path.resolve()}（先执行 paperlite init 生成；"
                                 f"或用 --config / 环境变量 {CONFIG_ENV} 指定）")
     with open(path, "rb") as f:
         raw = tomllib.load(f)

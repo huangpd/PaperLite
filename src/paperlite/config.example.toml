@@ -1,5 +1,5 @@
-# PaperLite 配置。复制为 config.toml 再填写（在项目根目录运行时自动读取；别处运行用 --config 或 PAPERLITE_CONFIG）。
-# config.toml 含代理密码，已在 .gitignore 里，不要提交、不要同步到别处公开。
+# PaperLite 配置。paperlite init 生成为 ./config.toml 再填写（在当前目录运行时自动读取；别处运行用 --config 或 PAPERLITE_CONFIG）。
+# config.toml 含代理密码，不要提交、不要同步到别处公开。
 
 [proxy]
 api_url = ""                  # 短效代理提取接口（每次返回一个 IP，青果格式 JSON），必填

@@ -2,28 +2,38 @@
 
 专门处理**单一站点、大量 URL**：用浏览器持续生产过 Cloudflare 的 cookie，curl_cffi 领用下载。生产与消费只通过 Redis 交互，可以分开跑在不同进程上；任务与结果存在站点输出目录的 SQLite 库 `tasks.db` 里。多站点、通用的路由和兜底由 `paper_downloader` 负责。
 
-独立项目（原 `paper_downloader/cookie_pool/`，2026-10-25 拆出）：自己的依赖和 venv，配置是项目根目录的 `config.toml`，不依赖 `paper_downloader` 的任何代码，也不用 PostgreSQL。
+独立项目（原 `paper_downloader/cookie_pool/`，2026-10-25 拆出）：自己的依赖和 venv，配置是运行目录的 `config.toml`，不依赖 `paper_downloader` 的任何代码，也不用 PostgreSQL。
 
 ## 快速开始
 
 需要：Python ≥ 3.11、Redis、一个短效代理提取接口（每次返回一个新 IP，青果格式）。
 
 ```bash
-git clone https://github.com/huangpd/PaperLite.git && cd PaperLite
-uv sync                                   # 国内服务器：uv venv && uv pip install -e . --index-url https://pypi.tuna.tsinghua.edu.cn/simple
-cp config.example.toml config.toml        # 填 [proxy] 的提取接口和代理账号密码（config.toml 已在 .gitignore）
+pip install paperlite                     # 或 uv tool install paperlite；国内加 -i https://pypi.tuna.tsinghua.edu.cn/simple
+mkdir work && cd work
+paperlite init                            # 生成 ./config.toml（权限 600），填 [proxy] 的提取接口和代理账号密码
 
 # Redis：只监听本机、不落盘（身份 10 分钟就过期，不需要持久化）
 docker run -d --name cf-redis -p 127.0.0.1:6379:6379 redis:latest redis-server --save "" --appendonly no
 
 # 导入并开跑：输出目录按主机自动定为 pdfs/dl.acm.org，下载完自动退出
+paperlite import --urls acm.txt
+paperlite run --workers 20
+```
+
+从源码装（开发、改代码）：
+
+```bash
+git clone https://github.com/huangpd/PaperLite.git && cd PaperLite
+uv sync                                   # 国内服务器：uv venv && uv pip install -e . --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+uv run paperlite init
 uv run paperlite import --urls data/acm.txt
 uv run paperlite run --workers 20
 ```
 
 运行中每 30 秒打印一行进度（已处理条数、PDF 篇数、身份池、近 30 秒速度）。随时 Ctrl+C，在途任务会放回 pending，再执行同一条命令就从断点继续。
 
-`paperlite` 是安装时生成在 `.venv/bin/` 里的命令（`pyproject.toml` 的 `[project.scripts]`），后面的 `run` / `import` / `status` 是它的子命令。下面统一写成 `uv run paperlite ...`，这几种写法等价：
+`paperlite` 是安装时生成的命令（`pyproject.toml` 的 `[project.scripts]`），后面的 `run` / `import` / `status` 是它的子命令。pip 安装的直接写 `paperlite ...`；源码目录里下面统一写成 `uv run paperlite ...`，这几种写法等价：
 
 ```bash
 uv run paperlite status                           # uv 自动用项目 venv，不用激活
@@ -38,6 +48,7 @@ source .venv/bin/activate && paperlite status
 
 | 命令 | 作用 |
 |---|---|
+| `uv run paperlite init [--force]` | 在当前目录生成配置模板 `config.toml`（或写到 `--config` 指定的路径） |
 | `uv run paperlite import --urls <文件>` | 导入任务。txt 一行一个链接，或带 `pdf_url` 列（可选 `paper_uid` / `source` / `batch_no`）的 CSV。重复导入不重置已有任务；一个库只能有一个主机 |
 | `uv run paperlite run [--urls <文件>] [--workers 20]` | 同进程生产身份 + 下载，下载完退出 |
 | `uv run paperlite produce [--keep N]` | 只生产身份，常驻 |
@@ -105,7 +116,7 @@ SIGTERM 与 Ctrl+C 一样优雅退出：在途任务放回 pending、在用身�
 | `max_fresh_rejects` / `breaker_pause_s` | 5 / 600 | 新身份接连一用就被拒时熔断暂停生产 |
 | `debug_dir` | 空 | 过盾失败截图目录 |
 
-完整列表和注释见 `config.example.toml`。配置查找顺序：`--config` > 环境变量 `PAPERLITE_CONFIG` > 当前目录的 `config.toml`。
+完整列表和注释见 `paperlite init` 生成的模板（源码 `src/paperlite/config.example.toml`）。配置查找顺序：`--config` > 环境变量 `PAPERLITE_CONFIG` > 当前目录的 `config.toml`。
 
 ## 速度与 IP 用量（ACM 实测）
 
@@ -139,9 +150,9 @@ PAPERLITE_TEST_REDIS=redis://127.0.0.1:6379/0 uv run pytest   # 连真实 Redis 
 
 ```
 PaperLite/
-  pyproject.toml  uv.lock  README.md  .gitignore
-  config.example.toml      # 配置模板；复制为 config.toml（含代理密码，不提交）
-  src/paperlite/           # 代码（src 布局：测试跑的是安装好的包，不会误用源码目录）
+  pyproject.toml  uv.lock  README.md  LICENSE  .gitignore
+  config.toml              # paperlite init 生成（含代理密码，不提交）
+  src/paperlite/           # 代码（src 布局：测试跑的是安装好的包，不会误用源码目录）；config.example.toml 是配置模板
   tests/
   data/                    # URL 清单等输入数据（不提交）
 ```
