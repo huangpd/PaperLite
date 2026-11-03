@@ -57,11 +57,31 @@ source .venv/bin/activate && paperlite status
 | `uv run paperlite retry --status failed [--kind network]` | 把失败（或 `non_pdf`）重置为 pending |
 | `uv run paperlite retry --stopped-volumes` | 重新核实按卷期停掉的任务 |
 | `uv run paperlite export [--status non_pdf] [--file x.csv]` | 导出任务表为 CSV（默认输出到标准输出） |
+| `uv run paperlite turnstile --url <页面> --sitekey <key> [--proxy ...] [--json]` | 按目标页 + sitekey 取 Cloudflare Turnstile token；`--serve 8191` 起 HTTP 服务（见下） |
 
 所有命令都可以加 `--out` / `--host` / `--db` 指定站点和任务库；只有一个站点时都不用写：
 
 - **站点输出目录**：`--out` > `--host`、`--urls` 里链接的主机、`--db` 记录的主机 → `<out_root>/<主机>`（`out_root` 默认 `pdfs`）> `out_root` 下唯一的站点。有多个站点时会列出来，用 `--host dl.acm.org` 选一个。
 - **任务库**：`--db` > 配置 `[pool] db_dir`（`<db_dir>/<输出目录名>-<路径哈希>.db`）> `<输出目录>/tasks.db`。全局参数：`--config <文件>`、`--log-level`、`--version`。
+
+## Turnstile token（通用）
+
+给出目标页 URL 和 sitekey 就能拿 token，不依赖站点配置和 Redis：
+
+```bash
+uv run paperlite turnstile --url https://example.com/login --sitekey 0x4AAAA... --json
+# {"ok": true, "token": "1.xxxx…", "user_agent": "Mozilla/5.0 …", "seconds": 15.3, "clicks": 2, "error": ""}
+
+uv run paperlite turnstile --serve 8191 --concurrency 4        # HTTP 服务
+curl localhost:8191/solve -d '{"url":"https://example.com/login","sitekey":"0x4AAAA...","proxy":"http://u:p@1.2.3.4:8000"}'
+```
+
+原理：用 CloakBrowser 打开目标 URL，但拦截这一个文档请求、换成只渲染该 sitekey 的最小页面（origin 仍是目标站，Turnstile 的 hostname 校验能过），
+在 `challenges.cloudflare.com` 的 iframe 上按坐标点复选框，从 callback 拿 token。卡在 "Verifying…" 时每 8 秒补点一次（实测只点一次常卡到超时）。
+可选 `action` / `cdata` 要与目标站一致（在页面的 `turnstile.render(...)` 参数或 `data-action` / `data-cdata` 里找）。
+token 一次性、约 300 秒有效；有的站会校验提交 token 的 IP/UA，提交时用同一代理和返回的 `user_agent`。
+
+过盾（`produce` / `run`）遇到交互式 Turnstile（如 ScienceDirect 的 "Are you a robot?" 页）也会自动点击，逻辑同上，见 `turnstile.py`。
 
 ## 常见场景
 
@@ -164,6 +184,7 @@ PaperLite/
 | `store.py` | Redis 身份池：`add` / `claim`（Lua 原子领用，独占）/ `heartbeat` / `release` / `discard` / `reap` / `stats` |
 | `producer.py` | 按需生产：目标健康身份数 = clamp(在线下载线程数, `min_identities`, `max_identities`)，最多 `max_browsers` 个浏览器同时过盾 |
 | `browser.py` | 一次过盾：独立 CloakBrowser 进程（一 IP 一指纹）经代理打开落地页，等挑战消失并拿到 `cf_clearance` |
+| `turnstile.py` | Turnstile 控件定位与点击（`TurnstileClicker`）、按 sitekey 取 token（`solve_turnstile`）、HTTP 服务 |
 | `consumer.py` | 下载线程：从任务库领任务、从身份池领身份，同 IP 请求间隔 `request_gap_s`；**流式下载**（先读 1024 字节判文件头，是 PDF 就边下边写 `.part`、完成后原子改名；不是 PDF 只读前 256KB）；cookie 被拒/IP 封禁/IP 掉线/寿命将尽就丢弃身份，任务放回不计重试 |
 | `tasks.py` | SQLite 任务库（表结构见下） |
 | `proxy.py` | 调短效代理提取接口拿新 IP 并体检（每个身份一个 IP，用完即弃） |

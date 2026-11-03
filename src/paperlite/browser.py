@@ -4,6 +4,7 @@
 paperlite/browser.py
 ──────────────────────
 用一个独立 CloakBrowser 进程经指定代理打开落地页，等 Cloudflare 挑战通过后导出 cookie。
+遇到交互式 Turnstile（复选框）时自动点击，见 paperlite/turnstile.py。
 
 每次过盾单独 launch：CloakBrowser 的指纹种子（--fingerprint）是启动参数，同一进程内所有 context 共用，
 独立进程才能做到一 IP 一指纹。
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from paperlite.proxy import Lease, ProxySettings
+from paperlite.turnstile import TurnstileClicker
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,7 @@ async def pass_challenge(
         context = await browser.new_context()
         page = await context.new_page()
         deadline = t0 + timeout_s
+        clicker = TurnstileClicker()
         await page.goto(landing, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
         while True:
             try:
@@ -89,7 +92,9 @@ async def pass_challenge(
                     result.cookies = cookies
                     break
             if time.monotonic() > deadline:
-                raise TimeoutError(f"{timeout_s:.0f}s 内未通过挑战（{await _title(page)!r}）")
+                raise TimeoutError(f"{timeout_s:.0f}s 内未通过挑战（{await _title(page)!r}，点击 {clicker.clicks} 次）")
+            if challenged:
+                await clicker.tick(page)     # 交互式 Turnstile（复选框）要点；非交互的不会出现可点控件
             await asyncio.sleep(0.5)
         result.user_agent = await page.evaluate("navigator.userAgent")
         result.ok = True
