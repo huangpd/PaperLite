@@ -700,3 +700,34 @@ class RedisStoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── turnstile ──
+
+def test_turnstile_parse_proxy():
+    from paperlite.turnstile import parse_proxy
+    assert parse_proxy("") is None
+    assert parse_proxy("http://1.2.3.4:8080") == {"server": "http://1.2.3.4:8080"}
+    assert parse_proxy("socks5://u:p%40@h:1080") == {"server": "socks5://h:1080", "username": "u", "password": "p%40"}
+    import pytest
+    with pytest.raises(ValueError):
+        parse_proxy("1.2.3.4")
+
+
+def test_turnstile_checkbox_point_inside_widget():
+    from paperlite.turnstile import checkbox_point
+    for box in ({"x": 100, "y": 200, "width": 300, "height": 65}, {"x": 0, "y": 0, "width": 150, "height": 140}):
+        for _ in range(50):
+            x, y = checkbox_point(box)
+            assert box["x"] + 10 < x < box["x"] + 50
+            assert box["y"] + 10 < y < box["y"] + box["height"] - 10
+
+
+def test_turnstile_harness_escapes_params():
+    import json
+    from paperlite.turnstile import harness_html
+    html = harness_html("0x4AAA", action="login", cdata='a"</script><b>')
+    assert '"sitekey": "0x4AAA"' in html and '"action": "login"' in html
+    assert "</script><b>" not in html
+    assert json.loads(json.dumps('a"</script><b>').replace("<", "\\u003c")) == 'a"</script><b>'
+    assert json.dumps('a"</script><b>').replace("<", "\\u003c") in html

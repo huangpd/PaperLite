@@ -12,6 +12,7 @@ PaperLite 命令行。一个站点（主机）一个输出目录，默认 <out_r
   paperlite status                                  # 任务统计 + 身份池
   paperlite retry    --status failed                # 把失败的重置为 pending
   paperlite export   --status non_pdf > non_pdf.csv
+  paperlite turnstile --url <页面> --sitekey <key>  # 取 Turnstile token；--serve 8191 起 HTTP 服务
 
 站点：--out > --host / --urls 的主机 / --db 记录的主机 → <out_root>/<主机> > out_root 下唯一的站点；多个站点时须指定。
 任务库：--db > 配置 [pool] db_dir > <输出目录>/tasks.db（PDF 输出到 goofys / s3fs 这类对象存储挂载时，
@@ -25,6 +26,7 @@ import argparse
 import asyncio
 import csv
 import dataclasses
+import json
 import logging
 import signal
 import sys
@@ -253,6 +255,32 @@ def _export(args) -> None:
     db.close()
 
 
+def _turnstile(args, parser) -> None:
+    from paperlite import turnstile
+
+    try:
+        proxy = turnstile.parse_proxy(args.proxy)
+    except ValueError as e:
+        parser.error(str(e))
+    if args.serve:
+        try:
+            turnstile.serve(args.bind, args.serve, args.concurrency, args.headed, args.proxy)
+        except KeyboardInterrupt:
+            logger.info("Turnstile 服务已停止")
+        return
+    if not (args.url and args.sitekey):
+        parser.error("缺少 --url / --sitekey（或用 --serve 起服务）")
+    r = asyncio.run(turnstile.solve_turnstile(args.url, args.sitekey, action=args.action, cdata=args.cdata,
+                                              proxy=proxy, timeout_s=args.timeout, headed=args.headed))
+    if args.json:
+        print(json.dumps({"ok": r.ok, "token": r.token, "user_agent": r.user_agent, "seconds": r.seconds,
+                          "clicks": r.clicks, "error": r.error}, ensure_ascii=False))
+    elif r.ok:
+        print(r.token)
+    if not r.ok:
+        sys.exit(f"失败: {r.error}")
+
+
 def _raise_interrupt(signum, frame):
     raise KeyboardInterrupt
 
@@ -267,6 +295,7 @@ _COMMANDS = {
     "status": "任务统计、失败分类、身份池",
     "retry": "把 failed / non_pdf 的任务重置为 pending",
     "export": "导出任务为 CSV",
+    "turnstile": "按 URL + sitekey 取 Cloudflare Turnstile token（--serve 起 HTTP 服务）",
     "help": "显示某个命令的帮助",
 }
 
@@ -358,6 +387,18 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     site_args(p)
     p.add_argument("--status", choices=Status.ALL, help="只导出该状态")
     p.add_argument("--file", default="-", help="输出文件，默认标准输出")
+    p = cmd("turnstile")
+    p.add_argument("--url", help="目标页 URL（token 绑定其 hostname）")
+    p.add_argument("--sitekey", help="目标站 Turnstile sitekey（0x4AAAA…）")
+    p.add_argument("--action", default="", help="可选：控件的 action")
+    p.add_argument("--cdata", default="", help="可选：控件的 cData")
+    p.add_argument("--proxy", default="", help="代理 scheme://[user:pass@]host:port；提交 token 时须用同一出口")
+    p.add_argument("--timeout", type=float, default=60, help="单次最长等待秒数，默认 60")
+    p.add_argument("--headed", action="store_true", help="有界面运行（调试）")
+    p.add_argument("--json", action="store_true", help="输出 JSON（含 user_agent、耗时）而非只输出 token")
+    p.add_argument("--serve", type=int, metavar="PORT", help="起 HTTP 服务：POST /solve {url, sitekey, ...}")
+    p.add_argument("--bind", default="127.0.0.1", help="--serve 监听地址，默认 127.0.0.1")
+    p.add_argument("--concurrency", type=int, default=4, help="--serve 同时运行的浏览器数，默认 4")
     p = cmd("help")
     p.add_argument("command", nargs="?", choices=[c for c in _COMMANDS if c != "help"], metavar="<命令>")
     return ap, parsers
@@ -408,6 +449,9 @@ def main() -> None:
         return
     if args.cmd == "export":
         _export(args)
+        return
+    if args.cmd == "turnstile":
+        _turnstile(args, parsers["turnstile"])
         return
 
     cfg, proxy = _load(args.config)
