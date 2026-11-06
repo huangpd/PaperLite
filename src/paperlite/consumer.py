@@ -18,9 +18,16 @@ paperlite/consumer.py
   超过 max_file_size_mb 中止，完成后原子改名；不是 PDF 只读前 256KB 用于判挑战和分类。
   超时是卡顿超时（连续 download_timeout_s 秒收不到数据），慢代理上的大文件不会被总时长掐断；
 - 返回 HTML 的判 non_pdf（error_kind 见 classify.py），原始页面存到 <out>/non_pdf/；
+- url_type = html 的任务要的就是网页：整页（上限 max_file_size_mb）存为 .html、记 success；404/410 判 failed / not_found，
+  其他 4xx 判 failed；挑战、封禁、5xx、网络错误的处理与 PDF 任务相同；
+  跳转由框架自己跟：curl 跟 HTTP 3xx 和中转页的 meta refresh（≤10s，最多 _MAX_REFRESH_HOPS 跳）；跳到别的主机后被挑战
+  （身份的 cookie 只对本主机有效）就改用浏览器经同一出口打开该地址，让它自己跳转、过挑战，保存最终页面；
+  最终地址记入 final_url；
   同一卷期接连 volume_stop_after 篇没有 PDF 就停掉该卷期其余任务（逻辑在 tasks.py）。
 """
 
+import asyncio
+import html as html_lib
 import logging
 import os
 import random
@@ -31,6 +38,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin
 
 import certifi
 from curl_cffi import requests as curl_requests
@@ -39,7 +47,7 @@ from paperlite.classify import classify_html, page_title
 from paperlite.config import PoolConfig
 from paperlite.proxy import ProxySettings
 from paperlite.store import Identity, IdentityStore
-from paperlite.tasks import Status, Task, TaskDB, pdf_path
+from paperlite.tasks import Status, Task, TaskDB, UrlType, pdf_path, url_host
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +57,10 @@ _PDF_HEADER_WINDOW = 1024                      # %PDF- 须在前 1024 字节内�
 _PDF_LEADING_JUNK = b" \t\r\n\x00\x0c\xef\xbb\xbf"  # 之前只允许这些（有的 PHP 下载脚本会输出前导换行）
 _HTML_LIMIT = 256 * 1024                       # 非 PDF 响应最多读这么多
 _RESET_RETRY_WAIT_S = 2.0      # curl (56) 后同一身份重试前的等待
+_MAX_REFRESH_HOPS = 5          # 网页任务最多跟这么多次 meta refresh
+_MAX_REFRESH_DELAY_S = 10      # 延迟更长的 meta refresh 当作页面定时刷新，不跟
+_META_RE = re.compile(rb"<meta\b[^>]*>", re.IGNORECASE)
+_REFRESH_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*[;,]\s*url\s*=\s*['\"]?([^'\"]+)", re.IGNORECASE)
 
 
 def impersonate_for(user_agent: str) -> str:
@@ -67,8 +79,22 @@ def impersonate_for(user_agent: str) -> str:
     return "chrome"
 
 
+def meta_refresh_target(body: bytes, base_url: str) -> Optional[str]:
+    """中转页（如 linkinghub 的 Redirecting）里短延迟 meta refresh 的目标绝对地址；没有则 None。"""
+    for tag in _META_RE.findall(body[:_HTML_LIMIT]):
+        t = tag.decode("utf-8", "replace")
+        if not re.search(r"http-equiv\s*=\s*['\"]?refresh", t, re.IGNORECASE):
+            continue
+        m = re.search(r"content\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", t, re.IGNORECASE)
+        r = _REFRESH_RE.match(html_lib.unescape(m.group(1).strip("'\""))) if m else None
+        if r and float(r.group(1)) <= _MAX_REFRESH_DELAY_S:
+            return urljoin(base_url, r.group(2).strip())
+    return None
+
+
 def is_challenge(headers, body: bytes) -> bool:
-    return bool(headers.get("cf-mitigated")) or b"challenge-platform" in body[:20000]
+    # 挑战页引用 /cdn-cgi/challenge-platform/h/<x>/orchestrate/…；正常页面里的 …/scripts/jsd、…/scripts/precursor 探针不算
+    return bool(headers.get("cf-mitigated")) or b"/challenge-platform/h/" in body[:20000]
 
 
 def pdf_offset(head: bytes) -> Optional[int]:
@@ -93,7 +119,8 @@ class Fetched:
     headers: dict
     saved: Optional[Path]     # 是 PDF 时已写好的文件
     size: int
-    body: bytes               # 不是 PDF 时响应的开头（≤ _HTML_LIMIT）
+    body: bytes               # 不是 PDF 时响应的开头（≤ _HTML_LIMIT；网页任务为整页）
+    url: str = ""             # 跟完 HTTP 跳转后的地址
 
 
 @dataclass
@@ -125,6 +152,7 @@ class Downloader:
         self.non_pdf_dir = self.out / "non_pdf"
         self.workers = workers
         self.stats = DownloadStats()
+        self._browser_slots = threading.BoundedSemaphore(max(1, cfg.max_browsers))   # 网页任务的浏览器兜底并发
         self._worker_prefix = f"{socket.gethostname()}-{os.getpid()}"
 
     def run(self, stop: Optional[threading.Event] = None) -> DownloadStats:
@@ -191,7 +219,7 @@ class Downloader:
                     stop.wait(0.5)
                     continue
                 keep, outcome = self._download(task, ident, session)
-                if outcome == "pdf":
+                if outcome in ("pdf", "page"):       # 下到了想要的内容，身份有效
                     if uses == 0:
                         self.store.note_success(self.host)
                     uses += 1
@@ -222,8 +250,11 @@ class Downloader:
         s.headers["user-agent"] = ident.user_agent
         return s
 
-    def _fetch(self, url: str, ident: Identity, session, dest: Path) -> Fetched:
-        """流式请求一次。是 PDF 就写到 dest（先写 .part 再原子改名），否则只留响应开头。网络异常原样抛出。"""
+    def _fetch(self, url: str, ident: Identity, session, dest: Path, full_html: bool = False) -> Fetched:
+        """
+        流式请求一次。是 PDF 就写到 dest（先写 .part 再原子改名），否则只留响应开头；
+        full_html=True（网页任务）时非 PDF 响应整页读完（不超过 max_file_size_mb）。网络异常原样抛出。
+        """
         resp = session.get(url, stream=True, proxy=self.proxy.url_for(ident.proxy_server), allow_redirects=True,
                            timeout=(self.cfg.connect_timeout_s, self.cfg.download_timeout_s))
         try:
@@ -234,16 +265,19 @@ class Downloader:
                 if len(head) >= _PDF_HEADER_WINDOW:
                     break
             offset = pdf_offset(head)
+            limit = self.cfg.max_file_size_mb * 1024 * 1024
             if offset is None:
                 body = bytearray(head)
+                cap = limit if full_html else _HTML_LIMIT
                 for chunk in chunks:
                     body += chunk
-                    if len(body) >= _HTML_LIMIT:
+                    if len(body) >= cap:
+                        if full_html:
+                            raise BadPdf(f"网页超过 {self.cfg.max_file_size_mb} MB 上限，已中止", retry=False)
                         break
-                body = body[:_HTML_LIMIT]
-                return Fetched(resp.status_code, dict(resp.headers), None, len(body), bytes(body))
+                body = body[:cap]
+                return Fetched(resp.status_code, dict(resp.headers), None, len(body), bytes(body), str(getattr(resp, "url", "") or url))
 
-            limit = self.cfg.max_file_size_mb * 1024 * 1024
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = dest.with_name(dest.name + ".part")
             try:
@@ -260,7 +294,7 @@ class Downloader:
                 tmp.replace(dest)
             finally:
                 tmp.unlink(missing_ok=True)
-            return Fetched(resp.status_code, dict(resp.headers), dest, size, b"")
+            return Fetched(resp.status_code, dict(resp.headers), dest, size, b"", str(getattr(resp, "url", "") or url))
         finally:
             try:
                 resp.close()
@@ -268,13 +302,16 @@ class Downloader:
                 pass
 
     def _download(self, task: Task, ident: Identity, session) -> tuple[bool, str]:
-        """下载一个任务并写结果；返回 (身份是否还能继续用, 结果: pdf / rejected / challenged / other)。"""
+        """下载一个任务并写结果；返回 (身份是否还能继续用, 结果: pdf / page / rejected / challenged / other)。"""
         t0 = time.monotonic()
         elapsed_ms = lambda: int((time.monotonic() - t0) * 1000)
         dest = pdf_path(self.out, task.paper_uid)
         for attempt in (1, 2):
             try:
-                got = self._fetch(task.pdf_url, ident, session, dest)
+                if task.url_type == UrlType.HTML:
+                    got = self._fetch_page(task.pdf_url, ident, session, dest)
+                else:
+                    got = self._fetch(task.pdf_url, ident, session, dest)
                 break
             except BadPdf as e:
                 if e.retry:
@@ -301,6 +338,8 @@ class Downloader:
             self.stats.add("success")
             return True, "pdf"
         if is_challenge(got.headers, got.body):
+            if task.url_type == UrlType.HTML and got.url and url_host(got.url) != self.host:
+                return self._render_page(task, ident, got.url, t0)     # 跳到了别的主机：身份不适用，交给浏览器
             if not self._identity_alive(ident, session):
                 return self._drop_identity(task, ident, f"HTTP {code} 挑战，落地页也被挑战，cookie 被拒"), "rejected"
             self.stats.add("challenged")
@@ -318,6 +357,9 @@ class Downloader:
         kind, title = classify_html(html), page_title(html)[:200]
         if kind == "blocked":
             return self._drop_identity(task, ident, f"IP 被站点封禁: {title}"), "rejected"
+        if task.url_type == UrlType.HTML:
+            return self._save_page(task, ident, got.code, got.body, got.url,
+                                   pdf_path(self.out, task.paper_uid, ".html"), title, elapsed_ms())
         self.non_pdf_dir.mkdir(parents=True, exist_ok=True)
         (self.non_pdf_dir / (dest.stem + ".html")).write_bytes(got.body)
         stopped = self.db.finish(task, Status.NON_PDF, http_status=code, file_size=got.size,
@@ -333,6 +375,59 @@ class Downloader:
             logger.info("卷期 %s 已有 %d 篇没有 PDF，停掉其余 %d 篇（记 non_pdf / inferred，不再请求）",
                         volume, self.cfg.volume_stop_after, skipped)
         return True, "other"
+
+    def _fetch_page(self, url: str, ident: Identity, session, dest: Path) -> Fetched:
+        """网页任务：请求并跟中转页的 meta refresh（HTTP 3xx 由 curl 自己跟）。"""
+        got = self._fetch(url, ident, session, dest, full_html=True)
+        for _ in range(_MAX_REFRESH_HOPS):
+            if got.saved is not None or got.code >= 400:
+                break
+            nxt = meta_refresh_target(got.body, got.url or url)
+            if not nxt:
+                break
+            logger.debug("跟 meta refresh %s → %s", got.url or url, nxt)
+            got = self._fetch(nxt, ident, session, dest, full_html=True)
+        return got
+
+    def _render_page(self, task: Task, ident: Identity, url: str, t0: float) -> tuple[bool, str]:
+        """浏览器兜底：经身份的出口打开 url，跟完跳转、过挑战后保存；失败计一次重试（challenge_failed）。"""
+        from paperlite.browser import render_page
+
+        logger.info("网页跳到 %s 被挑战，改用浏览器: %s", url_host(url), task.pdf_url)
+        with self._browser_slots:
+            r = asyncio.run(render_page(url, self.proxy.browser_proxy_for(ident.proxy_server), self.cfg.pass_timeout_s,
+                                        headed=self.cfg.headed))
+        if not r.ok:
+            self._retry_or_fail(task, ident, "challenge_failed", f"浏览器打开 {url} 失败: {r.error}")
+            return True, "other"
+        logger.info("浏览器 %.0fs（点击 %d 次）→ %s", r.seconds, r.clicks, r.url)
+        return self._save_page(task, ident, r.status or 200, r.html.encode("utf-8"), r.url,
+                               pdf_path(self.out, task.paper_uid, ".html"), r.title,
+                               int((time.monotonic() - t0) * 1000))
+
+    def _save_page(self, task: Task, ident: Identity, code: int, body: bytes, final_url: str, dest: Path,
+                   title: str, elapsed_ms: int) -> tuple[bool, str]:
+        """网页任务：2xx/3xx 落盘记 success；4xx 判 failed（404/410 记 not_found），不重试。"""
+        if code >= 400:
+            kind = "not_found" if code in (404, 410) else None
+            self.db.finish(task, Status.FAILED, http_status=code, elapsed_ms=elapsed_ms, exit_ip=ident.exit_ip,
+                           error_kind=kind, error_message=f"HTTP {code} {title}".strip(), final_url=final_url or None)
+            self.stats.add("failed")
+            logger.info("网页下载失败 HTTP %d %s %s", code, task.pdf_url, title)
+            return True, "other"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".part")
+        try:
+            tmp.write_bytes(body)
+            tmp.replace(dest)
+        finally:
+            tmp.unlink(missing_ok=True)
+        self.db.finish(task, Status.SUCCESS, http_status=code, file_path=str(dest), file_size=len(body),
+                       elapsed_ms=elapsed_ms, exit_ip=ident.exit_ip, error_message=title or None,
+                       final_url=final_url or None)
+        self.stats.add("success")
+        logger.debug("网页 %s → %s（%d 字节）%s", final_url or task.pdf_url, dest, len(body), title)
+        return True, "page"
 
     def _identity_alive(self, ident: Identity, session) -> bool:
         """用过盾时的落地页验身份：能正常打开说明 cookie 有效，挑战只针对那条 URL。"""

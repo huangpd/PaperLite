@@ -6,6 +6,7 @@ PaperLite 命令行。一个站点（主机）一个输出目录，默认 <out_r
 
   paperlite init                                    # 在当前目录生成 config.toml 模板
   paperlite import   --urls acm.txt                 # 导入任务（txt 一行一个，或带 pdf_url 列的 CSV）→ pdfs/dl.acm.org/
+  paperlite import   --urls pages.txt --type html   # 要网页本身（存 .html），数据库 url_type = html
   paperlite run      --workers 20                   # 同进程生产 + 消费，下载完退出
   paperlite produce                                 # 只生产身份，常驻
   paperlite download --workers 20                   # 只消费（需有生产者在跑）
@@ -42,7 +43,7 @@ from paperlite.consumer import Downloader
 from paperlite.producer import Producer
 from paperlite.proxy import IpSource, ProxySettings
 from paperlite.store import IdentityStore
-from paperlite.tasks import ERROR_KINDS, Status, TaskDB, url_host
+from paperlite.tasks import ERROR_KINDS, Status, TaskDB, UrlType, url_host
 
 logger = logging.getLogger("paperlite")
 
@@ -108,7 +109,7 @@ def _open_site(args, create: bool = False) -> tuple[Path, TaskDB]:
 
 
 def _read_url_file(path: str):
-    """txt：一行一个链接；CSV：表头含 pdf_url（可选 paper_uid / source / batch_no），与 paper_downloader 导入格式相同。"""
+    """txt：一行一个链接；CSV：表头含 pdf_url（可选 paper_uid / source / batch_no / url_type），与 paper_downloader 导入格式相同。"""
     with open(path, encoding="utf-8-sig", newline="") as f:
         first = f.readline()
         f.seek(0)
@@ -118,8 +119,10 @@ def _read_url_file(path: str):
             yield from ({"pdf_url": line.strip()} for line in f if line.strip().startswith("http"))
 
 
-def _import(db: TaskDB, path: str, source: str = "", batch: str = "") -> None:
-    rows = ({**r, "source": r.get("source") or source, "batch_no": r.get("batch_no") or batch}
+def _import(db: TaskDB, path: str, source: str = "", batch: str = "", url_type: str = UrlType.PDF) -> None:
+    """url_type 是整批的默认类型；CSV 里的 url_type 列逐行覆盖。"""
+    rows = ({**r, "source": r.get("source") or source, "batch_no": r.get("batch_no") or batch,
+             "url_type": (r.get("url_type") or "").strip() or url_type}
             for r in _read_url_file(path))
     try:
         added, existed = db.import_urls(rows)
@@ -152,7 +155,7 @@ class _ProducerThread:
 def _download(args, cfg, proxy, store, with_producer: bool) -> None:
     out, db = _open_site(args, create=True)
     if args.urls:
-        _import(db, args.urls)
+        _import(db, args.urls, url_type=args.type)
     try:
         reclaimed = db.lock_for_download()
     except RuntimeError as e:
@@ -219,6 +222,10 @@ def _status(args, cfg) -> None:
         c = db.counts()
         print(f"任务库 {db.path}（{host or '空'}）: 共 {sum(c.values())}  " +
               "  ".join(f"{s} {c[s]}" for s in Status.ALL))
+        types = db.type_counts()
+        if len(types) > 1 or UrlType.PDF not in types:
+            for t, tc in sorted(types.items()):
+                print(f"  [{t}] 共 {sum(tc.values())}  " + "  ".join(f"{s} {tc[s]}" for s in Status.ALL if tc[s]))
         for status, kind, n, inferred in db.kind_counts():
             print(f"  {status:8s} {kind or '-':16s} {n}" + (f"（其中按卷期推断 {inferred}）" if inferred else ""))
         v, n = db.volume_summary()
@@ -365,6 +372,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     site_args(p)
     p.add_argument("--source", default="", help="写入 source")
     p.add_argument("--batch", default="", help="写入 batch_no")
+    p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="链接类型：pdf = 要 PDF 文件（默认）；html = 要网页本身，整页存为 .html。CSV 的 url_type 列逐行覆盖")
     p = cmd("produce")
     site_args(p)
     p.add_argument("--keep", type=int, help="没有下载线程时也养着这么多身份（覆盖 min_identities），"
@@ -373,6 +381,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
         p = cmd(name)
         site_args(p)
         p.add_argument("--urls", help="先导入这个文件（可选）")
+        p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
         p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数，默认 20")
     p = cmd("status")
     site_args(p)
@@ -434,7 +443,7 @@ def main() -> None:
         return
     if args.cmd == "import":
         out, db = _open_site(args, create=True)
-        _import(db, args.urls, args.source, args.batch)
+        _import(db, args.urls, args.source, args.batch, args.type)
         logger.info("输出目录 %s，任务库 %s", out, db.path)
         db.close()
         return

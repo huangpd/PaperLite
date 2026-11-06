@@ -39,9 +39,16 @@ class ProxySettings:
     username: str = ""
     password: str = ""
     lease_s: float = 600              # 单个 IP 最长使用时间，与接口 deadline 取较早者
-    check_url: str = "https://dl.acm.org/robots.txt"
+    check_url: str = "https://www.cloudflare.com/cdn-cgi/trace"
     check_timeout_s: float = 10
     check_max_tries: int = 3
+
+    def browser_proxy_for(self, server: str) -> dict:
+        """ip:port → Playwright 代理配置（浏览器兜底下载用，与下载线程同一出口）。"""
+        proxy = {"server": f"{self.scheme}://{server}"}
+        if self.username:
+            proxy.update(username=self.username, password=self.password)
+        return proxy
 
     def url_for(self, server: str) -> str:
         """ip:port → 带鉴权的代理 URL（鉴权只在本地拼，不进 Redis）。"""
@@ -58,10 +65,7 @@ class Lease:
     expires_at: float     # time.time()
 
     def browser_proxy(self, s: ProxySettings) -> dict:
-        proxy = {"server": f"{s.scheme}://{self.server}"}
-        if s.username:
-            proxy.update(username=s.username, password=s.password)
-        return proxy
+        return s.browser_proxy_for(self.server)
 
 
 class IpSource:

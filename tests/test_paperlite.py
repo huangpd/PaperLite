@@ -14,7 +14,7 @@ from paperlite.consumer import Downloader, impersonate_for
 from paperlite.producer import Producer
 from paperlite.proxy import Lease, ProxySettings, parse_deadline
 from paperlite.store import Identity
-from paperlite.tasks import Status, TaskDB, derive_paper_uid, derive_volume, pdf_path, url_key
+from paperlite.tasks import Status, TaskDB, UrlType, derive_paper_uid, derive_volume, pdf_path, url_key
 
 FAKE_PDF = b"%PDF-1.4\n" + b"0" * 2048          # 超过最小文件大小（1024 字节）
 PROXY = ProxySettings(api_url="https://api.example/get?key=k", username="u", password="p@ss")
@@ -160,6 +160,28 @@ class TaskDBTest(unittest.TestCase):
         conn.close()
         with self.assertRaises(RuntimeError):
             TaskDB(path)
+
+    def test_url_type_imported_and_claimed(self):
+        self.db.import_urls([{"pdf_url": "https://dl.acm.org/doi/10.1145/1", "url_type": "html"},
+                             {"pdf_url": "https://dl.acm.org/doi/pdf/10.1145/2"}])
+        self.assertEqual([self.db.claim("w").url_type for _ in range(2)], [UrlType.HTML, UrlType.PDF])
+        self.assertEqual([r["url_type"] for r in self.db.rows()], ["html", "pdf"])
+        self.assertEqual(self.db.type_counts()["html"][Status.RUNNING], 1)
+        with self.assertRaises(ValueError):
+            self.db.import_urls([{"pdf_url": "https://dl.acm.org/doi/10.1145/3", "url_type": "page"}])
+
+    def test_old_db_gets_url_type_column(self):
+        import sqlite3
+        self.db.import_urls(self.urls(1))
+        self.db.close()
+        conn = sqlite3.connect(self.db.path)
+        conn.execute("ALTER TABLE paper_pdf_resources DROP COLUMN url_type")      # 模拟 0.1.2 的库
+        conn.commit()
+        conn.close()
+        self.db = TaskDB(self.db.path)
+        self.assertEqual(self.db.claim("w").url_type, UrlType.PDF)
+        self.db.import_urls([{"pdf_url": "https://dl.acm.org/doi/10.1145/2", "url_type": "html"}])
+        self.assertEqual(self.db.claim("w").url_type, UrlType.HTML)
 
     def test_check_constraints(self):
         import sqlite3
@@ -468,8 +490,8 @@ class DownloaderTest(unittest.TestCase):
         self.db.close()
         self.tmp.cleanup()
 
-    def run_with(self, store, responses_by_ip, urls):
-        self.db.import_urls({"pdf_url": u} for u in urls)
+    def run_with(self, store, responses_by_ip, urls, url_type="pdf"):
+        self.db.import_urls({"pdf_url": u, "url_type": url_type} for u in urls)
 
         def fake_session(ident):
             s = mock.Mock()
@@ -612,6 +634,28 @@ class DownloaderTest(unittest.TestCase):
         self.assertEqual((dl.stats.success, len(calls)), (1, 2))
         self.assertFalse(list(self.out.rglob("*.part")))
 
+    def test_html_task_saves_full_page(self):
+        url = "https://www.sciencedirect.com/science/article/abs/pii/0378436377901723?via%3Dihub"
+        page = b"<html><title>Measurements of spin</title>" + b"a" * (600 * 1024) + b"</html>"
+        dl = self.run_with(FakeStore([ident()]), {"1.2.3.4": lambda u: Resp(200, page)}, [url], url_type="html")
+        self.assertEqual((dl.stats.success, dl.stats.non_pdf), (1, 0))
+        r = self.row(url)
+        self.assertEqual((r["status"], r["url_type"], r["file_size"], r["error_kind"]), ("success", "html", len(page), None))
+        self.assertEqual(Path(r["file_path"]).suffix, ".html")
+        self.assertEqual(Path(r["file_path"]).read_bytes(), page)            # 整页，不截断到 256KB
+        self.assertFalse((self.out / "non_pdf").exists())
+
+    def test_html_task_404_fails_and_challenge_drops_identity(self):
+        store = FakeStore([ident(exit_ip="1.1.1.1"), ident(exit_ip="2.2.2.2")])
+        ok, gone = "https://dl.acm.org/doi/10.1145/1", "https://dl.acm.org/doi/10.1145/404"
+        dl = self.run_with(store, {
+            "1.1.1.1": lambda u: Resp(403, b"<html>challenge-platform</html>", {"cf-mitigated": "challenge"}),
+            "2.2.2.2": lambda u: Resp(404, b"<title>Not Found</title>") if u == gone else Resp(200, b"<title>ok</title>"),
+        }, [ok, gone], url_type="html")
+        self.assertEqual((dl.stats.success, dl.stats.failed, store.discarded), (1, 1, ["1.1.1.1"]))
+        r = self.row(gone)
+        self.assertEqual((r["status"], r["error_kind"], r["http_status"]), ("failed", "not_found", 404))
+
     def test_html_read_is_capped(self):
         url = "https://dl.acm.org/doi/pdf/10.1145/huge-html"
         dl = self.run_with(FakeStore([ident()]),
@@ -731,3 +775,29 @@ def test_turnstile_harness_escapes_params():
     assert "</script><b>" not in html
     assert json.loads(json.dumps('a"</script><b>').replace("<", "\\u003c")) == 'a"</script><b>'
     assert json.dumps('a"</script><b>').replace("<", "\\u003c") in html
+
+
+# ── 网页任务：跳转与挑战判断 ──
+
+def test_meta_refresh_target():
+    from paperlite.consumer import meta_refresh_target
+    linkinghub = (b'<html><head><META HTTP-EQUIV="REFRESH" content="2; url=\'/retrieve/articleSelectPrefsTemp?'
+                  b'Redirect=http%3A%2F%2Fjpsmjournal.com%2Fretrieve%2Fpii%2FS0885392416309782&amp;key=9361\'"/>'
+                  b'<title>Redirecting</title></head></html>')
+    assert meta_refresh_target(linkinghub, "https://linkinghub.elsevier.com/retrieve/pii/S0885392416309782") == (
+        "https://linkinghub.elsevier.com/retrieve/articleSelectPrefsTemp?"
+        "Redirect=http%3A%2F%2Fjpsmjournal.com%2Fretrieve%2Fpii%2FS0885392416309782&key=9361")
+    assert meta_refresh_target(b'<meta content="0;URL=https://b.org/x" http-equiv=refresh>', "https://a.org/") == "https://b.org/x"
+    assert meta_refresh_target(b'<meta http-equiv="refresh" content="300">', "https://a.org/") is None          # 定时刷新
+    assert meta_refresh_target(b'<meta http-equiv="refresh" content="600; url=/x">', "https://a.org/") is None
+    assert meta_refresh_target(b'<meta http-equiv="X-UA-Compatible" content="IE=edge">', "https://a.org/") is None
+
+
+def test_cf_probe_scripts_are_not_challenge():
+    from paperlite.consumer import is_challenge
+    normal = b'<html><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>' \
+             b'<script src="/cdn-cgi/challenge-platform/scripts/precursor"></script></html>'
+    assert not is_challenge({}, normal)
+    page = b'<html><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=1"></script></html>'
+    assert is_challenge({}, page)
+    assert is_challenge({"cf-mitigated": "challenge"}, b"")

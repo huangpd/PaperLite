@@ -25,9 +25,30 @@ logger = logging.getLogger(__name__)
 
 CLEARANCE = "cf_clearance"
 
-# Cloudflare 挑战页特征（按脚本/元素判断；标题会被本地化，如"请稍候…"）
-CHALLENGE_JS = """() => !!(window._cf_chl_opt || document.querySelector(
-    '#challenge-form, #challenge-stage, .cf-turnstile, script[src*="/cdn-cgi/challenge-platform/"]'))"""
+
+
+class DocTracker:
+    """
+    跟踪主框架最近一次文档响应，按响应头 cf-mitigated 判断当前是不是 Cloudflare 挑战页。
+    不在页面里执行 JS：实测挑战期间每 0.5s 在页面主环境调 document.querySelector 会让挑战明显难过
+    （ScienceDirect 3 次里 2 次超时，不调时 3 次都约 23s 通过）；也不看 window._cf_chl_opt / challenge-platform 脚本，
+    正常页面上 Cloudflare 同样会注入 /cdn-cgi/challenge-platform/scripts/{jsd,precursor} 探针并设 _cf_chl_opt。
+    """
+
+    def __init__(self, page) -> None:
+        self.page = page
+        self.url: str = ""
+        self.status: Optional[int] = None
+        self.challenged: Optional[bool] = None     # 还没收到文档响应时为 None
+        page.on("response", self._on_response)
+
+    def _on_response(self, resp) -> None:
+        try:
+            if resp.request.is_navigation_request() and resp.frame == self.page.main_frame:
+                self.url, self.status = resp.url, resp.status
+                self.challenged = bool(resp.headers.get("cf-mitigated"))
+        except Exception:
+            pass
 
 
 def browser_env() -> dict[str, str]:
@@ -77,14 +98,12 @@ async def pass_challenge(
         )
         context = await browser.new_context()
         page = await context.new_page()
+        doc = DocTracker(page)
         deadline = t0 + timeout_s
         clicker = TurnstileClicker()
         await page.goto(landing, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
         while True:
-            try:
-                challenged = bool(await page.evaluate(CHALLENGE_JS))
-            except Exception:
-                challenged = True     # 挑战通过后的跳转会销毁执行上下文，下一轮再看
+            challenged = doc.challenged is not False      # None：跳转中，还没收到新文档
             result.challenged |= challenged
             if not challenged:
                 cookies = await context.cookies([landing])
@@ -96,7 +115,7 @@ async def pass_challenge(
             if challenged:
                 await clicker.tick(page)     # 交互式 Turnstile（复选框）要点；非交互的不会出现可点控件
             await asyncio.sleep(0.5)
-        result.user_agent = await page.evaluate("navigator.userAgent")
+        result.user_agent = await _user_agent(page, deadline)
         result.ok = True
     except Exception as e:
         first = str(e).splitlines()[0][:160] if str(e) else ""
@@ -113,6 +132,18 @@ async def pass_challenge(
     return result
 
 
+async def _user_agent(page, deadline: float) -> str:
+    """挑战通过时（按响应头判断）新页面可能还在加载，执行上下文会被销毁，等加载完再读。"""
+    while True:
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=5000)
+            return await page.evaluate("navigator.userAgent")
+        except Exception:
+            if time.monotonic() > deadline + 15:
+                raise
+            await asyncio.sleep(0.5)
+
+
 async def _title(page) -> str:
     try:
         return (await page.title())[:60]
@@ -126,3 +157,83 @@ async def _screenshot(page, path: Path) -> None:
         await page.screenshot(path=str(path))
     except Exception:
         pass
+
+
+# ── 网页任务的浏览器兜底 ─────────────────────────────────────────────
+
+# 页面里还有短延迟（≤10s）的 meta refresh = 中转页，还会继续跳（只在非挑战页上执行）
+PENDING_REFRESH_JS = """() => [...document.querySelectorAll('meta[http-equiv]')].some(m =>
+    m.httpEquiv.toLowerCase() === 'refresh' && parseFloat(m.content) <= 10)"""
+
+
+@dataclass
+class RenderResult:
+    ok: bool
+    seconds: float
+    url: str = ""                 # 最终地址
+    status: Optional[int] = None  # 最终主文档的 HTTP 状态
+    title: str = ""
+    html: str = ""
+    clicks: int = 0
+    error: str = ""
+
+
+async def render_page(url: str, proxy: Optional[dict], timeout_s: float, settle_s: float = 2.0,
+                      headed: bool = False) -> RenderResult:
+    """
+    用浏览器打开 url，让它自己完成跳转（HTTP 3xx、meta refresh、JS 跳转）和 Cloudflare 挑战（交互式 Turnstile 自动点），
+    等页面不再是挑战页、没有待执行的 meta refresh、地址 settle_s 秒不变后，返回最终地址和整页 HTML。
+    """
+    from cloakbrowser import get_default_stealth_args, launch_async
+    from paperlite.turnstile import TurnstileClicker
+
+    t0 = time.monotonic()
+    result = RenderResult(ok=False, seconds=0)
+    browser = None
+    page = None
+    try:
+        args = [a for a in get_default_stealth_args() if a.split("=", 1)[0] != "--no-sandbox"]
+        browser = await launch_async(
+            headless=not headed, proxy=proxy, stealth_args=False,
+            args=args + ["--disable-dev-shm-usage", "--window-size=1440,900"], env=browser_env(),
+        )
+        page = await (await browser.new_context()).new_page()
+        doc = DocTracker(page)
+        clicker = TurnstileClicker()
+        deadline = t0 + timeout_s
+        await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
+        last_url, stable_since = "", time.monotonic()
+        while True:
+            busy = doc.challenged is not False
+            if not busy:
+                try:
+                    busy = bool(await page.evaluate(PENDING_REFRESH_JS))
+                except Exception:
+                    busy = True                   # 跳转中，执行上下文被销毁
+            now = time.monotonic()
+            if page.url != last_url:
+                last_url, stable_since = page.url, now
+            if not busy and now - stable_since >= settle_s:
+                break
+            if now > deadline:
+                raise TimeoutError(f"{timeout_s:.0f}s 内页面未稳定（{await _title(page)!r}，{page.url[:120]}，点击 {clicker.clicks} 次）")
+            if doc.challenged:
+                await clicker.tick(page)
+            await asyncio.sleep(0.5)
+        result.url = page.url
+        result.status = doc.status
+        result.title = await _title(page)
+        result.html = await page.content()
+        result.clicks = clicker.clicks
+        result.ok = True
+    except Exception as e:
+        first = str(e).splitlines()[0][:200] if str(e) else ""
+        result.error = f"{type(e).__name__}: {first}"
+    finally:
+        result.seconds = round(time.monotonic() - t0, 1)
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                logger.debug("关闭浏览器异常", exc_info=True)
+    return result

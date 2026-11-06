@@ -8,7 +8,9 @@ SQLite 任务库：一个站点一个库（<out>/tasks.db），存任务与结�
 表结构参照 paper_downloader 的 PostgreSQL 的 paper_pdf_resources（同名同义的列取值一致，便于以后迁移）：
   - url_key = sha256(规范化 pdf_url)，32 字节 BLOB，唯一；重复导入不会重置已有任务
   - paper_uid 从链接提取 DOI（转小写），没有时用 url-<url_key 前 16 位>；决定文件名
-  - status：pending → running → success | non_pdf | failed
+  - url_type：pdf = 链接应返回 PDF（默认）；html = 要的就是网页本身（如文章摘要页），整页 HTML 存为 .html
+  - final_url：网页任务跟完跳转（HTTP 3xx、meta refresh，必要时浏览器）后实际保存的地址
+  - status：pending → running → success | non_pdf | failed（html 任务没有 non_pdf：拿到网页即 success）
   - challenge_count：带有效 cookie 仍被站点挑战的次数（站点单独盯上了这条 URL）；领取时排在后面，
     满 max_url_challenges 判 failed / challenge_failed
   - volume：DOI 后缀点号前的卷期号（10.1145/1012326.1012328 → 1012326），新式纯数字 DOI 为空；
@@ -44,6 +46,13 @@ class Status:
     FINAL = (SUCCESS, FAILED, NON_PDF)
 
 
+class UrlType:
+    PDF = "pdf"          # 链接应返回 PDF
+    HTML = "html"        # 要的是网页本身
+
+    ALL = (PDF, HTML)
+
+
 # 与 paper_downloader monitor/classify.py 同名类别
 ERROR_KINDS = ("not_found", "paywall", "landing_page", "blocked", "network", "server_error", "challenge_failed",
                "extract_failed")
@@ -67,6 +76,8 @@ CREATE TABLE IF NOT EXISTS paper_pdf_resources (
     url_key       BLOB    NOT NULL UNIQUE,
     paper_uid     TEXT    NOT NULL,
     pdf_url       TEXT    NOT NULL,
+    url_type      TEXT    NOT NULL DEFAULT 'pdf' CHECK (url_type IN {_in(UrlType.ALL)}),
+    final_url     TEXT,
     file_path     TEXT,
     source        TEXT,
     batch_no      TEXT,
@@ -128,14 +139,14 @@ def derive_volume(paper_uid: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def pdf_path(out_dir: Path, paper_uid: str) -> Path:
-    """<out>/<h[0:2]>/<h[2:4]>/<名字>.pdf，h = sha256(paper_uid)；百万级文件也不会挤在一个目录里。"""
+def pdf_path(out_dir: Path, paper_uid: str, suffix: str = ".pdf") -> Path:
+    """<out>/<h[0:2]>/<h[2:4]>/<名字>.pdf（网页任务为 .html），h = sha256(paper_uid)；百万级文件也不会挤在一个目录里。"""
     digest = hashlib.sha256(paper_uid.encode("utf-8")).hexdigest()
     readable = paper_uid.strip().replace("/", "_")
     stem = _SAFE_NAME_RE.sub("_", readable).strip("._")
     if stem != readable or len(stem) > _MAX_STEM_LEN or not stem:
         stem = f"{stem[:_MAX_STEM_LEN]}_{digest[:8]}" if stem else f"paper_{digest[:8]}"
-    return Path(out_dir) / digest[:2] / digest[2:4] / f"{stem}.pdf"
+    return Path(out_dir) / digest[:2] / digest[2:4] / f"{stem}{suffix}"
 
 
 def now_text() -> str:
@@ -149,6 +160,7 @@ class Task:
     pdf_url: str
     retry_count: int
     challenge_count: int = 0
+    url_type: str = UrlType.PDF
 
 
 class TaskDB:
@@ -169,6 +181,11 @@ class TaskDB:
                 "SELECT sql FROM sqlite_master WHERE name = 'paper_pdf_resources'").fetchone()
             if old and not all(col in old[0] for col in ("challenge_count", "volume", "inferred")):
                 raise RuntimeError(f"{self.path} 是旧版结构（缺新列），删除后重新 import")
+            if old and "url_type" not in old[0]:          # 0.1.2 及以前的库：补列，已有任务都是 pdf
+                self._conn.execute("ALTER TABLE paper_pdf_resources ADD COLUMN url_type TEXT NOT NULL DEFAULT 'pdf' "
+                                   f"CHECK (url_type IN {_in(UrlType.ALL)})")
+            if old and "final_url" not in old[0]:
+                self._conn.execute("ALTER TABLE paper_pdf_resources ADD COLUMN final_url TEXT")
             self._conn.executescript(_SCHEMA)
 
     def close(self) -> None:
@@ -205,7 +222,7 @@ class TaskDB:
 
     def import_urls(self, rows: Iterable[dict]) -> tuple[int, int]:
         """
-        rows: {"pdf_url", 可选 "paper_uid" / "source" / "batch_no"}。返回 (新增, 已存在)。
+        rows: {"pdf_url", 可选 "paper_uid" / "source" / "batch_no" / "url_type"（pdf / html，默认 pdf）}。返回 (新增, 已存在)。
         一个库只能有一个主机：第一次导入时记下，之后其他主机的链接直接报错。
         """
         host = self.host()
@@ -220,7 +237,10 @@ class TaskDB:
             if h != host:
                 raise ValueError(f"本库主机是 {host}，不能导入 {h} 的链接（一个站点一个库）: {url}")
             uid = (r.get("paper_uid") or "").strip().lower() or derive_paper_uid(url)
-            batch.append((url_key(url), uid, url, r.get("source") or None, r.get("batch_no") or None,
+            kind = (r.get("url_type") or UrlType.PDF).strip().lower()
+            if kind not in UrlType.ALL:
+                raise ValueError(f"url_type 只能是 {' / '.join(UrlType.ALL)}，不是 {kind!r}: {url}")
+            batch.append((url_key(url), uid, url, kind, r.get("source") or None, r.get("batch_no") or None,
                           derive_volume(uid), ts, ts))
             seen += 1
         with self._lock:
@@ -229,8 +249,8 @@ class TaskDB:
                 self._conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('host', ?)", (host,))
                 before = self._conn.total_changes
                 self._conn.executemany(
-                    "INSERT INTO paper_pdf_resources (url_key, paper_uid, pdf_url, source, batch_no, volume, "
-                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (url_key) DO NOTHING", batch)
+                    "INSERT INTO paper_pdf_resources (url_key, paper_uid, pdf_url, url_type, source, batch_no, volume, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (url_key) DO NOTHING", batch)
                 added = self._conn.total_changes - before
                 self._conn.execute("COMMIT")
             except BaseException:
@@ -271,11 +291,11 @@ class TaskDB:
                     row = c.execute(
                         "UPDATE paper_pdf_resources SET status = 'running', claimed_by = ?, updated_at = ? "
                         "WHERE id = ? AND status = 'pending' "
-                        "RETURNING id, paper_uid, pdf_url, retry_count, challenge_count",
+                        "RETURNING id, paper_uid, pdf_url, retry_count, challenge_count, url_type",
                         (worker, now_text(), task_id)).fetchone()
                     if row:
                         return Task(row["id"], row["paper_uid"], row["pdf_url"], row["retry_count"],
-                                    row["challenge_count"])
+                                    row["challenge_count"], row["url_type"])
                 after_id, _, after_cc = rows[-1]
                 scanned += len(rows)
             return None
@@ -293,7 +313,8 @@ class TaskDB:
 
     def finish(self, task: Task, status: str, *, http_status: Optional[int] = None, file_path: str = None,
                file_size: Optional[int] = None, elapsed_ms: Optional[int] = None, exit_ip: str = None,
-               error_kind: Optional[str] = None, error_message: Optional[str] = None) -> Optional[tuple[str, int]]:
+               error_kind: Optional[str] = None, error_message: Optional[str] = None,
+               final_url: Optional[str] = None) -> Optional[tuple[str, int]]:
         """
         写最终结果（success / non_pdf / failed）。成功时清空错误列。
         判 non_pdf 后若该卷期就此满足停止条件，停掉其余任务并返回 (卷期号, 停掉的任务数)，否则 None。
@@ -302,9 +323,9 @@ class TaskDB:
         with self._lock:
             self._conn.execute(
                 "UPDATE paper_pdf_resources SET status = ?, http_status = ?, file_path = ?, file_size = ?, "
-                "elapsed_ms = ?, exit_ip = ?, error_kind = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                "elapsed_ms = ?, exit_ip = ?, error_kind = ?, error_message = ?, final_url = ?, updated_at = ? WHERE id = ?",
                 (status, http_status, file_path, file_size, elapsed_ms, exit_ip, error_kind, error_message,
-                 now_text(), task.id))
+                 final_url, now_text(), task.id))
             if status == Status.NON_PDF and error_kind in NO_PDF_KINDS and self.volume_stop_after:
                 return self._maybe_stop_volume(task.id)
         return None
@@ -366,6 +387,16 @@ class TaskDB:
             return self._conn.execute(
                 "SELECT EXISTS (SELECT 1 FROM paper_pdf_resources WHERE status = ?)", (status,)).fetchone()[0] == 1
 
+    def type_counts(self) -> dict[str, dict[str, int]]:
+        """{url_type: {status: 条数}}"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT url_type, status, count(*) FROM paper_pdf_resources GROUP BY 1, 2").fetchall()
+        out: dict[str, dict[str, int]] = {}
+        for t, st, n in rows:
+            out.setdefault(t, {s: 0 for s in Status.ALL})[st] = n
+        return out
+
     def counts(self) -> dict[str, int]:
         with self._lock:
             rows = self._conn.execute("SELECT status, count(*) FROM paper_pdf_resources GROUP BY status").fetchall()
@@ -417,7 +448,7 @@ class TaskDB:
         return v, n
 
     def rows(self, status: Optional[str] = None):
-        sql = ("SELECT id, paper_uid, volume, pdf_url, status, error_kind, inferred, http_status, file_size, elapsed_ms, "
+        sql = ("SELECT id, paper_uid, volume, pdf_url, url_type, final_url, status, error_kind, inferred, http_status, file_size, elapsed_ms, "
                "exit_ip, retry_count, challenge_count, file_path, error_message, updated_at FROM paper_pdf_resources")
         args: tuple = ()
         if status:
