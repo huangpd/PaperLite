@@ -1,4 +1,6 @@
 import os
+import json
+import logging
 import tempfile
 import tomllib
 import threading
@@ -10,8 +12,10 @@ from unittest import mock
 
 from paperlite.browser_pool import BrowserPool
 from paperlite.classify import classify_html
-from paperlite.config import PoolConfig, proxy_settings
+from paperlite.config import PoolConfig, RunConfig, proxy_settings
 from paperlite.consumer import Downloader, impersonate_for
+from paperlite.inspect import WindowInspector
+from paperlite.logutil import JsonFormatter
 from paperlite.producer import Producer
 from paperlite.proxy import Lease, ProxySettings, parse_deadline
 from paperlite.store import Identity
@@ -47,6 +51,38 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(PoolConfig.from_dict({"page_interval_s": [15, 40]}).page_interval_s, (15.0, 40.0))
         with self.assertRaises(ValueError):
             PoolConfig.from_dict({"page_interval_s": [30, 10]})
+
+    def test_title_window_must_cover_trigger(self):
+        self.assertEqual(PoolConfig().title_window_size, 500)
+        with self.assertRaises(ValueError):
+            PoolConfig.from_dict({"title_dup_trigger": 10, "title_window_size": 9})
+
+    def test_default_run_config(self):
+        run = RunConfig.from_dict({"command": "run", "mode": "browser", "proxy": False,
+                                   "workers": 1, "urls": "x.csv", "url_type": "html"})
+        self.assertEqual((run.command, run.mode, run.proxy, run.workers), ("run", "browser", False, 1))
+        with self.assertRaises(ValueError):
+            RunConfig.from_dict({"command": "run", "mode": "curl", "proxy": False})
+
+    def test_configured_run_argument_mapping(self):
+        import argparse
+        from paperlite.cli import _configured_run_args
+        base = argparse.Namespace(config="x.toml", log_level="INFO")
+        args = _configured_run_args(base, RunConfig(command="run", mode="browser", proxy=False,
+                                                     workers=2, urls="x.csv", url_type="html"))
+        self.assertEqual((args.cmd, args.browser, args.no_proxy, args.workers, args.urls, args.type),
+                         ("run", True, True, 2, "x.csv", "html"))
+
+    def test_json_log_formatter(self):
+        record = logging.LogRecord("paperlite.test", logging.INFO, __file__, 1,
+                                   "页面保存成功", (), None)
+        record.event = "page_saved"
+        record.doi = "10.1/example"
+        record.seconds = 3.2
+        data = json.loads(JsonFormatter().format(record))
+        self.assertEqual((data["event"], data["doi"], data["seconds"]),
+                         ("page_saved", "10.1/example", 3.2))
+        self.assertNotIn("bytes", data)
 
     def test_proxy_settings(self):
         with self.assertRaises(ValueError):
@@ -163,6 +199,58 @@ class InspectTest(unittest.TestCase):
         rules, flagged = inspect(self.db, trigger=10, min_precision=0.98, min_support=10)
         self.assertEqual((rules, flagged), (0, 0))           # 护栏生效，不误标
         self.assertEqual(self.db.suspect_count(), 0)
+
+
+class WindowInspectorTest(unittest.TestCase):
+    """实时巡检只处理新结果和有限窗口，不读取历史成功表。"""
+
+    class FakeDB:
+        def __init__(self):
+            self.count_calls = 0
+            self.flag_calls = []
+
+        def crawled_titles(self):
+            raise AssertionError("实时巡检不应扫描历史任务")
+
+        def count_pending_matching(self, doi_prefix, url_prefix):
+            self.count_calls += 1
+            return 2
+
+        def flag_suspects(self, doi_prefix, url_prefix, title, support, precision):
+            self.flag_calls.append((doi_prefix, url_prefix, title, support, precision))
+            return 2
+
+    def test_does_not_repeat_same_rule_without_historical_scan(self):
+        db = self.FakeDB()
+        watcher = WindowInspector(db, trigger=3, min_support=3, window_size=5)
+        base = "https://example.org/article/"
+        self.assertEqual(watcher.observe("10.1/cov.1", base + "1", "Outside Front Cover"), (0, 0))
+        self.assertEqual(watcher.observe("10.1/cov.2", base + "2", "Outside Front Cover"), (0, 0))
+        self.assertEqual(watcher.observe("10.1/cov.3", base + "3", "Outside Front Cover"), (1, 2))
+        self.assertEqual(watcher.observe("10.1/cov.4", base + "4", "Outside Front Cover"), (0, 0))
+        self.assertEqual(len(db.flag_calls), 1)               # 相同规则不会重复写入
+        self.assertGreater(db.count_calls, 0)
+
+    def test_new_sample_can_expand_rule(self):
+        db = self.FakeDB()
+        watcher = WindowInspector(db, trigger=3, min_support=3, window_size=10)
+        base = "https://example.org/article/"
+        watcher.observe("10.1/journal(23)001", base + "23001", "Cover")
+        watcher.observe("10.1/journal(23)002", base + "23002", "Cover")
+        self.assertEqual(watcher.observe("10.1/journal(23)003", base + "23003", "Cover"), (1, 2))
+        # 新卷期样本让公共前缀从 (23) 扩到 (2；这是新规则，应允许再次标记。
+        self.assertEqual(watcher.observe("10.1/journal(24)001", base + "24001", "Cover"), (1, 2))
+        self.assertEqual(len(db.flag_calls), 2)
+
+    def test_evicted_samples_do_not_count(self):
+        db = self.FakeDB()
+        watcher = WindowInspector(db, trigger=3, min_support=3, window_size=3)
+        watcher.observe("10.1/a1", "https://x/a1", "Repeated")
+        watcher.observe("10.1/a2", "https://x/a2", "Repeated")
+        watcher.observe("10.1/b", "https://x/b", "Other B")
+        watcher.observe("10.1/c", "https://x/c", "Other C")
+        self.assertEqual(watcher.observe("10.1/a3", "https://x/a3", "Repeated"), (0, 0))
+        self.assertEqual(db.count_calls, 0)                  # 窗口内从未同时达到 3 条
 
 
 class TaskDBTest(unittest.TestCase):
@@ -381,7 +469,7 @@ class CliDbOptionTest(unittest.TestCase):
         self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
         with open(cfg, "rb") as f:
             raw = tomllib.load(f)
-        self.assertEqual(set(raw), {"proxy", "pool", "landing"})
+        self.assertEqual(set(raw), {"proxy", "pool", "run", "landing"})
         with self.assertRaises(SystemExit):                     # 已存在不覆盖
             self.run_cli("init")
         self.run_cli("init", "--force")
@@ -826,6 +914,23 @@ class BrowserPoolTest(unittest.TestCase):
         self.assertEqual(r["final_url"], urls[0] + "#final")
         self.assertEqual(Path(r["file_path"]).suffix, ".html")
         self.assertEqual(Path(r["file_path"]).read_bytes(), f"<html>{urls[0]}</html>".encode())
+
+    def test_realtime_inspector_stops_matching_pending_pages(self):
+        from paperlite.browser import RenderResult
+        self.cfg = PoolConfig(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1,
+                              title_dup_trigger=3, title_window_size=10,
+                              rule_min_support=3, rule_min_precision=1.0)
+        urls = [f"https://example.org/cover/{i}" for i in range(6)]
+
+        def cover(url):
+            return RenderResult(ok=True, seconds=1.0, url=url, status=200,
+                                title="Outside Front Cover", html="<html>cover</html>")
+
+        pool = self.run_pool(cover, urls)
+        self.assertEqual(pool.stats.success, 3)
+        rows = self.db.rows()
+        self.assertEqual(sum(r["status"] == "success" for r in rows), 3)
+        self.assertEqual(self.db.suspect_count(), 3)
 
     def test_404_fails_without_retry(self):
         from paperlite.browser import RenderResult

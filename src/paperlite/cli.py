@@ -38,9 +38,10 @@ from pathlib import Path
 
 from paperlite import __version__
 from paperlite import config as config_mod
-from paperlite.config import PoolConfig
+from paperlite.config import PoolConfig, RunConfig
 from paperlite.browser_pool import BrowserPool
 from paperlite.consumer import Downloader
+from paperlite.logutil import setup_logging
 from paperlite.producer import Producer
 from paperlite.proxy import IpSource, ProxySettings
 from paperlite.store import IdentityStore
@@ -48,6 +49,18 @@ from paperlite.tasks import ERROR_KINDS, Status, TaskDB, UrlType, url_host
 
 logger = logging.getLogger("paperlite")
 
+
+def _configured_run_args(args, run: RunConfig):
+    """把 [run] 转成与 ``paperlite run ...`` 相同的 argparse 参数。"""
+    if run.command != "run":
+        return None
+    return argparse.Namespace(
+        cmd="run", config=args.config, log_level=args.log_level,
+        out=run.out or None, host=run.host or None, db=run.db or None,
+        urls=run.urls or None, type=run.url_type, workers=run.workers,
+        curl=run.mode == "curl", browser=run.mode == "browser",
+        no_proxy=not run.proxy, headed=run.headed,
+    )
 
 
 def _load(path: str | None) -> tuple[PoolConfig, ProxySettings]:
@@ -360,16 +373,9 @@ def _inspect(args) -> None:
 
 
 def _browse_report(pool: BrowserPool, cfg: PoolConfig, stop: threading.Event) -> None:
-    from paperlite import inspect as inspect_mod
-
     s = pool.stats
     last_done, last_t = 0, time.monotonic()
     while not stop.wait(30):
-        if cfg.title_dup_trigger:                       # 巡检：同标题重复到阈值就归纳规则、标记疑似封面
-            try:
-                inspect_mod.inspect(pool.db, cfg.title_dup_trigger, cfg.rule_min_precision, cfg.rule_min_support)
-            except Exception:
-                logger.debug("巡检异常", exc_info=True)
         c = pool.db.counts()
         now = time.monotonic()
         done = s.success + s.failed
@@ -526,17 +532,30 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
 def main() -> None:
     ap, parsers = _build_parser()
     args = ap.parse_args()
-    if args.cmd is None:                     # 只敲 paperlite：像 uv 一样打印用法，不报错
-        ap.print_help()
-        return
+    pool_for_logging = None
+    if args.cmd is None:
+        try:
+            pool_for_logging, run = config_mod.load_run(config_mod.resolve_path(args.config))
+        except FileNotFoundError:
+            ap.print_help()
+            return
+        except (TypeError, ValueError) as e:
+            raise SystemExit(f"配置错误: {e}")
+        configured = _configured_run_args(args, run)
+        if configured is None:
+            ap.print_help()
+            return
+        args = configured
     if args.cmd == "help":
         (parsers[args.command] if args.command else ap).print_help()
         return
 
-    logging.basicConfig(level=args.log_level.upper(), stream=sys.stderr if args.cmd == "export" else sys.stdout,
-                        format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s", datefmt="%H:%M:%S")
+    pool_for_logging = pool_for_logging or _pool_cfg(args)
+    log_path = setup_logging(args.log_level, pool_for_logging.log_dir, stderr=args.cmd == "export")
     for noisy in ("asyncio", "curl_cffi"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    if log_path:
+        logger.info("日志文件 %s", log_path.resolve())
 
     # SIGTERM（pkill / systemd / docker stop）与 Ctrl+C 一样优雅退出；
     # 非交互 shell 用 & 启动的进程 SIGINT 被设为忽略，这里显式恢复

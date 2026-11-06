@@ -420,7 +420,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "certifi", specifier = ">=2024.2.2" },
-    { name = "cloakbrowser", specifier = ">=0.6.2" },
+    { name = "cloakbrowser", specifier = "==0.6.4" },
     { name = "curl-cffi", specifier = ">=0.15.0" },
     { name = "redis", specifier = ">=5.0" },
 ]

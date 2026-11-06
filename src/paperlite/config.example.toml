@@ -7,13 +7,14 @@ scheme = "http"
 username = ""
 password = ""
 lease_s = 600                 # 单个 IP 最长使用时间（秒），与接口返回的 deadline 取较早者
-check_url = "https://dl.acm.org/robots.txt"   # 新 IP 体检地址，收到任意 HTTP 响应即合格
+check_url = "https://www.cloudflare.com/cdn-cgi/trace"   # 新 IP 体检地址，收到任意 HTTP 响应即合格
 
 [pool]
 redis_url = "redis://127.0.0.1:6379/0"
-out_root = "pdfs"             # 不给 --out 时，站点输出目录为 <out_root>/<主机>，如 pdfs/dl.acm.org
-db_dir = ""                   # 任务库目录（本地盘）。设置后任务库放这里：<目录>/<输出目录名>-<路径哈希>.db；
+out_root = "file"             # 默认输出根目录，站点目录为 <out_root>/<主机>
+db_dir = "db"                # 任务库目录（本地盘）。设置后任务库放这里：<目录>/<输出目录名>-<路径哈希>.db；
                               # 留空则放输出目录里的 tasks.db。PDF 输出到 goofys 等挂载上时必须设置（或每次用 --db）
+log_dir = "log"               # 日志目录；非空时同时打印到终端并写入 .jsonl 日志文件
 max_browsers = 20             # 同时运行的浏览器上限
 max_identities = 20           # 健康身份上限；实际按在线下载线程数生产
 min_identities = 0            # 没有下载线程时也保持的预热身份数
@@ -31,8 +32,21 @@ max_tries = 3                 # 单条 URL 网络错误重试次数（cookie 被
 max_url_challenges = 3        # 单条 URL 带有效 cookie 仍被挑战满这么多次 → failed / challenge_failed
 volume_stop_after = 3         # 同一卷期（DOI 点号前那段）还没下到 PDF、已有这么多篇 404/订阅/摘要页 → 停掉该卷期其余任务；0 关闭
 title_dup_trigger = 10        # 巡检：同一标题重复这么多篇就归纳 doi/url 规则、标记疑似封面的未采任务（不再采）；0 关闭
+title_window_size = 500       # 实时巡检只看本次运行最近这么多条成功结果，不反复扫描历史任务
 rule_min_precision = 0.98     # 规则在已采数据上的最低精确率（防止把真文章误标）
 rule_min_support = 10         # 规则在已采数据上的最低命中数
+
+[run]                         # 配置后可只执行：paperlite --config config.toml
+command = "run"               # 填 "run" 启用无子命令启动
+mode = "browser"             # browser / curl
+proxy = false                 # false 等价于 --no-proxy（仅 browser）
+workers = 1
+urls = ""                    # 可选：启动时先导入 URL 文件
+url_type = "html"            # pdf / html
+out = ""                      # 可选精确输出目录；非空时覆盖 [pool] out_root
+host = ""
+db = ""                       # 可选精确数据库文件；非空时覆盖 [pool] db_dir
+headed = false
 
 [landing]                     # 各主机的过盾落地页（任意会触发挑战的普通页面）；未配置的用主机首页
 "dl.acm.org" = "https://dl.acm.org/doi/10.1145/3779295"

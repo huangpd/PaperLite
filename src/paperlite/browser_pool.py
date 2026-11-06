@@ -24,6 +24,8 @@ from typing import Optional
 
 from paperlite.browser import BrowserSession
 from paperlite.config import PoolConfig
+from paperlite.inspect import WindowInspector
+from paperlite.logutil import log_event
 from paperlite.proxy import IpSource, Lease, ProxySettings, ProxyUnavailable
 from paperlite.tasks import Status, Task, TaskDB, UrlType, pdf_path
 
@@ -65,6 +67,9 @@ class BrowserPool:
         self.landing = cfg.landing_for(self.host)
         self.stats = BrowserStats()
         self._drained = threading.Event()      # 所有任务领完
+        self.inspector = (WindowInspector(db, cfg.title_dup_trigger, cfg.rule_min_precision,
+                                          cfg.rule_min_support, cfg.title_window_size)
+                          if cfg.title_dup_trigger else None)
 
     def run(self, stop: Optional[threading.Event] = None) -> BrowserStats:
         asyncio.run(self._run(stop or threading.Event()))
@@ -141,7 +146,12 @@ class BrowserPool:
                 await session.start()
                 r = await session.render(self.landing, self.cfg.pass_timeout_s)
             except Exception as e:
-                logger.info("浏览器启动/过盾异常 ip=%s: %s", lease.exit_ip, type(e).__name__)
+                logger.error("浏览器启动/过盾异常", extra={
+                    "event": "browser_start_failed",
+                    "exit_ip": lease.exit_ip,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                }, exc_info=True)
                 await session.close()
                 continue
             if not r.ok:
@@ -193,7 +203,10 @@ class BrowserPool:
         await asyncio.to_thread(self.db.finish, task, Status.SUCCESS, http_status=code, file_path=str(dest),
                                 file_size=len(body), elapsed_ms=elapsed, exit_ip=lease.exit_ip,
                                 title=r.title or None, final_url=r.url or None)
+        if self.inspector is not None:
+            await asyncio.to_thread(self.inspector.observe, task.doi, task.url, r.title)
         self.stats.add("success")
         self.stats.add("pages")
-        logger.info("✓ %.0fs（点击 %d）%d 字节 → %s", r.seconds, r.clicks, len(body),
-                    r.url.rsplit("/", 1)[-1][:40] or r.url)
+        log_event(logger, logging.INFO, "page_saved", "页面保存成功",
+                  doi=task.doi, target=r.url.rsplit("/", 1)[-1][:40] or r.url,
+                  seconds=round(r.seconds, 1), clicks=r.clicks)

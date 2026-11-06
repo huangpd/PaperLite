@@ -14,8 +14,9 @@ paperlite/inspect.py
 
 import logging
 import re
+import threading
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,81 @@ def _candidates(samples: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
 def _matches(doi: str, url: str, dp: str, up: str) -> bool:
     return (not dp or doi.startswith(dp)) and (not up or url.startswith(up))
+
+
+class WindowInspector:
+    """浏览器采集用的增量巡检器，只观察本次进程最近 ``window_size`` 条成功结果。
+
+    每条结果只进入内存一次；标题达到阈值后，有新的同标题样本才重新评估。已经生成过的
+    规则不会重复写入，但新样本确实跨越卷期时允许归纳出更宽的新规则。
+    """
+
+    def __init__(self, db, trigger: int = 10, min_precision: float = 0.98,
+                 min_support: int = 10, window_size: int = 500) -> None:
+        if trigger <= 0:
+            raise ValueError("trigger 必须大于 0")
+        if window_size < trigger:
+            raise ValueError("window_size 不能小于 trigger")
+        self.db = db
+        self.trigger = trigger
+        self.min_precision = min_precision
+        self.min_support = min_support
+        self.window_size = window_size
+        self._rows: deque[tuple[str, str, str, str]] = deque()
+        self._counts: Counter[str] = Counter()
+        self._applied_rules: set[tuple[str, str]] = set()
+        self._lock = threading.Lock()
+
+    def observe(self, doi: str, url: str, title: str) -> tuple[int, int]:
+        """加入一条刚成功的结果；返回本次新增的 ``(规则数, 标记数)``。"""
+        nt = norm_title(title)
+        if not nt:
+            return 0, 0
+        with self._lock:
+            if len(self._rows) >= self.window_size:
+                _, _, old_nt, _ = self._rows.popleft()
+                self._counts[old_nt] -= 1
+                if self._counts[old_nt] <= 0:
+                    del self._counts[old_nt]
+            self._rows.append((doi, url, nt, title))
+            self._counts[nt] += 1
+            if self._counts[nt] < self.trigger:
+                return 0, 0
+            return self._trigger(nt)
+
+    def _trigger(self, nt: str) -> tuple[int, int]:
+        rows = list(self._rows)
+        samples = [(d, u) for d, u, t, _ in rows if t == nt]
+        bad_titles = {t for t, count in self._counts.items() if count >= self.trigger}
+        original = next(title for _, _, t, title in rows if t == nt)
+        best = None
+        for dp, up in _candidates(samples):
+            matched = [t for d, u, t, _ in rows if _matches(d, u, dp, up)]
+            support = len(matched)
+            if support < self.min_support:
+                continue
+            precision = sum(1 for t in matched if t in bad_titles) / support
+            if precision < self.min_precision:
+                continue
+            pending = self.db.count_pending_matching(dp, up)
+            if pending == 0:
+                continue
+            key = (pending, support)
+            if best is None or key > best[0]:
+                best = (key, support, precision, dp, up)
+        if best is None:
+            return 0, 0
+        _, support, precision, dp, up = best
+        if (dp, up) in self._applied_rules:
+            return 0, 0
+        flagged = self.db.flag_suspects(dp, up, original, support, precision)
+        if not flagged:
+            return 0, 0
+        self._applied_rules.add((dp, up))
+        logger.info("巡检窗口：标题重复 %d 次（%r）→ 规则 doi~%r url~%r"
+                    "（precision %.3f，窗口命中 %d）→ 标记 %d 条疑似封面，不再采",
+                    len(samples), original[:40], dp, up, precision, support, flagged)
+        return 1, flagged
 
 
 def inspect(db, trigger: int = 10, min_precision: float = 0.98, min_support: int = 10) -> tuple[int, int]:

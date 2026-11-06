@@ -6,6 +6,7 @@ paperlite/config.py
 读 config.toml（模板见包内 config.example.toml，paperlite init 生成）。查找顺序：--config 参数 > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml。
   [proxy]    代理提取接口与鉴权
   [pool]     生产 / 消费参数
+  [run]      省略子命令时的默认运行参数
   [landing]  主机 → 过盾落地页
 """
 
@@ -43,6 +44,7 @@ class PoolConfig:
     redis_url: str = "redis://127.0.0.1:6379/0"
     out_root: str = "pdfs"            # 不给 --out 时的输出根目录：每个站点 <out_root>/<主机>
     db_dir: str = ""                  # 任务库目录；设置后任务库放这里（<目录>/<输出目录名>-<路径哈希>.db），不放输出目录
+    log_dir: str = ""                 # 日志目录；非空时同时写终端和按启动时间命名的日志文件
     key_prefix: str = "paperlite"
     # 生产
     max_browsers: int = 20            # 同时运行的浏览器上限
@@ -70,6 +72,7 @@ class PoolConfig:
     volume_stop_after: int = 3        # 同一卷期还没下到 PDF、已有这么多篇 404/订阅/摘要页 → 停掉该卷期其余任务；0 关闭
     # 巡检：同标题重复到阈值就归纳 doi/url 规则，把疑似封面的 pending 标记跳过（见 inspect.py）
     title_dup_trigger: int = 10       # 同一标题重复这么多篇就触发巡检；0 关闭巡检
+    title_window_size: int = 500      # 实时巡检只保留本次运行最近这么多条成功结果
     rule_min_precision: float = 0.98  # 归纳出的规则在已采数据上的最低精确率，防止把真文章误标
     rule_min_support: int = 10        # 规则在已采数据上的最低命中数
 
@@ -86,8 +89,46 @@ class PoolConfig:
                 if not 0 <= lo <= hi:
                     raise ValueError(f"{key} 必须是 [最小, 最大] 且 0 ≤ 最小 ≤ 最大")
                 kwargs[key] = (lo, hi)
+        trigger = int(kwargs.get("title_dup_trigger", cls.title_dup_trigger))
+        window = int(kwargs.get("title_window_size", cls.title_window_size))
+        if trigger < 0:
+            raise ValueError("title_dup_trigger 不能小于 0")
+        if trigger and window < trigger:
+            raise ValueError("title_window_size 不能小于 title_dup_trigger")
         kwargs["landing"] = {str(k).lower(): str(v) for k, v in (landing or {}).items()}
         return cls(**kwargs)
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """只传 ``--config`` 时采用的默认命令参数。command 为空则仍显示帮助。"""
+
+    command: str = ""
+    mode: str = "browser"
+    proxy: bool = True
+    workers: int = 20
+    urls: str = ""
+    url_type: str = "pdf"
+    out: str = ""
+    host: str = ""
+    db: str = ""
+    headed: bool = False
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RunConfig":
+        _reject_unknown("run", raw, cls)
+        cfg = cls(**raw)
+        if cfg.command not in ("", "run"):
+            raise ValueError("[run] command 目前只支持 run")
+        if cfg.mode not in ("browser", "curl"):
+            raise ValueError("[run] mode 必须是 browser 或 curl")
+        if cfg.workers < 1:
+            raise ValueError("[run] workers 必须大于 0")
+        if cfg.url_type not in ("pdf", "html"):
+            raise ValueError("[run] url_type 必须是 pdf 或 html")
+        if not cfg.proxy and cfg.mode != "browser":
+            raise ValueError("[run] proxy = false 只支持 browser 模式")
+        return cfg
 
 
 def proxy_settings(raw: dict[str, Any]) -> ProxySettings:
@@ -103,7 +144,7 @@ def _read(path: Path) -> dict[str, Any]:
                                 f"或用 --config / 环境变量 {CONFIG_ENV} 指定）")
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    _reject_unknown("顶层", raw, None, allowed={"proxy", "pool", "landing"})
+    _reject_unknown("顶层", raw, None, allowed={"proxy", "pool", "run", "landing"})
     return raw
 
 
@@ -117,6 +158,13 @@ def load_pool(path: Path | None = None) -> PoolConfig:
     """只读 [pool]，不校验代理（import / retry / export 只需要 db_dir 这类设置）。"""
     raw = _read(path or resolve_path())
     return PoolConfig.from_dict(raw.get("pool", {}), raw.get("landing", {}))
+
+
+def load_run(path: Path | None = None) -> tuple[PoolConfig, RunConfig]:
+    """读取无需子命令即可启动所需的 [pool] / [run]；不强制校验代理配置。"""
+    raw = _read(path or resolve_path())
+    return (PoolConfig.from_dict(raw.get("pool", {}), raw.get("landing", {})),
+            RunConfig.from_dict(raw.get("run", {})))
 
 
 def task_db_path(out: str | None, db: str | None, db_dir: str = "") -> Path:
