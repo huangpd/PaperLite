@@ -129,8 +129,10 @@ class TaskDBTest(unittest.TestCase):
         self.assertEqual(self.db.import_urls(self.urls(1, 3)), (1, 1))   # 重复导入不重置
         self.assertEqual(self.db.counts()[Status.SUCCESS], 1)
         self.assertEqual(self.db.host(), "dl.acm.org")
-        with self.assertRaises(ValueError):
-            self.db.import_urls([{"pdf_url": "https://other.org/x.pdf"}])
+        # 允许混合主机：再导入别的主机不报错，host() 仍是第一个，hosts() 两个都在
+        self.assertEqual(self.db.import_urls([{"url": "https://other.org/x.pdf"}]), (1, 0))
+        self.assertEqual(self.db.host(), "dl.acm.org")
+        self.assertEqual(self.db.hosts(), ["dl.acm.org", "other.org"])
 
     def test_claim_retry_and_reset(self):
         self.db.import_urls(self.urls(1))

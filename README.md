@@ -49,8 +49,8 @@ source .venv/bin/activate && paperlite status
 | 命令 | 作用 |
 |---|---|
 | `uv run paperlite init [--force]` | 在当前目录生成配置模板 `config.toml`（或写到 `--config` 指定的路径） |
-| `uv run paperlite import --urls <文件> [--type pdf\|html]` | 导入任务。txt 一行一个链接，或带 `url` 列（可选 `doi` / `source` / `batch_no` / `url_type`；旧名 `pdf_url` / `paper_uid` 仍兼容）的 CSV。`--type html` 表示要网页本身（整页存 `.html`），CSV 的 `url_type` 列逐行覆盖；`run` / `download --urls` 同样可加 `--type`。重复导入不重置已有任务；一个库只能有一个主机 |
-| `uv run paperlite run [--urls <文件>] [--workers 20]` | 同进程生产身份 + 下载，下载完退出 |
+| `uv run paperlite import --urls <文件> [--type pdf\|html]` | 导入任务。txt 一行一个链接，或带 `url` 列（可选 `doi` / `source` / `batch_no` / `url_type`；旧名 `pdf_url` / `paper_uid` 仍兼容）的 CSV。`--type html` 表示要网页本身（整页存 `.html`），CSV 的 `url_type` 列逐行覆盖；`run` / `download --urls` 同样可加 `--type`。重复导入不重置已有任务；可混多个主机（`run --browser` 按每条 URL 各自过盾）|
+| `uv run paperlite run [--urls <文件>] [--workers 20]` | 下载，下载完退出。默认 **curl 模式**（浏览器过盾存 cookie、curl 批量下，省资源，须单主机）；加 `--browser` 走**浏览器模式**（每浏览器+IP 过盾一次后连续下同域名多篇、整页存 `.html`，可混多主机、浏览器自己跟跳转；`--no-proxy` 本地直连不用代理）|
 | `uv run paperlite produce [--keep N]` | 只生产身份，常驻 |
 | `uv run paperlite download [--workers 20]` | 只下载，需有生产者在跑 |
 | `uv run paperlite status` | 各状态数量、失败 / non_pdf 按 `error_kind` 分组、被停卷期、身份池 |

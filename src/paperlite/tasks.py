@@ -224,16 +224,23 @@ class TaskDB:
     # ── 主机 ──────────────────────────────────────────────────
 
     def host(self) -> Optional[str]:
+        """第一个导入的主机（meta 记录）；curl 模式的落地页/身份池按它来。多主机库见 hosts()。"""
         with self._lock:
             row = self._conn.execute("SELECT value FROM meta WHERE key = 'host'").fetchone()
         return row[0] if row else None
+
+    def hosts(self) -> list[str]:
+        """库里出现过的所有主机（去重排序）。允许一个库混多个主机。"""
+        with self._lock:
+            urls = self._conn.execute("SELECT DISTINCT url FROM paper_pdf_resources").fetchall()
+        return sorted({url_host(u[0]) for u in urls})
 
     # ── 导入 ──────────────────────────────────────────────────
 
     def import_urls(self, rows: Iterable[dict]) -> tuple[int, int]:
         """
         rows: {"url"（或旧名 "pdf_url"）, 可选 "doi"（或旧名 "paper_uid"）/ "source" / "batch_no" / "url_type"}。返回 (新增, 已存在)。
-        doi 来自导入列，没给则从 URL 回退推导（纯 URL 列表照样能用）。一个库只能有一个主机。
+        doi 来自导入列，没给则从 URL 回退推导（纯 URL 列表照样能用）。允许混合多个主机（browse 模式按每条 URL 各自过盾）。
         """
         host = self.host()
         batch, seen = [], 0
@@ -243,9 +250,7 @@ class TaskDB:
             h = url_host(url)
             if not h:
                 raise ValueError(f"不是有效链接: {url}")
-            host = host or h
-            if h != host:
-                raise ValueError(f"本库主机是 {host}，不能导入 {h} 的链接（一个站点一个库）: {url}")
+            host = host or h          # meta 只记第一个主机（curl 模式的落地页/身份池用）；允许再导入别的主机
             doi = (r.get("doi") or r.get("paper_uid") or "").strip().lower() or derive_doi(url)
             kind = (r.get("url_type") or UrlType.PDF).strip().lower()
             if kind not in UrlType.ALL:

@@ -157,6 +157,11 @@ def _download(args, cfg, proxy, store, with_producer: bool) -> None:
     out, db = _open_site(args, create=True)
     if args.urls:
         _import(db, args.urls, url_type=args.type)
+    hs = db.hosts()
+    if len(hs) > 1:
+        db.close()
+        raise SystemExit(f"curl 模式（run / download / produce）需单主机，本库有 {len(hs)} 个：{'、'.join(hs[:5])}。"
+                         f"混合主机请用 paperlite run --browser")
     try:
         reclaimed = db.lock_for_download()
     except RuntimeError as e:
@@ -289,7 +294,7 @@ def _turnstile(args, parser) -> None:
         sys.exit(f"失败: {r.error}")
 
 
-def _browse(args, cfg, proxy) -> None:
+def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
     """浏览器下载模式：每个浏览器+IP 过盾一次后连续下同域名多篇（整页存 .html）。不用 Redis 身份池。"""
     out, db = _open_site(args, create=True)
     if args.urls:
@@ -301,7 +306,7 @@ def _browse(args, cfg, proxy) -> None:
     if reclaimed:
         logger.info("上次中断残留的 %d 个 running 任务已放回 pending", reclaimed)
     try:
-        pool = BrowserPool(cfg, proxy, db, out, args.workers)
+        pool = BrowserPool(cfg, proxy, db, out, args.workers, no_proxy=no_proxy)
     except ValueError as e:
         db.close()
         raise SystemExit(str(e))
@@ -348,10 +353,9 @@ def _raise_interrupt(signum, frame):
 _COMMANDS = {
     "init": "在当前目录生成配置模板 config.toml",
     "import": "导入任务（txt 一行一个链接，或带 url 列的 CSV）",
-    "run": "生产身份 + 下载，下载完退出",
+    "run": "下载，下载完退出。默认 curl 模式（单主机）；--browser 走浏览器模式（可多主机、跟跳转）",
     "produce": "只生产身份，常驻",
-    "download": "只下载，需有生产者在跑",
-    "browse": "浏览器下载网页模式：每浏览器+IP 过盾一次后连续下同域名多篇（整页存 .html）",
+    "download": "只下载（curl 模式），需有生产者在跑",
     "status": "任务统计、失败分类、身份池",
     "retry": "把 failed / non_pdf 的任务重置为 pending",
     "export": "导出任务为 CSV",
@@ -365,7 +369,8 @@ _DESCRIPTION = "浏览器过盾 cookie 池 + curl_cffi，单站点大批量下�
 _EPILOG = """示例:
   paperlite init                         # 生成 config.toml，填好代理
   paperlite import --urls acm.txt        # 导入 → pdfs/dl.acm.org/
-  paperlite run --workers 20             # 开跑，Ctrl+C 随时停，再执行从断点继续
+  paperlite run --workers 20             # curl 模式开跑（单主机），Ctrl+C 随时停，再执行从断点继续
+  paperlite run --browser --urls x.csv   # 浏览器模式：可混多主机、跟跳转、整页存 .html（加 --no-proxy 本地直连）
   paperlite status
 
 用 paperlite help <命令> 查看某个命令的参数。"""
@@ -430,19 +435,22 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     site_args(p)
     p.add_argument("--keep", type=int, help="没有下载线程时也养着这么多身份（覆盖 min_identities），"
                                             "下载前一两分钟先启动可省掉冷启动的过盾等待")
-    for name in ("download", "run"):
-        p = cmd(name)
-        site_args(p)
-        p.add_argument("--urls", help="先导入这个文件（可选）")
-        p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
-        p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数，默认 20")
-    p = cmd("browse")
+    p = cmd("download")
     site_args(p)
     p.add_argument("--urls", help="先导入这个文件（可选）")
-    p.add_argument("--type", choices=UrlType.ALL, default=UrlType.HTML,
-                   help="--urls 的链接类型，浏览器模式默认 html（整页存 .html）")
-    p.add_argument("--workers", type=int, default=5,
-                   help="同时打开的浏览器数 = 并发出口 IP 数（受配置 max_browsers 约束），默认 5")
+    p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
+    p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数，默认 20")
+    p = cmd("run")
+    site_args(p)
+    p.add_argument("--urls", help="先导入这个文件（可选）")
+    p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
+    p.add_argument("--workers", type=int, default=20,
+                   help="并发数：curl 模式 = 下载线程/身份数；--browser 模式 = 同时打开的浏览器数。默认 20（浏览器模式建议调小）")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--curl", action="store_true", help="curl 模式（默认）：浏览器过盾存 cookie、curl 批量下，省资源；须单主机")
+    g.add_argument("--browser", action="store_true", help="浏览器模式：每浏览器+IP 过盾一次后连续下同域名多篇、整页存 .html；可混多主机、能跟跳转")
+    p.add_argument("--no-proxy", action="store_true", help="仅 --browser：直连本机 IP、不取代理（本地测试，无需代理配置）")
+    p.add_argument("--headed", action="store_true", help="仅 --browser：有界面运行（调试）")
     p = cmd("status")
     site_args(p)
     p = cmd("retry")
@@ -523,12 +531,20 @@ def main() -> None:
         _turnstile(args, parsers["turnstile"])
         return
 
+    if args.cmd == "run" and args.browser:          # 浏览器模式
+        if args.no_proxy:
+            cfg = _pool_cfg(args)
+            proxy = None
+        else:
+            cfg, proxy = _load(args.config)
+        if args.headed:
+            cfg = dataclasses.replace(cfg, headed=True)
+        _browse(args, cfg, proxy, no_proxy=args.no_proxy)
+        return
+
     cfg, proxy = _load(args.config)
     if args.cmd == "status":
         _status(args, cfg)
-        return
-    if args.cmd == "browse":
-        _browse(args, cfg, proxy)
         return
 
     store = IdentityStore(cfg.redis_url, cfg.key_prefix)

@@ -46,7 +46,8 @@ class BrowserStats:
 class BrowserPool:
     """N 个 worker 协程并发，每个 worker 独占一个 浏览器+IP，串行领取任务下载。"""
 
-    def __init__(self, cfg: PoolConfig, proxy: ProxySettings, db: TaskDB, out: Path, workers: int) -> None:
+    def __init__(self, cfg: PoolConfig, proxy: Optional[ProxySettings], db: TaskDB, out: Path, workers: int,
+                 no_proxy: bool = False) -> None:
         if workers > cfg.max_browsers:
             logger.info("worker 数 %d 超过 max_browsers %d，按 %d 运行", workers, cfg.max_browsers, cfg.max_browsers)
             workers = cfg.max_browsers
@@ -54,13 +55,14 @@ class BrowserPool:
         self.proxy = proxy
         self.db = db
         self.out = out
+        self.no_proxy = no_proxy                       # 直连本机 IP，不取代理、不轮换 IP
         self.workers = max(1, workers)
-        self.ips = IpSource(proxy)
-        host = db.host()
-        if host is None:
+        self.ips = None if no_proxy else IpSource(proxy)
+        self.hosts = db.hosts()
+        if not self.hosts:
             raise ValueError("任务库里没有任务，无法确定主机")
-        self.host = host
-        self.landing = cfg.landing_for(host)
+        self.host = db.host() or self.hosts[0]      # 热身落地页用第一个主机；其它主机的页面在首次渲染时各自过盾
+        self.landing = cfg.landing_for(self.host)
         self.stats = BrowserStats()
         self._drained = threading.Event()      # 所有任务领完
 
@@ -69,8 +71,9 @@ class BrowserPool:
         return self.stats
 
     async def _run(self, stop: threading.Event) -> None:
-        logger.info("浏览器下载模式：%s，落地页 %s，浏览器 %d，单篇间隔 %.0f–%.0fs",
-                    self.host, self.landing, self.workers, *self.cfg.page_interval_s)
+        logger.info("浏览器下载模式：主机 %s%s，热身落地页 %s，浏览器 %d%s，单篇间隔 %.0f–%.0fs",
+                    "、".join(self.hosts[:3]), " 等" if len(self.hosts) > 3 else "", self.landing, self.workers,
+                    "（本机直连）" if self.no_proxy else "", *self.cfg.page_interval_s)
         tasks = [asyncio.create_task(self._worker(i, stop)) for i in range(self.workers)]
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -111,18 +114,29 @@ class BrowserPool:
         return None
 
     async def _new_session(self, stop: threading.Event):
-        """取一个寿命够长的新 IP → 起浏览器 → 过落地页的盾热身一次。失败则换 IP 重试。"""
+        """取一个寿命够长的新 IP → 起浏览器 → 过落地页的盾热身一次。失败则换 IP 重试。
+        no_proxy：用本机 IP，不取代理、不轮换；过盾失败重试几次仍不成就放弃（没别的 IP 可换）。"""
+        tries = 0
         while not stop.is_set() and not self._drained.is_set():
-            try:
-                lease = await asyncio.to_thread(self.ips.extract_checked)
-            except ProxyUnavailable as e:
-                logger.warning("提取 IP 失败: %s", e)
-                await asyncio.sleep(_NO_IP_WAIT_S)
-                continue
-            if lease.left() < self.cfg.min_left_s + self.cfg.pass_timeout_s:
-                logger.info("IP %s 剩余寿命太短，丢弃", lease.exit_ip)
-                continue
-            session = BrowserSession(self.proxy.browser_proxy_for(lease.server), self.cfg.headed)
+            if self.no_proxy:
+                tries += 1
+                if tries > 3:
+                    logger.warning("直连本机 IP 连续 %d 次过盾失败，放弃该 worker", tries - 1)
+                    return None, None
+                lease = Lease(server="", exit_ip="local", area="", expires_at=time.time() + 10 ** 9)
+                proxy_arg = None
+            else:
+                try:
+                    lease = await asyncio.to_thread(self.ips.extract_checked)
+                except ProxyUnavailable as e:
+                    logger.warning("提取 IP 失败: %s", e)
+                    await asyncio.sleep(_NO_IP_WAIT_S)
+                    continue
+                if lease.left() < self.cfg.min_left_s + self.cfg.pass_timeout_s:
+                    logger.info("IP %s 剩余寿命太短，丢弃", lease.exit_ip)
+                    continue
+                proxy_arg = self.proxy.browser_proxy_for(lease.server)
+            session = BrowserSession(proxy_arg, self.cfg.headed)
             try:
                 await session.start()
                 r = await session.render(self.landing, self.cfg.pass_timeout_s)
@@ -135,8 +149,11 @@ class BrowserPool:
                 await session.close()
                 continue
             self.stats.add("browsers")
-            logger.info("浏览器就绪 ip=%s 过盾 %.0fs（点击 %d），身份寿命 %.0fs",
-                        lease.exit_ip, r.seconds, r.clicks, lease.left())
+            if self.no_proxy:
+                logger.info("浏览器就绪（本机直连）过盾 %.0fs（点击 %d）", r.seconds, r.clicks)
+            else:
+                logger.info("浏览器就绪 ip=%s 过盾 %.0fs（点击 %d），身份寿命 %.0fs",
+                            lease.exit_ip, r.seconds, r.clicks, lease.left())
             return session, lease
         return None, None
 
