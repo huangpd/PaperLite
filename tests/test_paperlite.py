@@ -15,7 +15,7 @@ from paperlite.consumer import Downloader, impersonate_for
 from paperlite.producer import Producer
 from paperlite.proxy import Lease, ProxySettings, parse_deadline
 from paperlite.store import Identity
-from paperlite.tasks import Status, TaskDB, UrlType, derive_paper_uid, derive_volume, pdf_path, url_key
+from paperlite.tasks import Status, TaskDB, UrlType, derive_doi, derive_volume, pdf_path, url_key
 
 FAKE_PDF = b"%PDF-1.4\n" + b"0" * 2048          # 超过最小文件大小（1024 字节）
 PROXY = ProxySettings(api_url="https://api.example/get?key=k", username="u", password="p@ss")
@@ -101,8 +101,8 @@ class IdentityRulesTest(unittest.TestCase):
 
     def test_paper_uid_and_path(self):
         url = "https://dl.acm.org/doi/pdf/10.1145/1005062.1005064"
-        self.assertEqual(derive_paper_uid(url), "10.1145/1005062.1005064")
-        self.assertTrue(derive_paper_uid("https://x.org/a.pdf").startswith("url-"))
+        self.assertEqual(derive_doi(url), "10.1145/1005062.1005064")
+        self.assertTrue(derive_doi("https://x.org/a.pdf").startswith("url-"))
         p = pdf_path(Path("out"), "10.1145/3779295")
         self.assertEqual(p.name, "10.1145_3779295.pdf")
         self.assertEqual(len(p.parent.name), 2)              # out/<h0:2>/<h2:4>/
@@ -151,7 +151,7 @@ class TaskDBTest(unittest.TestCase):
         self.db.import_urls(self.urls(1, 2))
         t1 = self.db.claim("w")
         self.assertFalse(self.db.challenged(t1, max_challenges=2, exit_ip="1.1.1.1", message="403"))
-        self.assertEqual(self.db.claim("w").pdf_url, self.urls(2)[0]["pdf_url"])   # 被挑战的排到后面
+        self.assertEqual(self.db.claim("w").url, self.urls(2)[0]["pdf_url"])   # 被挑战的排到后面
         t1 = self.db.claim("w")
         self.assertEqual(t1.challenge_count, 1)
         self.assertTrue(self.db.challenged(t1, max_challenges=2, exit_ip="2.2.2.2", message="403"))
@@ -189,6 +189,27 @@ class TaskDBTest(unittest.TestCase):
         self.assertEqual(self.db.claim("w").url_type, UrlType.PDF)
         self.db.import_urls([{"pdf_url": "https://dl.acm.org/doi/10.1145/2", "url_type": "html"}])
         self.assertEqual(self.db.claim("w").url_type, UrlType.HTML)
+
+    def test_doi_imported_from_column_else_derived(self):
+        self.db.import_urls([{"url": "https://dl.acm.org/doi/10.1145/1", "doi": "10.9999/CUSTOM"},
+                             {"url": "https://dl.acm.org/doi/10.1145/2"}])      # 第二条无 doi → 回退推导
+        dois = sorted(r["doi"] for r in self.db.rows())
+        self.assertEqual(dois, ["10.1145/2", "10.9999/custom"])               # 导入的 doi 转小写；缺省从 URL 推
+
+    def test_old_db_renames_pdf_url_and_paper_uid(self):
+        import sqlite3
+        self.db.import_urls(self.urls(1))
+        self.db.close()
+        conn = sqlite3.connect(self.db.path)                                  # 模拟 0.1.3 之前：列名还是 pdf_url / paper_uid，无 title
+        conn.execute("ALTER TABLE paper_pdf_resources RENAME COLUMN url TO pdf_url")
+        conn.execute("ALTER TABLE paper_pdf_resources RENAME COLUMN doi TO paper_uid")
+        conn.execute("ALTER TABLE paper_pdf_resources DROP COLUMN title")
+        conn.commit()
+        conn.close()
+        self.db = TaskDB(self.db.path)                                        # 打开时自动 RENAME 回来 + 补 title
+        t = self.db.claim("w")
+        self.assertTrue(t.url.startswith("https://dl.acm.org") and t.doi)
+        self.assertIn("title", [d[0] for d in self.db._conn.execute("SELECT * FROM paper_pdf_resources").description])
 
     def test_check_constraints(self):
         import sqlite3
@@ -228,7 +249,7 @@ class VolumeStopTest(unittest.TestCase):
         self.load(1000, 6)
         self.load(2000, 2)
         got = [self.db.claim("w") for _ in range(6)]
-        vols = [t.paper_uid.split("/")[1].split(".")[0] for t in got if t]
+        vols = [t.doi.split("/")[1].split(".")[0] for t in got if t]
         self.assertEqual(vols, ["1000", "1000", "1000", "2000", "2000"])   # 卷期 1000 最多放 3 篇，其余线程去别的卷期
         self.assertIsNone(got[5])
         self.db.finish(got[0], Status.SUCCESS)                               # 下到一篇 PDF → 卷期确认，放开
@@ -511,7 +532,7 @@ class DownloaderTest(unittest.TestCase):
         return dl
 
     def row(self, url):
-        return next(r for r in self.db.rows() if r["pdf_url"] == url)
+        return next(r for r in self.db.rows() if r["url"] == url)
 
     def test_rejected_cookie_switches_identity_without_counting_retry(self):
         store = FakeStore([ident(exit_ip="1.1.1.1"), ident(exit_ip="2.2.2.2")])
@@ -535,7 +556,7 @@ class DownloaderTest(unittest.TestCase):
                            [url])
         self.assertEqual(dl.stats.non_pdf, 1)
         r = self.row(url)
-        self.assertEqual((r["status"], r["error_kind"], r["error_message"]), ("non_pdf", "not_found", "ACM Error: 404"))
+        self.assertEqual((r["status"], r["error_kind"], r["title"]), ("non_pdf", "not_found", "ACM Error: 404"))
         self.assertTrue((self.out / "non_pdf" / "10.1145_404.html").exists())
 
     def test_blocked_ip_drops_identity(self):
@@ -648,7 +669,9 @@ class DownloaderTest(unittest.TestCase):
         self.assertEqual((dl.stats.success, dl.stats.non_pdf), (1, 0))
         r = self.row(url)
         self.assertEqual((r["status"], r["url_type"], r["file_size"], r["error_kind"]), ("success", "html", len(page), None))
+        self.assertEqual((r["title"], r["error_message"]), ("Measurements of spin", None))   # 标题进 title，error_message 为空
         self.assertEqual(Path(r["file_path"]).suffix, ".html")
+        self.assertTrue(Path(r["file_path"]).is_absolute())                  # file_path 存绝对路径
         self.assertEqual(Path(r["file_path"]).read_bytes(), page)            # 整页，不截断到 256KB
         self.assertFalse((self.out / "non_pdf").exists())
 
@@ -729,7 +752,7 @@ class BrowserPoolTest(unittest.TestCase):
         return pool
 
     def row(self, url):
-        return next(r for r in self.db.rows() if r["pdf_url"] == url)
+        return next(r for r in self.db.rows() if r["url"] == url)
 
     def _ok(self, url):
         from paperlite.browser import RenderResult

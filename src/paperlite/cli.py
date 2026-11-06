@@ -5,7 +5,7 @@ PaperLite 命令行。一个站点（主机）一个输出目录，默认 <out_r
 生产与消费可以分开跑（不同进程，只共享 Redis），也可以 run 一起跑。
 
   paperlite init                                    # 在当前目录生成 config.toml 模板
-  paperlite import   --urls acm.txt                 # 导入任务（txt 一行一个，或带 pdf_url 列的 CSV）→ pdfs/dl.acm.org/
+  paperlite import   --urls acm.txt                 # 导入任务（txt 一行一个，或带 url 列的 CSV）→ pdfs/dl.acm.org/
   paperlite import   --urls pages.txt --type html   # 要网页本身（存 .html），数据库 url_type = html
   paperlite run      --workers 20                   # 同进程生产 + 消费，下载完退出
   paperlite produce                                 # 只生产身份，常驻
@@ -73,7 +73,7 @@ def _host_from_urls(path: str | None) -> str | None:
     if not path:
         return None
     first = next(iter(_read_url_file(path)), None)
-    return url_host(first["pdf_url"]) if first else None
+    return url_host(first.get("url") or first.get("pdf_url") or "") if first else None
 
 
 def _resolve_out(args, pool: PoolConfig) -> Path:
@@ -110,14 +110,14 @@ def _open_site(args, create: bool = False) -> tuple[Path, TaskDB]:
 
 
 def _read_url_file(path: str):
-    """txt：一行一个链接；CSV：表头含 pdf_url（可选 paper_uid / source / batch_no / url_type），与 paper_downloader 导入格式相同。"""
+    """txt：一行一个链接；CSV：表头含 url（或旧名 pdf_url），可选 doi / source / batch_no / url_type。"""
     with open(path, encoding="utf-8-sig", newline="") as f:
         first = f.readline()
         f.seek(0)
-        if "pdf_url" in first:
-            yield from (r for r in csv.DictReader(f) if (r.get("pdf_url") or "").strip())
+        if "url" in first or "pdf_url" in first:
+            yield from (r for r in csv.DictReader(f) if (r.get("url") or r.get("pdf_url") or "").strip())
         else:
-            yield from ({"pdf_url": line.strip()} for line in f if line.strip().startswith("http"))
+            yield from ({"url": line.strip()} for line in f if line.strip().startswith("http"))
 
 
 def _import(db: TaskDB, path: str, source: str = "", batch: str = "", url_type: str = UrlType.PDF) -> None:
@@ -347,7 +347,7 @@ def _raise_interrupt(signum, frame):
 # 顶层帮助里的命令清单（按常用顺序）
 _COMMANDS = {
     "init": "在当前目录生成配置模板 config.toml",
-    "import": "导入任务（txt 一行一个链接，或带 pdf_url 列的 CSV）",
+    "import": "导入任务（txt 一行一个链接，或带 url 列的 CSV）",
     "run": "生产身份 + 下载，下载完退出",
     "produce": "只生产身份，常驻",
     "download": "只下载，需有生产者在跑",
@@ -421,7 +421,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p = cmd("init")
     p.add_argument("--force", action="store_true", help="已存在也覆盖")
     p = cmd("import")
-    p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 pdf_url 列的 CSV；须同一主机")
+    p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 url 列的 CSV；须同一主机")
     site_args(p)
     p.add_argument("--source", default="", help="写入 source")
     p.add_argument("--batch", default="", help="写入 batch_no")

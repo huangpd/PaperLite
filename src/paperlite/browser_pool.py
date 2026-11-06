@@ -142,7 +142,7 @@ class BrowserPool:
 
     async def _do_task(self, task: Task, session: BrowserSession, lease: Lease, name: str) -> None:
         t0 = time.monotonic()
-        r = await session.render(task.pdf_url, self.cfg.pass_timeout_s)
+        r = await session.render(task.url, self.cfg.pass_timeout_s)
         elapsed = int((time.monotonic() - t0) * 1000)
         if not r.ok:
             failed = await asyncio.to_thread(
@@ -151,18 +151,18 @@ class BrowserPool:
             if failed:
                 self.stats.add("failed")      # 满次数判死；否则放回 pending 等后面重试，不计数
             logger.info("%s 渲染失败（第 %d 次%s）%s: %s", name, task.challenge_count + 1,
-                        "，判失败" if failed else "，稍后重试", task.pdf_url, r.error)
+                        "，判失败" if failed else "，稍后重试", task.url, r.error)
             return
 
         code = r.status or 200
-        dest = pdf_path(self.out, task.paper_uid, ".html")
+        dest = pdf_path(self.out, task.doi, ".html")
         if code >= 400:
             kind = "not_found" if code in (404, 410) else None
             await asyncio.to_thread(self.db.finish, task, Status.FAILED, http_status=code, elapsed_ms=elapsed,
-                                    exit_ip=lease.exit_ip, error_kind=kind,
-                                    error_message=f"HTTP {code} {r.title}".strip(), final_url=r.url or None)
+                                    exit_ip=lease.exit_ip, error_kind=kind, error_message=f"HTTP {code}",
+                                    final_url=r.url or None, title=r.title or None)
             self.stats.add("failed")
-            logger.info("网页 HTTP %d %s %s", code, task.pdf_url, r.title)
+            logger.info("网页 HTTP %d %s %s", code, task.url, r.title)
             return
 
         body = r.html.encode("utf-8")
@@ -175,7 +175,7 @@ class BrowserPool:
             tmp.unlink(missing_ok=True)
         await asyncio.to_thread(self.db.finish, task, Status.SUCCESS, http_status=code, file_path=str(dest),
                                 file_size=len(body), elapsed_ms=elapsed, exit_ip=lease.exit_ip,
-                                error_message=r.title or None, final_url=r.url or None)
+                                title=r.title or None, final_url=r.url or None)
         self.stats.add("success")
         self.stats.add("pages")
         logger.info("✓ %.0fs（点击 %d）%d 字节 → %s", r.seconds, r.clicks, len(body),

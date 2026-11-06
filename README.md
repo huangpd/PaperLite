@@ -49,7 +49,7 @@ source .venv/bin/activate && paperlite status
 | 命令 | 作用 |
 |---|---|
 | `uv run paperlite init [--force]` | 在当前目录生成配置模板 `config.toml`（或写到 `--config` 指定的路径） |
-| `uv run paperlite import --urls <文件> [--type pdf\|html]` | 导入任务。txt 一行一个链接，或带 `pdf_url` 列（可选 `paper_uid` / `source` / `batch_no` / `url_type`）的 CSV。`--type html` 表示要网页本身（整页存 `.html`），CSV 的 `url_type` 列逐行覆盖；`run` / `download --urls` 同样可加 `--type`。重复导入不重置已有任务；一个库只能有一个主机 |
+| `uv run paperlite import --urls <文件> [--type pdf\|html]` | 导入任务。txt 一行一个链接，或带 `url` 列（可选 `doi` / `source` / `batch_no` / `url_type`；旧名 `pdf_url` / `paper_uid` 仍兼容）的 CSV。`--type html` 表示要网页本身（整页存 `.html`），CSV 的 `url_type` 列逐行覆盖；`run` / `download --urls` 同样可加 `--type`。重复导入不重置已有任务；一个库只能有一个主机 |
 | `uv run paperlite run [--urls <文件>] [--workers 20]` | 同进程生产身份 + 下载，下载完退出 |
 | `uv run paperlite produce [--keep N]` | 只生产身份，常驻 |
 | `uv run paperlite download [--workers 20]` | 只下载，需有生产者在跑 |
@@ -205,21 +205,22 @@ Redis 键（`{prefix}:{host}:...`）：`id:{id}` 身份 hash（EXPIREAT 到期�
 | 列 | 说明 |
 |---|---|
 | `id` | 自增主键，按它的顺序领取 |
-| `url_key` | sha256(规范化 `pdf_url`)，32 字节，唯一：协议和域名转小写、去掉 `#片段` |
-| `paper_uid` | 导入时给的，或从链接提取的 DOI（小写）；都没有时 `url-<url_key 前 16 位>`。决定文件名 |
-| `pdf_url` / `source` / `batch_no` | 导入时的原值（网页任务的链接也存在 `pdf_url`） |
+| `url_key` | sha256(规范化 `url`)，32 字节，唯一：协议和域名转小写、去掉 `#片段` |
+| `doi` | 导入列 `doi` 给的值（小写）；没给则从链接回退推导（提取 DOI/PII，认不出用 `url-<url_key 前 16 位>`）。决定文件名 |
+| `url` / `source` / `batch_no` | 导入时的原值（旧名 `pdf_url` 仍可作为 CSV 表头导入） |
 | `url_type` | `pdf`（默认）= 链接应返回 PDF；`html` = 要网页本身：2xx 时整页存为 `.html`、记 `success`，404/410 记 `failed / not_found`，其他 4xx 记 `failed`；挑战、封禁、5xx、网络错误的处理同 PDF。跳转由框架自己跟：curl 跟 HTTP 3xx 和中转页的 meta refresh（如 linkinghub 的 Redirecting 页）；跳到别的主机后被 Cloudflare 挑战，就用浏览器经同一出口打开、自动过挑战后保存最终页面（并发受 `max_browsers` 限制）。0.1.2 及以前的库打开时自动补这一列（PG 版没有这列） |
 | `final_url` | 网页任务实际保存的最终地址（跟完跳转后） |
 | `volume` | DOI 后缀点号前的卷期号（`10.1145/1012326.1012328` → `1012326`），导入时提取；新式纯数字 DOI 为空，不参与卷期停止 |
 | `status` | `pending` → `running` → `success` / `non_pdf` / `failed`（CHECK 约束） |
 | `error_kind` | 最近一次没成功的类别：`not_found` / `paywall` / `landing_page`（non_pdf）；`network` / `server_error` / `extract_failed`（过小或超过大小上限）；`challenge_failed`（URL 被单独挑战满次数）；`blocked` 只用于丢弃身份，不落到最终结果 |
-| `error_message` | non_pdf 时是页面标题；失败时是错误信息 |
+| `title` | 网页/non_pdf 任务的页面 `<title>`（成功、non_pdf、404 都记） |
+| `error_message` | 只记错误信息（失败原因、按卷期推断说明等）；不再存标题 |
 | `http_status` / `file_size` / `elapsed_ms` | 最近一次尝试的 HTTP 状态、响应字节数、耗时（毫秒） |
 | `exit_ip` | 最近一次尝试用的出口 IP（paper_downloader 没有这列） |
 | `retry_count` | 网络错误、5xx 才计；cookie 被拒、IP 封禁不计 |
 | `inferred` | 1 = 按卷期推断、没有实际请求（见下「卷期停止」） |
 | `challenge_count` | 带有效 cookie 仍被站点挑战的次数（站点单独盯上了这条 URL）；领取按它从小到大排，被挑战过的排到后面；满 `max_url_challenges`（3）判 `failed / challenge_failed`（PG 版没有这列） |
-| `file_path` | 成功后的文件路径：`<out>/<h[0:2]>/<h[2:4]>/<paper_uid 的 / 换成 _>.pdf`（网页任务为 `.html`），`h = sha256(paper_uid)`，与 paper_downloader 同一规则 |
+| `file_path` | 成功后的**绝对**文件路径：`<out>/<h[0:2]>/<h[2:4]>/<doi 的 / 换成 _>.pdf`（网页任务为 `.html`），`h = sha256(doi)`。文件名用 doi；想去掉主机层就把 `--out` 传成不含主机的目录 |
 | `claimed_by` | 领取它的 `主机名-进程号-线程号` |
 | `created_at` / `updated_at` | 北京时间文本 `YYYY-MM-DD HH:MM:SS` |
 

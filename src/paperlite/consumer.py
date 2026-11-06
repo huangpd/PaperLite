@@ -305,13 +305,13 @@ class Downloader:
         """下载一个任务并写结果；返回 (身份是否还能继续用, 结果: pdf / page / rejected / challenged / other)。"""
         t0 = time.monotonic()
         elapsed_ms = lambda: int((time.monotonic() - t0) * 1000)
-        dest = pdf_path(self.out, task.paper_uid)
+        dest = pdf_path(self.out, task.doi)
         for attempt in (1, 2):
             try:
                 if task.url_type == UrlType.HTML:
-                    got = self._fetch_page(task.pdf_url, ident, session, dest)
+                    got = self._fetch_page(task.url, ident, session, dest)
                 else:
-                    got = self._fetch(task.pdf_url, ident, session, dest)
+                    got = self._fetch(task.url, ident, session, dest)
                 break
             except BadPdf as e:
                 if e.retry:
@@ -320,12 +320,12 @@ class Downloader:
                     self.db.finish(task, Status.FAILED, exit_ip=ident.exit_ip, error_kind="extract_failed",
                                    error_message=str(e), elapsed_ms=elapsed_ms())
                     self.stats.add("failed")
-                    logger.warning("下载失败 %s: %s", task.pdf_url, e)
+                    logger.warning("下载失败 %s: %s", task.url, e)
                 return True, "other"
             except Exception as e:
                 err = f"{type(e).__name__}: {str(e).splitlines()[0][:160] if str(e) else ''}"
                 if attempt == 1 and "(56)" in err:
-                    logger.debug("连接被断 %s，同一身份重试一次: %s", ident.exit_ip, task.pdf_url)
+                    logger.debug("连接被断 %s，同一身份重试一次: %s", ident.exit_ip, task.url)
                     time.sleep(_RESET_RETRY_WAIT_S)
                     continue
                 self._retry_or_fail(task, ident, "network", err)
@@ -345,9 +345,9 @@ class Downloader:
             self.stats.add("challenged")
             if self.db.challenged(task, self.cfg.max_url_challenges, ident.exit_ip, f"HTTP {code} 挑战（cookie 有效）"):
                 self.stats.add("failed")
-                logger.warning("URL 被站点单独挑战 %d 次，判失败: %s", self.cfg.max_url_challenges, task.pdf_url)
+                logger.warning("URL 被站点单独挑战 %d 次，判失败: %s", self.cfg.max_url_challenges, task.url)
             else:
-                logger.info("URL 被挑战但身份正常（落地页可访问），排到后面: %s", task.pdf_url)
+                logger.info("URL 被挑战但身份正常（落地页可访问），排到后面: %s", task.url)
             return True, "challenged"
         if code >= 500:
             self._retry_or_fail(task, ident, "server_error", f"HTTP {code}", http_status=code)
@@ -359,14 +359,14 @@ class Downloader:
             return self._drop_identity(task, ident, f"IP 被站点封禁: {title}"), "rejected"
         if task.url_type == UrlType.HTML:
             return self._save_page(task, ident, got.code, got.body, got.url,
-                                   pdf_path(self.out, task.paper_uid, ".html"), title, elapsed_ms())
+                                   pdf_path(self.out, task.doi, ".html"), title, elapsed_ms())
         self.non_pdf_dir.mkdir(parents=True, exist_ok=True)
         (self.non_pdf_dir / (dest.stem + ".html")).write_bytes(got.body)
         stopped = self.db.finish(task, Status.NON_PDF, http_status=code, file_size=got.size,
                                  elapsed_ms=elapsed_ms(), exit_ip=ident.exit_ip, error_kind=kind,
-                                 error_message=title or None)
+                                 title=title or None)
         self.stats.add("non_pdf")
-        logger.info("non_pdf %s %s %s", kind, task.pdf_url, title)
+        logger.info("non_pdf %s %s %s", kind, task.url, title)
         if stopped:
             volume, skipped = stopped
             self.stats.add("volumes_stopped")
@@ -393,7 +393,7 @@ class Downloader:
         """浏览器兜底：经身份的出口打开 url，跟完跳转、过挑战后保存；失败计一次重试（challenge_failed）。"""
         from paperlite.browser import render_page
 
-        logger.info("网页跳到 %s 被挑战，改用浏览器: %s", url_host(url), task.pdf_url)
+        logger.info("网页跳到 %s 被挑战，改用浏览器: %s", url_host(url), task.url)
         with self._browser_slots:
             r = asyncio.run(render_page(url, self.proxy.browser_proxy_for(ident.proxy_server), self.cfg.pass_timeout_s,
                                         headed=self.cfg.headed))
@@ -402,7 +402,7 @@ class Downloader:
             return True, "other"
         logger.info("浏览器 %.0fs（点击 %d 次）→ %s", r.seconds, r.clicks, r.url)
         return self._save_page(task, ident, r.status or 200, r.html.encode("utf-8"), r.url,
-                               pdf_path(self.out, task.paper_uid, ".html"), r.title,
+                               pdf_path(self.out, task.doi, ".html"), r.title,
                                int((time.monotonic() - t0) * 1000))
 
     def _save_page(self, task: Task, ident: Identity, code: int, body: bytes, final_url: str, dest: Path,
@@ -411,9 +411,10 @@ class Downloader:
         if code >= 400:
             kind = "not_found" if code in (404, 410) else None
             self.db.finish(task, Status.FAILED, http_status=code, elapsed_ms=elapsed_ms, exit_ip=ident.exit_ip,
-                           error_kind=kind, error_message=f"HTTP {code} {title}".strip(), final_url=final_url or None)
+                           error_kind=kind, error_message=f"HTTP {code}", final_url=final_url or None,
+                           title=title or None)
             self.stats.add("failed")
-            logger.info("网页下载失败 HTTP %d %s %s", code, task.pdf_url, title)
+            logger.info("网页下载失败 HTTP %d %s %s", code, task.url, title)
             return True, "other"
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".part")
@@ -423,10 +424,10 @@ class Downloader:
         finally:
             tmp.unlink(missing_ok=True)
         self.db.finish(task, Status.SUCCESS, http_status=code, file_path=str(dest), file_size=len(body),
-                       elapsed_ms=elapsed_ms, exit_ip=ident.exit_ip, error_message=title or None,
+                       elapsed_ms=elapsed_ms, exit_ip=ident.exit_ip, title=title or None,
                        final_url=final_url or None)
         self.stats.add("success")
-        logger.debug("网页 %s → %s（%d 字节）%s", final_url or task.pdf_url, dest, len(body), title)
+        logger.debug("网页 %s → %s（%d 字节）%s", final_url or task.url, dest, len(body), title)
         return True, "page"
 
     def _identity_alive(self, ident: Identity, session) -> bool:
@@ -448,10 +449,10 @@ class Downloader:
     def _retry_or_fail(self, task: Task, ident: Identity, kind: str, err: str,
                        http_status: Optional[int] = None) -> None:
         if task.retry_count + 1 < self.cfg.max_tries:
-            logger.info("下载出错 %s %s（第 %d 次）: %s", ident.exit_ip, task.pdf_url, task.retry_count + 1, err)
+            logger.info("下载出错 %s %s（第 %d 次）: %s", ident.exit_ip, task.url, task.retry_count + 1, err)
             self.db.retry_later(task, count=True, error_kind=kind, error_message=err, exit_ip=ident.exit_ip)
         else:
-            logger.warning("下载失败 %s: %s", task.pdf_url, err)
+            logger.warning("下载失败 %s: %s", task.url, err)
             self.db.finish(task, Status.FAILED, http_status=http_status, exit_ip=ident.exit_ip,
                            error_kind=kind, error_message=err)
             self.stats.add("failed")
