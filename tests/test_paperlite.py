@@ -110,6 +110,61 @@ class IdentityRulesTest(unittest.TestCase):
         self.assertNotEqual(url_key("https://dl.acm.org/A"), url_key("https://dl.acm.org/a"))
 
 
+class InspectTest(unittest.TestCase):
+    """巡检：同标题重复触发 → doi/url 规则 → 标记疑似封面的 pending。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = TaskDB(Path(self.tmp.name) / "tasks.db")
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def _add(self, doi, url, status=None, title=None):
+        self.db.import_urls([{"url": url, "doi": doi}])
+        if status:                              # 领取后写成最终结果（模拟已采）
+            t = self.db.claim("w")
+            self.db.finish(t, status, title=title)
+
+    def test_dup_title_induces_rule_and_flags_pending(self):
+        host = "https://ex.org/pii/"
+        for i in range(1, 13):                   # 12 篇封面（同标题），doi/url 连续
+            self._add(f"10.1/cov.{i:03d}", f"{host}COV{i:03d}", "success", "Outside Front Cover")
+        for i in range(1, 6):                    # 5 篇真文章，不同标题
+            self._add(f"10.1/art.{i}", f"{host}ART{i}", "success", f"Real paper {i}")
+        for i in range(13, 21):                  # 8 篇未采封面（doi/url 同前缀）
+            self._add(f"10.1/cov.{i:03d}", f"{host}COV{i:03d}")
+        for i in range(6, 9):                    # 3 篇未采真文章
+            self._add(f"10.1/art.{i}", f"{host}ART{i}")
+
+        from paperlite.inspect import inspect
+        rules, flagged = inspect(self.db, trigger=10, min_precision=0.98, min_support=10)
+        self.assertEqual((rules, flagged), (1, 8))           # 一条规则，标记 8 篇未采封面
+        self.assertEqual(self.db.suspect_count(), 8)
+        # 领取只拿得到真文章，封面被跳过
+        claimed = [self.db.claim(f"w{i}") for i in range(5)]
+        got = {t.doi for t in claimed if t}
+        self.assertTrue(got <= {"10.1/art.6", "10.1/art.7", "10.1/art.8"})
+        self.assertFalse(any((t and t.doi.startswith("10.1/cov")) for t in claimed))
+        # 规则落库，可清除
+        self.assertEqual(len(self.db.skip_rules()), 1)
+        self.assertEqual(self.db.clear_suspects(), 8)
+        self.assertEqual(self.db.suspect_count(), 0)
+
+    def test_scattered_covers_not_flagged_by_precision_guard(self):
+        # 封面和真文章 doi/url 交错，唯一公共前缀会命中真文章 → precision 不达标 → 不标记
+        for i in range(1, 13):
+            self._add(f"10.1/j.{2*i:03d}", f"https://ex.org/p/{2*i:03d}", "success", "Outside Front Cover")
+            self._add(f"10.1/j.{2*i+1:03d}", f"https://ex.org/p/{2*i+1:03d}", "success", f"Real {i}")
+        for i in range(100, 110):               # 未采，和上面同刊前缀
+            self._add(f"10.1/j.{i}", f"https://ex.org/p/{i}")
+        from paperlite.inspect import inspect
+        rules, flagged = inspect(self.db, trigger=10, min_precision=0.98, min_support=10)
+        self.assertEqual((rules, flagged), (0, 0))           # 护栏生效，不误标
+        self.assertEqual(self.db.suspect_count(), 0)
+
+
 class TaskDBTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

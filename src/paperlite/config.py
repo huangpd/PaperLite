@@ -68,6 +68,10 @@ class PoolConfig:
     max_tries: int = 3                # 单条 URL 的网络错误重试次数（cookie 被拒不计）
     max_url_challenges: int = 3       # 单条 URL 带有效 cookie 仍被挑战满这么多次 → failed / challenge_failed
     volume_stop_after: int = 3        # 同一卷期还没下到 PDF、已有这么多篇 404/订阅/摘要页 → 停掉该卷期其余任务；0 关闭
+    # 巡检：同标题重复到阈值就归纳 doi/url 规则，把疑似封面的 pending 标记跳过（见 inspect.py）
+    title_dup_trigger: int = 10       # 同一标题重复这么多篇就触发巡检；0 关闭巡检
+    rule_min_precision: float = 0.98  # 归纳出的规则在已采数据上的最低精确率，防止把真文章误标
+    rule_min_support: int = 10        # 规则在已采数据上的最低命中数
 
     def landing_for(self, host: str) -> str:
         return self.landing.get(host) or f"https://{host}/"

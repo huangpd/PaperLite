@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS paper_pdf_resources (
     url_type      TEXT    NOT NULL DEFAULT 'pdf' CHECK (url_type IN {_in(UrlType.ALL)}),
     final_url     TEXT,
     title         TEXT,
+    flag          TEXT,                                  -- 巡检标记：suspect_cover = 疑似封面/栏目，不再领取
     file_path     TEXT,
     source        TEXT,
     batch_no      TEXT,
@@ -108,6 +109,16 @@ CREATE TABLE IF NOT EXISTS volume_stops (
     stopped_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS skip_rules (
+    doi_prefix TEXT NOT NULL,          -- doi 前缀（空串=不限 doi）
+    url_prefix TEXT NOT NULL,          -- url 前缀（空串=不限 url）
+    title      TEXT NOT NULL,          -- 触发的坏标题（样本标题，重复 >= 阈值）
+    support    INTEGER NOT NULL,       -- 已采数据里匹配该规则的条数
+    precision  REAL    NOT NULL,       -- 匹配的已采条目里"坏标题"的占比
+    flagged    INTEGER NOT NULL,       -- 据此标记的 pending 数
+    created_at TEXT    NOT NULL,
+    PRIMARY KEY (doi_prefix, url_prefix)
+);
 """
 
 
@@ -196,6 +207,8 @@ class TaskDB:
                 self._conn.execute("ALTER TABLE paper_pdf_resources RENAME COLUMN paper_uid TO doi")
             if cols and "title" not in cols:
                 self._conn.execute("ALTER TABLE paper_pdf_resources ADD COLUMN title TEXT")
+            if cols and "flag" not in cols:
+                self._conn.execute("ALTER TABLE paper_pdf_resources ADD COLUMN flag TEXT")
             self._conn.executescript(_SCHEMA)
 
     def close(self) -> None:
@@ -234,6 +247,82 @@ class TaskDB:
         with self._lock:
             urls = self._conn.execute("SELECT DISTINCT url FROM paper_pdf_resources").fetchall()
         return sorted({url_host(u[0]) for u in urls})
+
+    # ── 巡检：疑似封面规则（见 inspect.py）────────────────────
+
+    def crawled_titles(self, cap: int = 100_000) -> list[tuple[str, str, str]]:
+        """已采成功任务的 (doi, url, title)，供巡检归纳；超量按 id 取前 cap 条。"""
+        with self._lock:
+            return [(r["doi"], r["url"], r["title"] or "")
+                    for r in self._conn.execute(
+                        "SELECT doi, url, title FROM paper_pdf_resources WHERE status = 'success' "
+                        "AND title IS NOT NULL ORDER BY id LIMIT ?", (cap,)).fetchall()]
+
+    @staticmethod
+    def _prefix_where(doi_prefix: str, url_prefix: str) -> tuple[str, list]:
+        """前缀匹配用 substr（避免 LIKE 的 % _ 通配问题）；空前缀 = 不限该维度。"""
+        clauses, args = "", []
+        if doi_prefix:
+            clauses += " AND substr(doi, 1, ?) = ?"; args += [len(doi_prefix), doi_prefix]
+        if url_prefix:
+            clauses += " AND substr(url, 1, ?) = ?"; args += [len(url_prefix), url_prefix]
+        return clauses, args
+
+    def count_pending_matching(self, doi_prefix: str, url_prefix: str) -> int:
+        """未采（pending 且未标记）任务里 doi/url 命中前缀的条数。"""
+        where, args = self._prefix_where(doi_prefix, url_prefix)
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT count(*) FROM paper_pdf_resources WHERE status = 'pending' AND flag IS NULL{where}",
+                args).fetchone()[0]
+
+    def flag_suspects(self, doi_prefix: str, url_prefix: str, title: str, support: int, precision: float) -> int:
+        """把命中规则的 pending 标 suspect_cover、记录规则到 skip_rules；返回本次标记数。"""
+        where, args = self._prefix_where(doi_prefix, url_prefix)
+        ts = now_text()
+        with self._lock:
+            c = self._conn
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                n = c.execute(
+                    f"UPDATE paper_pdf_resources SET flag = 'suspect_cover', "
+                    f"error_message = ?, updated_at = ? WHERE status = 'pending' AND flag IS NULL{where}",
+                    [f"疑似封面规则 doi~{doi_prefix} url~{url_prefix}", ts, *args]).rowcount
+                c.execute("INSERT OR REPLACE INTO skip_rules "
+                          "(doi_prefix, url_prefix, title, support, precision, flagged, created_at) "
+                          "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          (doi_prefix, url_prefix, title, support, round(precision, 4), n, ts))
+                c.execute("COMMIT")
+            except BaseException:
+                c.execute("ROLLBACK")
+                raise
+        return n
+
+    def skip_rules(self) -> list:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT doi_prefix, url_prefix, title, support, precision, flagged, created_at "
+                "FROM skip_rules ORDER BY created_at").fetchall()
+
+    def suspect_count(self) -> int:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT count(*) FROM paper_pdf_resources WHERE flag = 'suspect_cover'").fetchone()[0]
+
+    def clear_suspects(self) -> int:
+        """清除所有 suspect_cover 标记与规则，放回可采。返回清除的标记数。"""
+        with self._lock:
+            c = self._conn
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                n = c.execute("UPDATE paper_pdf_resources SET flag = NULL, error_message = NULL "
+                              "WHERE flag = 'suspect_cover'").rowcount
+                c.execute("DELETE FROM skip_rules")
+                c.execute("COMMIT")
+            except BaseException:
+                c.execute("ROLLBACK")
+                raise
+        return n
 
     # ── 导入 ──────────────────────────────────────────────────
 
@@ -293,7 +382,8 @@ class TaskDB:
             while scanned < self._CLAIM_SCAN_MAX:
                 rows = c.execute(
                     "SELECT id, volume, challenge_count FROM paper_pdf_resources INDEXED BY idx_claim "
-                    "WHERE status = 'pending' AND (challenge_count, id) > (?, ?) ORDER BY challenge_count, id LIMIT ?",
+                    "WHERE status = 'pending' AND flag IS NULL AND (challenge_count, id) > (?, ?) "
+                    "ORDER BY challenge_count, id LIMIT ?",
                     (after_cc, after_id, self._CLAIM_BATCH)).fetchall()
                 if not rows:
                     return None

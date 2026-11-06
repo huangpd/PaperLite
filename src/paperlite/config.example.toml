@@ -30,6 +30,9 @@ max_file_size_mb = 200        # 单个 PDF 超过就中止
 max_tries = 3                 # 单条 URL 网络错误重试次数（cookie 被拒不计）
 max_url_challenges = 3        # 单条 URL 带有效 cookie 仍被挑战满这么多次 → failed / challenge_failed
 volume_stop_after = 3         # 同一卷期（DOI 点号前那段）还没下到 PDF、已有这么多篇 404/订阅/摘要页 → 停掉该卷期其余任务；0 关闭
+title_dup_trigger = 10        # 巡检：同一标题重复这么多篇就归纳 doi/url 规则、标记疑似封面的未采任务（不再采）；0 关闭
+rule_min_precision = 0.98     # 规则在已采数据上的最低精确率（防止把真文章误标）
+rule_min_support = 10         # 规则在已采数据上的最低命中数
 
 [landing]                     # 各主机的过盾落地页（任意会触发挑战的普通页面）；未配置的用主机首页
 "dl.acm.org" = "https://dl.acm.org/doi/10.1145/3779295"

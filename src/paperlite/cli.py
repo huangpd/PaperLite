@@ -318,7 +318,7 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
         db.close()
         return
     stop = threading.Event()
-    threading.Thread(target=_browse_report, args=(pool, stop), daemon=True, name="report").start()
+    threading.Thread(target=_browse_report, args=(pool, cfg, stop), daemon=True, name="report").start()
     t0 = time.monotonic()
     try:
         pool.run(stop)
@@ -332,10 +332,44 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
                 (time.monotonic() - t0) / 60, s.success, s.failed, s.browsers)
 
 
-def _browse_report(pool: BrowserPool, stop: threading.Event) -> None:
+def _inspect(args) -> None:
+    """巡检：同标题重复到阈值就归纳 doi/url 规则、标记疑似封面的未采任务。"""
+    cfg = _pool_cfg(args)
+    _, db = _open_site(args)
+    try:
+        if args.reset:
+            print(f"已清除 {db.clear_suspects()} 条 suspect_cover 标记与全部规则，放回可采")
+            return
+        if args.list:
+            rules = db.skip_rules()
+            if not rules:
+                print("还没有生效的规则")
+            for r in rules:
+                print(f"  doi~{r['doi_prefix']!r} url~{r['url_prefix']!r} | 标题 {(r['title'] or '')[:40]!r} | "
+                      f"precision {r['precision']} 已采命中 {r['support']} 标记 {r['flagged']} | {r['created_at']}")
+            return
+        trigger = args.trigger if args.trigger is not None else cfg.title_dup_trigger
+        mp = args.min_precision if args.min_precision is not None else cfg.rule_min_precision
+        ms = args.min_support if args.min_support is not None else cfg.rule_min_support
+        from paperlite import inspect as inspect_mod
+        rules, flagged = inspect_mod.inspect(db, trigger, mp, ms)
+        print(f"巡检完成：本次生效规则 {rules} 条，新标记疑似封面 {flagged} 条；"
+              f"累计规则 {len(db.skip_rules())} 条、疑似封面 {db.suspect_count()} 条")
+    finally:
+        db.close()
+
+
+def _browse_report(pool: BrowserPool, cfg: PoolConfig, stop: threading.Event) -> None:
+    from paperlite import inspect as inspect_mod
+
     s = pool.stats
     last_done, last_t = 0, time.monotonic()
     while not stop.wait(30):
+        if cfg.title_dup_trigger:                       # 巡检：同标题重复到阈值就归纳规则、标记疑似封面
+            try:
+                inspect_mod.inspect(pool.db, cfg.title_dup_trigger, cfg.rule_min_precision, cfg.rule_min_support)
+            except Exception:
+                logger.debug("巡检异常", exc_info=True)
         c = pool.db.counts()
         now = time.monotonic()
         done = s.success + s.failed
@@ -357,6 +391,7 @@ _COMMANDS = {
     "produce": "只生产身份，常驻",
     "download": "只下载（curl 模式），需有生产者在跑",
     "status": "任务统计、失败分类、身份池",
+    "inspect": "巡检：同标题重复到阈值就归纳 doi/url 规则，标记疑似封面的未采任务（不再采）",
     "retry": "把 failed / non_pdf 的任务重置为 pending",
     "export": "导出任务为 CSV",
     "turnstile": "按 URL + sitekey 取 Cloudflare Turnstile token（--serve 起 HTTP 服务）",
@@ -453,6 +488,13 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p.add_argument("--headed", action="store_true", help="仅 --browser：有界面运行（调试）")
     p = cmd("status")
     site_args(p)
+    p = cmd("inspect")
+    site_args(p)
+    p.add_argument("--trigger", type=int, help="同标题重复多少篇触发（覆盖配置 title_dup_trigger）")
+    p.add_argument("--min-precision", type=float, help="规则最低精确率（覆盖配置 rule_min_precision）")
+    p.add_argument("--min-support", type=int, help="规则最低命中数（覆盖配置 rule_min_support）")
+    p.add_argument("--list", action="store_true", help="只列出已生效的规则，不重新巡检")
+    p.add_argument("--reset", action="store_true", help="清除所有 suspect_cover 标记与规则（放回可采）")
     p = cmd("retry")
     site_args(p)
     g = p.add_mutually_exclusive_group(required=True)
@@ -540,6 +582,10 @@ def main() -> None:
         if args.headed:
             cfg = dataclasses.replace(cfg, headed=True)
         _browse(args, cfg, proxy, no_proxy=args.no_proxy)
+        return
+
+    if args.cmd == "inspect":
+        _inspect(args)
         return
 
     cfg, proxy = _load(args.config)
