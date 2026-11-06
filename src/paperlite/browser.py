@@ -150,7 +150,7 @@ async def _user_agent(page, deadline: float) -> str:
 
 async def _title(page) -> str:
     try:
-        return (await page.title())[:60]
+        return (await page.title()).strip()[:200]      # 存库用，别截太短（原来 60 会把文章标题砍半）
     except Exception:
         return ""
 
