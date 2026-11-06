@@ -64,6 +64,9 @@ class Lease:
     area: str
     expires_at: float     # time.time()
 
+    def left(self, now: Optional[float] = None) -> float:
+        return self.expires_at - (time.time() if now is None else now)
+
     def browser_proxy(self, s: ProxySettings) -> dict:
         return s.browser_proxy_for(self.server)
 

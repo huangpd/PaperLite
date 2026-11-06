@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+from paperlite.browser_pool import BrowserPool
 from paperlite.classify import classify_html
 from paperlite.config import PoolConfig, proxy_settings
 from paperlite.consumer import Downloader, impersonate_for
@@ -40,6 +41,12 @@ class ConfigTest(unittest.TestCase):
             PoolConfig.from_dict({"max_browser": 3})
         with self.assertRaises(ValueError):
             PoolConfig.from_dict({"request_gap_s": [5, 3]})
+
+    def test_page_interval_parsed_and_validated(self):
+        self.assertEqual(PoolConfig().page_interval_s, (10.0, 30.0))
+        self.assertEqual(PoolConfig.from_dict({"page_interval_s": [15, 40]}).page_interval_s, (15.0, 40.0))
+        with self.assertRaises(ValueError):
+            PoolConfig.from_dict({"page_interval_s": [30, 10]})
 
     def test_proxy_settings(self):
         with self.assertRaises(ValueError):
@@ -672,6 +679,97 @@ class DownloaderTest(unittest.TestCase):
         self.assertEqual((dl.stats.success, dl.stats.failed), (0, 1))
         r = self.row(url)
         self.assertEqual((r["status"], r["error_kind"], r["retry_count"]), ("failed", "network", 1))
+
+
+class BrowserPoolTest(unittest.TestCase):
+    """浏览器下载模式：用假 BrowserSession / IpSource 驱动，不开真浏览器。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name)
+        self.db = TaskDB(self.out / "tasks.db")
+        self.cfg = PoolConfig(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, max_url_challenges=2)
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def run_pool(self, responses, urls, workers=1, n_leases=3):
+        from paperlite import browser_pool as bp
+        from paperlite.browser import RenderResult
+        from paperlite.proxy import ProxyUnavailable
+
+        self.db.import_urls({"pdf_url": u, "url_type": "html"} for u in urls)
+
+        class FakeSession:
+            def __init__(s, proxy, headed=False):
+                s.proxy = proxy
+            async def start(s):
+                pass
+            async def render(s, url, timeout_s, settle_s=2.0):
+                return responses(url)
+            async def close(s):
+                pass
+
+        leases = iter([Lease(server=f"1.2.3.{i}:1", exit_ip=f"1.2.3.{i}", area="", expires_at=time.time() + 9999)
+                       for i in range(1, n_leases + 1)])
+
+        class FakeIp:
+            def __init__(s, proxy):
+                pass
+            def extract_checked(s):
+                try:
+                    return next(leases)
+                except StopIteration:
+                    raise ProxyUnavailable("no more test IPs")
+
+        with mock.patch.object(bp, "BrowserSession", FakeSession), mock.patch.object(bp, "IpSource", FakeIp):
+            pool = BrowserPool(self.cfg, PROXY, self.db, self.out, workers)
+            pool.run()
+        return pool
+
+    def row(self, url):
+        return next(r for r in self.db.rows() if r["pdf_url"] == url)
+
+    def _ok(self, url):
+        from paperlite.browser import RenderResult
+        final = url + "#final"
+        return RenderResult(ok=True, seconds=1.0, url=final, status=200, title="Paper", html=f"<html>{url}</html>")
+
+    def test_downloads_pages_in_browser(self):
+        urls = [f"https://www.sciencedirect.com/science/article/abs/pii/{i}" for i in range(3)]
+        pool = self.run_pool(self._ok, urls)
+        self.assertEqual((pool.stats.success, pool.stats.failed), (3, 0))
+        self.assertEqual(pool.stats.browsers, 1)                 # 一个浏览器连下三篇
+        r = self.row(urls[0])
+        self.assertEqual((r["status"], r["url_type"]), ("success", "html"))
+        self.assertEqual(r["final_url"], urls[0] + "#final")
+        self.assertEqual(Path(r["file_path"]).suffix, ".html")
+        self.assertEqual(Path(r["file_path"]).read_bytes(), f"<html>{urls[0]}</html>".encode())
+
+    def test_404_fails_without_retry(self):
+        from paperlite.browser import RenderResult
+        gone = "https://www.sciencedirect.com/science/article/abs/pii/404"
+        def resp(url):
+            if url == gone:
+                return RenderResult(ok=True, seconds=1.0, url=url, status=404, title="Not Found", html="x")
+            return self._ok(url)
+        pool = self.run_pool(resp, ["https://www.sciencedirect.com/science/article/abs/pii/ok", gone])
+        self.assertEqual((pool.stats.success, pool.stats.failed), (1, 1))
+        r = self.row(gone)
+        self.assertEqual((r["status"], r["error_kind"], r["http_status"]), ("failed", "not_found", 404))
+
+    def test_render_failure_retries_then_fails(self):
+        from paperlite.browser import RenderResult
+        url = "https://www.sciencedirect.com/science/article/abs/pii/stuck"
+        def resp(u):
+            if u == self.cfg.landing_for("www.sciencedirect.com"):
+                return self._ok(u)                               # 落地页能过盾
+            return RenderResult(ok=False, seconds=5.0, error="TimeoutError: 页面未稳定")
+        pool = self.run_pool(resp, [url], n_leases=9)
+        self.assertEqual((pool.stats.success, pool.stats.failed), (0, 1))
+        r = self.row(url)
+        self.assertEqual((r["status"], r["error_kind"], r["challenge_count"]), ("failed", "challenge_failed", 2))
 
 
 @unittest.skipUnless(os.environ.get("PAPERLITE_TEST_REDIS"), "设置 PAPERLITE_TEST_REDIS=redis://... 才跑")

@@ -39,6 +39,7 @@ from pathlib import Path
 from paperlite import __version__
 from paperlite import config as config_mod
 from paperlite.config import PoolConfig
+from paperlite.browser_pool import BrowserPool
 from paperlite.consumer import Downloader
 from paperlite.producer import Producer
 from paperlite.proxy import IpSource, ProxySettings
@@ -288,6 +289,57 @@ def _turnstile(args, parser) -> None:
         sys.exit(f"失败: {r.error}")
 
 
+def _browse(args, cfg, proxy) -> None:
+    """浏览器下载模式：每个浏览器+IP 过盾一次后连续下同域名多篇（整页存 .html）。不用 Redis 身份池。"""
+    out, db = _open_site(args, create=True)
+    if args.urls:
+        _import(db, args.urls, url_type=args.type)
+    try:
+        reclaimed = db.lock_for_download()
+    except RuntimeError as e:
+        raise SystemExit(str(e))
+    if reclaimed:
+        logger.info("上次中断残留的 %d 个 running 任务已放回 pending", reclaimed)
+    try:
+        pool = BrowserPool(cfg, proxy, db, out, args.workers)
+    except ValueError as e:
+        db.close()
+        raise SystemExit(str(e))
+    c = db.counts()
+    logger.info("输出目录 %s，任务库 %s", out, db.path)
+    logger.info("%s：待下载 %d，已成功 %d，失败 %d；浏览器 %d", pool.host, c[Status.PENDING],
+                c[Status.SUCCESS], c[Status.FAILED], pool.workers)
+    if not c[Status.PENDING]:
+        db.close()
+        return
+    stop = threading.Event()
+    threading.Thread(target=_browse_report, args=(pool, stop), daemon=True, name="report").start()
+    t0 = time.monotonic()
+    try:
+        pool.run(stop)
+    except KeyboardInterrupt:
+        logger.info("中断：在途任务重跑时会放回 pending，可继续")
+    finally:
+        stop.set()
+        db.close()
+    s = pool.stats
+    logger.info("结束: 用时 %.1f 分钟，success %d，failed %d，启动浏览器 %d 个",
+                (time.monotonic() - t0) / 60, s.success, s.failed, s.browsers)
+
+
+def _browse_report(pool: BrowserPool, stop: threading.Event) -> None:
+    s = pool.stats
+    last_done, last_t = 0, time.monotonic()
+    while not stop.wait(30):
+        c = pool.db.counts()
+        now = time.monotonic()
+        done = s.success + s.failed
+        rate = (done - last_done) / max((now - last_t) / 60, 1e-9)
+        last_done, last_t = done, now
+        logger.info("进度: 成功 %d 失败 %d 待下载 %d running %d | 浏览器 %d | 近 30s %.0f 篇/分钟",
+                    s.success, s.failed, c[Status.PENDING], c[Status.RUNNING], pool.workers, rate)
+
+
 def _raise_interrupt(signum, frame):
     raise KeyboardInterrupt
 
@@ -299,6 +351,7 @@ _COMMANDS = {
     "run": "生产身份 + 下载，下载完退出",
     "produce": "只生产身份，常驻",
     "download": "只下载，需有生产者在跑",
+    "browse": "浏览器下载网页模式：每浏览器+IP 过盾一次后连续下同域名多篇（整页存 .html）",
     "status": "任务统计、失败分类、身份池",
     "retry": "把 failed / non_pdf 的任务重置为 pending",
     "export": "导出任务为 CSV",
@@ -383,6 +436,13 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
         p.add_argument("--urls", help="先导入这个文件（可选）")
         p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
         p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数，默认 20")
+    p = cmd("browse")
+    site_args(p)
+    p.add_argument("--urls", help="先导入这个文件（可选）")
+    p.add_argument("--type", choices=UrlType.ALL, default=UrlType.HTML,
+                   help="--urls 的链接类型，浏览器模式默认 html（整页存 .html）")
+    p.add_argument("--workers", type=int, default=5,
+                   help="同时打开的浏览器数 = 并发出口 IP 数（受配置 max_browsers 约束），默认 5")
     p = cmd("status")
     site_args(p)
     p = cmd("retry")
@@ -466,6 +526,9 @@ def main() -> None:
     cfg, proxy = _load(args.config)
     if args.cmd == "status":
         _status(args, cfg)
+        return
+    if args.cmd == "browse":
+        _browse(args, cfg, proxy)
         return
 
     store = IdentityStore(cfg.redis_url, cfg.key_prefix)

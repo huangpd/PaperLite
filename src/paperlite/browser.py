@@ -50,6 +50,10 @@ class DocTracker:
         except Exception:
             pass
 
+    def reset(self) -> None:
+        """下一次导航前清状态，避免用上一页的 challenged 判断新页（challenged=None 视作"跳转中"）。"""
+        self.url, self.status, self.challenged = "", None, None
+
 
 def browser_env() -> dict[str, str]:
     # macOS 上 DYLD_LIBRARY_PATH=/opt/homebrew/lib 会让 Chromium 启动即 SIGBUS，浏览器进程一律剔除 DYLD_*
@@ -178,62 +182,98 @@ class RenderResult:
     error: str = ""
 
 
-async def render_page(url: str, proxy: Optional[dict], timeout_s: float, settle_s: float = 2.0,
-                      headed: bool = False) -> RenderResult:
+class BrowserSession:
     """
-    用浏览器打开 url，让它自己完成跳转（HTTP 3xx、meta refresh、JS 跳转）和 Cloudflare 挑战（交互式 Turnstile 自动点），
-    等页面不再是挑战页、没有待执行的 meta refresh、地址 settle_s 秒不变后，返回最终地址和整页 HTML。
+    一个常驻 CloakBrowser 进程 + 一个出口 IP（由传入的 proxy 决定）。
+    过盾一次后在同一个 context 里连续 render() 多篇：同站第二篇起多半不再弹挑战，省掉反复启动浏览器。
+    用于浏览器下载模式（browser_pool），也被一次性的 render_page() 复用。
     """
-    from cloakbrowser import get_default_stealth_args, launch_async
-    from paperlite.turnstile import TurnstileClicker
 
-    t0 = time.monotonic()
-    result = RenderResult(ok=False, seconds=0)
-    browser = None
-    page = None
-    try:
+    def __init__(self, proxy: Optional[dict], headed: bool = False) -> None:
+        self.proxy = proxy
+        self.headed = headed
+        self.browser = None
+        self.page = None
+        self.doc: Optional[DocTracker] = None
+        self.clicker = None
+
+    async def start(self) -> None:
+        from cloakbrowser import get_default_stealth_args, launch_async
+        from paperlite.turnstile import TurnstileClicker
+
         args = [a for a in get_default_stealth_args() if a.split("=", 1)[0] != "--no-sandbox"]
-        browser = await launch_async(
-            headless=not headed, proxy=proxy, stealth_args=False,
+        self.browser = await launch_async(
+            headless=not self.headed, proxy=self.proxy, stealth_args=False,
             args=args + ["--disable-dev-shm-usage", "--window-size=1440,900"], env=browser_env(),
         )
-        page = await (await browser.new_context()).new_page()
-        doc = DocTracker(page)
-        clicker = TurnstileClicker()
-        deadline = t0 + timeout_s
-        await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
-        last_url, stable_since = "", time.monotonic()
-        while True:
-            busy = doc.challenged is not False
-            if not busy:
-                try:
-                    busy = bool(await page.evaluate(PENDING_REFRESH_JS))
-                except Exception:
-                    busy = True                   # 跳转中，执行上下文被销毁
-            now = time.monotonic()
-            if page.url != last_url:
-                last_url, stable_since = page.url, now
-            if not busy and now - stable_since >= settle_s:
-                break
-            if now > deadline:
-                raise TimeoutError(f"{timeout_s:.0f}s 内页面未稳定（{await _title(page)!r}，{page.url[:120]}，点击 {clicker.clicks} 次）")
-            if doc.challenged:
-                await clicker.tick(page)
-            await asyncio.sleep(0.5)
-        result.url = page.url
-        result.status = doc.status
-        result.title = await _title(page)
-        result.html = await page.content()
-        result.clicks = clicker.clicks
-        result.ok = True
-    except Exception as e:
-        first = str(e).splitlines()[0][:200] if str(e) else ""
-        result.error = f"{type(e).__name__}: {first}"
-    finally:
-        result.seconds = round(time.monotonic() - t0, 1)
-        if browser is not None:
+        self.page = await (await self.browser.new_context()).new_page()
+        self.doc = DocTracker(self.page)
+        self.clicker = TurnstileClicker()
+
+    async def render(self, url: str, timeout_s: float, settle_s: float = 2.0) -> RenderResult:
+        """
+        在常驻浏览器里打开 url，让它自己完成跳转（HTTP 3xx、meta refresh、JS 跳转）和 Cloudflare 挑战
+        （交互式 Turnstile 自动点），等页面不再是挑战页、无待执行 meta refresh、地址 settle_s 秒不变后返回。
+        clicks 记本次新增的点击数。失败（超时/异常）时 ok=False，浏览器仍可复用于下一篇。
+        """
+        page, doc, clicker = self.page, self.doc, self.clicker
+        t0 = time.monotonic()
+        result = RenderResult(ok=False, seconds=0)
+        clicks0 = clicker.clicks
+        try:
+            doc.reset()                       # 别用上一页的 challenged 状态判断新页
+            await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
+            deadline = t0 + timeout_s
+            last_url, stable_since = "", time.monotonic()
+            while True:
+                busy = doc.challenged is not False
+                if not busy:
+                    try:
+                        busy = bool(await page.evaluate(PENDING_REFRESH_JS))
+                    except Exception:
+                        busy = True               # 跳转中，执行上下文被销毁
+                now = time.monotonic()
+                if page.url != last_url:
+                    last_url, stable_since = page.url, now
+                if not busy and now - stable_since >= settle_s:
+                    break
+                if now > deadline:
+                    raise TimeoutError(f"{timeout_s:.0f}s 内页面未稳定（{await _title(page)!r}，{page.url[:120]}，点击 {clicker.clicks - clicks0} 次）")
+                if doc.challenged:
+                    await clicker.tick(page)
+                await asyncio.sleep(0.5)
+            result.url = page.url
+            result.status = doc.status
+            result.title = await _title(page)
+            result.html = await page.content()
+            result.clicks = clicker.clicks - clicks0
+            result.ok = True
+        except Exception as e:
+            first = str(e).splitlines()[0][:200] if str(e) else ""
+            result.error = f"{type(e).__name__}: {first}"
+        finally:
+            result.seconds = round(time.monotonic() - t0, 1)
+        return result
+
+    async def close(self) -> None:
+        if self.browser is not None:
             try:
-                await browser.close()
+                await self.browser.close()
             except Exception:
                 logger.debug("关闭浏览器异常", exc_info=True)
-    return result
+            self.browser = self.page = self.doc = self.clicker = None
+
+
+async def render_page(url: str, proxy: Optional[dict], timeout_s: float, settle_s: float = 2.0,
+                      headed: bool = False) -> RenderResult:
+    """一次性渲染一个 url：起一个浏览器 → render → 关。批量用 BrowserSession 复用同一浏览器。"""
+    session = BrowserSession(proxy, headed)
+    try:
+        await session.start()
+        r = await session.render(url, timeout_s, settle_s)
+    except Exception as e:
+        first = str(e).splitlines()[0][:200] if str(e) else ""
+        r = RenderResult(ok=False, seconds=0, error=f"{type(e).__name__}: {first}")
+    finally:
+        await session.close()
+    return r

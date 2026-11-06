@@ -60,6 +60,7 @@ class PoolConfig:
     min_left_s: float = 20            # 身份剩余寿命低于此值不再发请求
     lease_ttl_s: float = 120          # 下载线程占用身份的心跳 TTL；进程崩溃后到期自动归还
     request_gap_s: tuple[float, float] = (3.0, 5.0)   # 同一 IP 两次请求的随机间隔
+    page_interval_s: tuple[float, float] = (10.0, 30.0)   # 浏览器下载模式：同一浏览器两篇之间的随机间隔（避开同域名频率限制）
     connect_timeout_s: float = 15
     download_timeout_s: float = 120   # 流式下载的卡顿超时：连续这么久收不到数据才算超时（不是总时长上限）
     min_file_size: int = 1024         # PDF 小于此字节数视为不完整，计一次重试
@@ -75,11 +76,12 @@ class PoolConfig:
     def from_dict(cls, raw: dict[str, Any], landing: dict[str, str] | None = None) -> "PoolConfig":
         _reject_unknown("pool", raw, cls)
         kwargs = dict(raw)
-        if "request_gap_s" in kwargs:
-            lo, hi = (float(x) for x in kwargs["request_gap_s"])
-            if not 0 <= lo <= hi:
-                raise ValueError("request_gap_s 必须是 [最小, 最大] 且 0 ≤ 最小 ≤ 最大")
-            kwargs["request_gap_s"] = (lo, hi)
+        for key in ("request_gap_s", "page_interval_s"):
+            if key in kwargs:
+                lo, hi = (float(x) for x in kwargs[key])
+                if not 0 <= lo <= hi:
+                    raise ValueError(f"{key} 必须是 [最小, 最大] 且 0 ≤ 最小 ≤ 最大")
+                kwargs[key] = (lo, hi)
         kwargs["landing"] = {str(k).lower(): str(v) for k, v in (landing or {}).items()}
         return cls(**kwargs)
 
