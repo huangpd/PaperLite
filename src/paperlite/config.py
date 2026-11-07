@@ -104,7 +104,7 @@ class RunConfig:
     """只传 ``--config`` 时采用的默认命令参数。command 为空则仍显示帮助。"""
 
     command: str = ""
-    mode: str = "browser"
+    mode: str = "curl"
     proxy: bool = True
     workers: int = 20
     urls: str = ""

@@ -84,6 +84,36 @@ class ConfigTest(unittest.TestCase):
                          ("page_saved", "10.1/example", 3.2))
         self.assertNotIn("bytes", data)
 
+    def test_console_formatter_human_readable(self):
+        from paperlite.logutil import ConsoleFormatter
+        record = logging.LogRecord("paperlite", logging.INFO, __file__, 1,
+                                   "待下载 100", (), None)
+        record.event = "progress"           # 内建+隐藏字段不进文本
+        record.pdf = 140
+        line = ConsoleFormatter(color=False).format(record)
+        self.assertNotIn("{", line)         # 不是 JSON
+        self.assertIn("INFO", line)
+        self.assertIn("待下载 100", line)
+        self.assertIn("pdf=140", line)      # 业务字段附在后面
+        self.assertNotIn("event=", line)    # progress 这类隐藏字段不打
+        self.assertFalse(line.startswith("\033"))   # 无色时不含 ANSI
+
+    def test_console_formatter_colors_only_when_enabled(self):
+        from paperlite.logutil import ConsoleFormatter
+        rec = logging.LogRecord("paperlite", logging.ERROR, __file__, 1, "过盾超时", (), None)
+        self.assertTrue(ConsoleFormatter(color=True).format(rec).startswith("\033["))
+        self.assertFalse(ConsoleFormatter(color=False).format(rec).startswith("\033["))
+
+    def test_log_format_selection(self):
+        import io
+        from paperlite.logutil import _console_formatter, ConsoleFormatter, JsonFormatter
+        nontty = io.StringIO()                      # isatty() -> False
+        # auto：非 TTY（重定向/管道/采集）给 JSON，便于机器解析
+        self.assertIsInstance(_console_formatter("auto", nontty), JsonFormatter)
+        # 显式覆盖
+        self.assertIsInstance(_console_formatter("json", nontty), JsonFormatter)
+        self.assertIsInstance(_console_formatter("text", nontty), ConsoleFormatter)
+
     def test_proxy_settings(self):
         with self.assertRaises(ValueError):
             proxy_settings({"username": "u"})            # 缺 api_url
@@ -1084,3 +1114,139 @@ def test_cf_probe_scripts_are_not_challenge():
     page = b'<html><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=1"></script></html>'
     assert is_challenge({}, page)
     assert is_challenge({"cf-mitigated": "challenge"}, b"")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 命令行契约：断言 README「命令」「主要配置」两节描述的子命令、参数、默认值、
+# choices 与真实的 argparse 定义一致。只测参数解析（纯函数），不碰 Redis/网络。
+# 改了 CLI 的命令集或参数默认值而没更新 README 时，这里会红。
+# ──────────────────────────────────────────────────────────────────────────
+class CliArgsTest(unittest.TestCase):
+    def setUp(self):
+        import contextlib
+        import io
+        from paperlite.cli import _build_parser
+        self.ap, self.parsers = _build_parser()
+        self._contextlib, self._io = contextlib, io
+
+    def parse(self, *argv):
+        return self.ap.parse_args(list(argv))
+
+    def fails(self, *argv):
+        """argparse 出错会 print_usage 到 stderr 再 sys.exit —— 吞掉输出，断言退出。"""
+        buf = self._io.StringIO()
+        with self.assertRaises(SystemExit), self._contextlib.redirect_stderr(buf):
+            self.ap.parse_args(list(argv))
+
+    # README 命令表列出的子命令（help 是帮助本身）
+    def test_command_set_matches_readme(self):
+        from paperlite.cli import _COMMANDS
+        self.assertEqual(
+            set(_COMMANDS),
+            {"init", "import", "run", "produce", "download", "status",
+             "inspect", "retry", "export", "turnstile", "help"},
+        )
+        # 每个命令都建了子解析器（help 自身也在内）
+        self.assertEqual(set(self.parsers), set(_COMMANDS))
+
+    # README 快速开始/脚注：--version、--config、--log-level 默认 INFO
+    def test_global_flags(self):
+        self.assertEqual(self.parse("status").log_level, "INFO")
+        self.assertIsNone(self.parse("status").config)
+        self.fails("--version")          # version action 直接退出
+        self.fails("不是命令")            # 未知命令报错退出
+
+    # README：所有命令可加 --out / --host / --db 指定站点和库
+    def test_site_args_on_site_commands(self):
+        for name in ("import", "run", "produce", "download", "status", "inspect", "retry", "export"):
+            argv = [name] + (["--urls", "x.txt"] if name == "import" else
+                             ["--status", "failed"] if name == "retry" else [])
+            ns = self.parse(*argv, "--out", "o", "--host", "h", "--db", "d.db")
+            self.assertEqual((ns.out, ns.host, ns.db), ("o", "h", "d.db"), name)
+        # turnstile 不是站点命令，没有 --out
+        self.fails("turnstile", "--out", "o")
+
+    # README import 行：--urls 必填；--type 为 pdf|html 默认 pdf
+    def test_import(self):
+        from paperlite.tasks import UrlType
+        self.fails("import")                                   # 缺 --urls
+        ns = self.parse("import", "--urls", "acm.txt")
+        self.assertEqual(ns.type, UrlType.PDF)
+        self.assertEqual(self.parse("import", "--urls", "x", "--type", "html").type, "html")
+        self.fails("import", "--urls", "x", "--type", "xml")   # 非法 choice
+
+    # README run 行：--workers 默认 20；--curl/--browser 互斥；--no-proxy；--type
+    def test_run(self):
+        ns = self.parse("run")
+        self.assertEqual(ns.workers, 20)
+        self.assertFalse(ns.browser or ns.curl or ns.no_proxy)
+        self.assertEqual(ns.type, "pdf")
+        self.assertIsNone(ns.config_file)                      # 裸 run：无配置文件，用 flag
+        self.assertTrue(self.parse("run", "--browser", "--no-proxy").no_proxy)
+        self.fails("run", "--browser", "--curl")               # 互斥
+
+    # README「配置文件启动」：paperlite run config.toml 按 [run] 启动
+    def test_run_config_file_positional(self):
+        self.assertEqual(self.parse("run", "config.toml").config_file, "config.toml")
+
+    # 默认模式统一为 curl：run 子命令不带标志、[run] 省略 mode 都是 curl
+    def test_default_mode_is_curl(self):
+        from paperlite.config import RunConfig
+        from paperlite.cli import _configured_run_args
+        import argparse
+        self.assertEqual(RunConfig().mode, "curl")
+        ns = self.parse("run")
+        self.assertFalse(ns.curl or ns.browser)               # run 分发时无标志即走 curl 分支
+        mapped = _configured_run_args(argparse.Namespace(config=None, log_level="INFO"),
+                                      RunConfig(command="run"))
+        self.assertTrue(mapped.curl and not mapped.browser)   # [run] 省略 mode → curl
+
+    # README：produce 常驻，--keep 覆盖 min_identities
+    def test_produce(self):
+        self.assertIsNone(self.parse("produce").keep)
+        self.assertEqual(self.parse("produce", "--keep", "20").keep, 20)
+
+    # README：download 需 --workers（默认 20），可选 --urls
+    def test_download(self):
+        self.assertEqual(self.parse("download").workers, 20)
+        self.assertEqual(self.parse("download", "--workers", "8").workers, 8)
+
+    # README retry：必须二选一；--status 只接受 failed/non_pdf；--kind 配合
+    def test_retry(self):
+        from paperlite.cli import ERROR_KINDS
+        self.fails("retry")                                    # 缺 required 互斥组
+        self.assertEqual(self.parse("retry", "--status", "failed").status, "failed")
+        self.assertEqual(self.parse("retry", "--status", "non_pdf").status, "non_pdf")
+        self.assertTrue(self.parse("retry", "--stopped-volumes").stopped_volumes)
+        self.fails("retry", "--status", "failed", "--stopped-volumes")   # 互斥
+        self.fails("retry", "--status", "pending")             # 非法 choice
+        self.assertIn("network", ERROR_KINDS)
+        self.assertEqual(self.parse("retry", "--status", "failed", "--kind", "network").kind, "network")
+
+    # README export：--status 为全部状态之一；--file 默认标准输出（-）
+    def test_export(self):
+        from paperlite.tasks import Status
+        self.assertEqual(self.parse("export").file, "-")
+        for s in Status.ALL:
+            self.assertEqual(self.parse("export", "--status", s).status, s)
+        self.fails("export", "--status", "bogus")
+
+    # README inspect 行：--trigger/--min-precision/--min-support/--list/--reset
+    def test_inspect(self):
+        ns = self.parse("inspect", "--trigger", "10", "--min-precision", "0.9",
+                        "--min-support", "5", "--list", "--reset")
+        self.assertEqual((ns.trigger, ns.min_precision, ns.min_support), (10, 0.9, 5))
+        self.assertTrue(ns.list and ns.reset)
+
+    # README Turnstile 节：--url/--sitekey、--serve 起服务、--json、默认值
+    def test_turnstile(self):
+        ns = self.parse("turnstile", "--url", "https://x/", "--sitekey", "0x4A")
+        self.assertEqual((ns.timeout, ns.concurrency, ns.bind), (60, 4, "127.0.0.1"))
+        self.assertFalse(ns.json)
+        self.assertEqual(self.parse("turnstile", "--serve", "8191").serve, 8191)
+        self.assertTrue(self.parse("turnstile", "--url", "x", "--sitekey", "k", "--json").json)
+
+    # README：init --force
+    def test_init(self):
+        self.assertFalse(self.parse("init").force)
+        self.assertTrue(self.parse("init", "--force").force)

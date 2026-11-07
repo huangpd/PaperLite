@@ -41,6 +41,7 @@ from paperlite import config as config_mod
 from paperlite.config import PoolConfig, RunConfig
 from paperlite.browser_pool import BrowserPool
 from paperlite.consumer import Downloader
+from paperlite import logutil
 from paperlite.logutil import setup_logging
 from paperlite.producer import Producer
 from paperlite.proxy import IpSource, ProxySettings
@@ -50,12 +51,11 @@ from paperlite.tasks import ERROR_KINDS, Status, TaskDB, UrlType, url_host
 logger = logging.getLogger("paperlite")
 
 
-def _configured_run_args(args, run: RunConfig):
+def _configured_run_args(args, run: RunConfig, config: str | None = None):
     """把 [run] 转成与 ``paperlite run ...`` 相同的 argparse 参数。"""
-    if run.command != "run":
-        return None
     return argparse.Namespace(
-        cmd="run", config=args.config, log_level=args.log_level,
+        cmd="run", config=config if config is not None else args.config,
+        log_level=args.log_level, log_format=getattr(args, "log_format", "auto"),
         out=run.out or None, host=run.host or None, db=run.db or None,
         urls=run.urls or None, type=run.url_type, workers=run.workers,
         curl=run.mode == "curl", browser=run.mode == "browser",
@@ -448,6 +448,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
                      description=_DESCRIPTION, epilog=_EPILOG)
     ap.add_argument("--config", help=f"配置文件，默认取环境变量 {config_mod.CONFIG_ENV}，再默认当前目录的 config.toml")
     ap.add_argument("--log-level", default="INFO", help="日志级别，默认 INFO")
+    ap.add_argument("--log-format", choices=logutil.LOG_FORMATS, default="auto",
+                    help="终端日志格式：auto（默认，交互式给文本、重定向给 JSON）/ text / json。日志文件始终为 JSON")
     ap.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}", help="显示版本")
     sub = ap.add_subparsers(dest="cmd", metavar="<命令>", help=argparse.SUPPRESS)
     parsers: dict[str, argparse.ArgumentParser] = {}
@@ -482,6 +484,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
     p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数，默认 20")
     p = cmd("run")
+    p.add_argument("config_file", nargs="?", metavar="[配置文件]",
+                   help="给了就按它的 [run] 段启动（paperlite run config.toml），其余 run 参数忽略；省略则用下面的参数临时跑")
     site_args(p)
     p.add_argument("--urls", help="先导入这个文件（可选）")
     p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
@@ -541,17 +545,25 @@ def main() -> None:
             return
         except (TypeError, ValueError) as e:
             raise SystemExit(f"配置错误: {e}")
-        configured = _configured_run_args(args, run)
-        if configured is None:
+        if run.command != "run":
             ap.print_help()
             return
-        args = configured
+        args = _configured_run_args(args, run)
+    elif args.cmd == "run" and args.config_file:          # paperlite run config.toml
+        try:
+            pool_for_logging, run = config_mod.load_run(config_mod.resolve_path(args.config_file))
+        except FileNotFoundError as e:
+            raise SystemExit(str(e))
+        except (TypeError, ValueError) as e:
+            raise SystemExit(f"配置错误: {e}")
+        args = _configured_run_args(args, run, config=args.config_file)
     if args.cmd == "help":
         (parsers[args.command] if args.command else ap).print_help()
         return
 
     pool_for_logging = pool_for_logging or _pool_cfg(args)
-    log_path = setup_logging(args.log_level, pool_for_logging.log_dir, stderr=args.cmd == "export")
+    log_path = setup_logging(args.log_level, pool_for_logging.log_dir, stderr=args.cmd == "export",
+                             fmt=getattr(args, "log_format", "auto"))
     for noisy in ("asyncio", "curl_cffi"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     if log_path:
