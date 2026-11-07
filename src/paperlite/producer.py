@@ -129,7 +129,8 @@ class Producer:
                 logger.info("IP %s 剩余寿命太短，丢弃", lease.exit_ip)
                 return
             r = await pass_challenge(self.landing, lease, self.ips.s, self.cfg.pass_timeout_s,
-                                     self.cfg.headed, self.cfg.debug_dir)
+                                     self.cfg.headed, self.cfg.debug_dir, geoip=self.cfg.geoip,
+                                     webrtc_spoof=self.cfg.webrtc_spoof)
             if not r.ok or r.clearance_expires() is None:
                 self.stats.failed += 1
                 logger.info("过盾失败 %s %.0fs: %s", lease.exit_ip, r.seconds, r.error or "未拿到 cf_clearance")

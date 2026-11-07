@@ -959,7 +959,7 @@ class BrowserPoolTest(unittest.TestCase):
         self.db.import_urls({"pdf_url": u, "url_type": "html"} for u in urls)
 
         class FakeSession:
-            def __init__(s, proxy, headed=False):
+            def __init__(s, proxy, headed=False, geoip=False, webrtc_spoof=True):
                 s.proxy = proxy
             async def start(s):
                 pass
@@ -1385,3 +1385,22 @@ class ProxyCheckTest(unittest.TestCase):
             with self.assertRaises(ProxyUnavailable):
                 src.extract_checked()
             self.assertEqual(chk.call_count, 3)              # 连续 3 个不过才放弃
+
+
+class GeoipGateTest(unittest.TestCase):
+    """geoip=true 但 GeoIP 库缺失时，启动前报错而非卡死下载。"""
+
+    def test_require_geoip(self):
+        from paperlite.cli import _require_geoip
+        from paperlite.config import Limits
+        _require_geoip(Limits(geoip=False))                                  # 关：不检查、不报错
+        with mock.patch("paperlite.browser.ensure_geoip_db", return_value=(True, "/x/db.mmdb", "u")):
+            _require_geoip(Limits(geoip=True))                               # 就位（或下成功）：通过
+        with mock.patch("paperlite.browser.ensure_geoip_db",
+                        return_value=(False, "/x/GeoLite2-City.mmdb", "https://example/db")):
+            with self.assertRaises(SystemExit) as e:
+                _require_geoip(Limits(geoip=True))                           # 下不动：报错
+            msg = str(e.exception)
+            self.assertIn("GeoLite2-City.mmdb", msg)        # 指明文件
+            self.assertIn("https://example/db", msg)        # 给出下载地址
+            self.assertIn("geoip = false", msg)             # 给出关闭选项

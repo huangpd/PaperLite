@@ -78,6 +78,8 @@ class Limits:
     pass_timeout_s: float = 90        # 单次过盾等待上限
     hedge_after_s: float = 45         # 过盾超过此时长未成功即另开一个补位（成功的多在 30s 内）
     headed: bool = False
+    webrtc_spoof: bool = True         # 给浏览器加 --fingerprint-webrtc-ip=auto：把 WebRTC 出口伪造成代理出口 IP，防泄露真实 IP。不需要 GeoIP 库
+    geoip: bool = True                # 按出口 IP 对齐浏览器时区/语言（重要的指纹一致性）；需 ~70MB GeoIP 库，首次启动会限时下载，连不上则报错给手动预置指引
     debug_dir: str = ""               # 过盾失败截图目录，空则不截图
     max_fresh_rejects: int = 5        # 连续这么多个新身份一篇没下成就被拒 → 熔断暂停生产
     breaker_pause_s: float = 600      # 熔断暂停时长；之后放一个身份试探

@@ -1,6 +1,6 @@
 [project]
 name = "paperlite"
-version = "0.1.8"
+version = "0.1.10"
 description = "大批量 PDF 下载：浏览器过盾 cookie 池（Redis）+ curl_cffi + SQLite 任务库"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 dependencies = [
-    "cloakbrowser==0.6.4",
+    "cloakbrowser[geoip]==0.6.4",
     "curl-cffi>=0.15.0",
     "redis>=5.0",
     "certifi>=2024.2.2",

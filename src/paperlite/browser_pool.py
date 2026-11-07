@@ -141,7 +141,7 @@ class BrowserPool:
                     logger.info("IP %s 剩余寿命太短，丢弃", lease.exit_ip)
                     continue
                 proxy_arg = self.proxy.browser_proxy_for(lease.server)
-            session = BrowserSession(proxy_arg, self.cfg.headed)
+            session = BrowserSession(proxy_arg, self.cfg.headed, self.cfg.geoip, self.cfg.webrtc_spoof)
             try:
                 await session.start()
                 r = await session.render(self.landing, self.cfg.pass_timeout_s)

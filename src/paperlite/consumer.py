@@ -396,7 +396,7 @@ class Downloader:
         logger.info("网页跳到 %s 被挑战，改用浏览器: %s", url_host(url), task.url)
         with self._browser_slots:
             r = asyncio.run(render_page(url, self.proxy.browser_proxy_for(ident.proxy_server), self.cfg.pass_timeout_s,
-                                        headed=self.cfg.headed))
+                                        headed=self.cfg.headed, geoip=self.cfg.geoip, webrtc_spoof=self.cfg.webrtc_spoof))
         if not r.ok:
             self._retry_or_fail(task, ident, "challenge_failed", f"浏览器打开 {url} 失败: {r.error}")
             return True, "other"

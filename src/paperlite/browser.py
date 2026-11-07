@@ -75,6 +75,51 @@ class PassResult:
         return c["expires"] if c and c.get("expires", -1) > 0 else None
 
 
+def geoip_db_ready() -> tuple[bool, str, str]:
+    """geoip 用的 GeoLite2-City.mmdb 是否已就绪；返回 (是否存在, DB 路径, 下载地址)。
+    路径从 cloakbrowser 取（变了也跟着变），取不到就退回默认 ~/.cloakbrowser/geoip/。"""
+    try:
+        from cloakbrowser.geoip import _get_geoip_dir, GEOIP_DB_FILENAME, GEOIP_DB_URL
+        path = _get_geoip_dir() / GEOIP_DB_FILENAME
+        url = GEOIP_DB_URL
+    except Exception:
+        from pathlib import Path as _P
+        path = _P.home() / ".cloakbrowser" / "geoip" / "GeoLite2-City.mmdb"
+        url = "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb"
+    return path.exists(), str(path), url
+
+
+def ensure_geoip_db(connect_timeout: float = 15.0, read_timeout: float = 45.0) -> tuple[bool, str, str]:
+    """确保 GeoIP 库就位：已存在直接返回；缺失则**一次性、短超时**下载（connect/read 卡住就快速失败，
+    不像 cloakbrowser 那样每次启动都重试 5 分钟）。返回 (是否就绪, DB 路径, 下载地址)。"""
+    from pathlib import Path as _P
+    ok, path, url = geoip_db_ready()
+    if ok:
+        return True, path, url
+    import httpx
+    p = _P(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    try:
+        logger.info("首次使用 geoip：下载 GeoIP 库(~70MB) %s …", url)
+        with httpx.stream("GET", url, follow_redirects=True,
+                          timeout=httpx.Timeout(read_timeout, connect=connect_timeout)) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_bytes(65_536):
+                    f.write(chunk)
+        tmp.replace(p)
+        logger.info("GeoIP 库就绪: %s", p)
+        return True, path, url
+    except Exception as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        logger.warning("GeoIP 库下载失败: %s", str(e).splitlines()[0][:120])
+        return False, path, url
+
+
 async def pass_challenge(
     landing: str,
     lease: Lease,
@@ -82,6 +127,8 @@ async def pass_challenge(
     timeout_s: float,
     headed: bool = False,
     debug_dir: str = "",
+    geoip: bool = False,
+    webrtc_spoof: bool = True,
 ) -> PassResult:
     """
     打开 landing 直到挑战脚本消失且拿到 cf_clearance；超时返回 ok=False。
@@ -97,8 +144,9 @@ async def pass_challenge(
     page = None
     try:
         browser = await launch_async(
-            headless=not headed, proxy=lease.browser_proxy(proxy), stealth_args=False,
-            args=args + ["--disable-dev-shm-usage", "--window-size=1440,900"], env=browser_env(),
+            headless=not headed, proxy=lease.browser_proxy(proxy), stealth_args=False, geoip=geoip,
+            args=args + ["--disable-dev-shm-usage", "--window-size=1440,900"]
+            + (["--fingerprint-webrtc-ip=auto"] if webrtc_spoof else []), env=browser_env(),
         )
         context = await browser.new_context()
         page = await context.new_page()
@@ -189,9 +237,12 @@ class BrowserSession:
     用于浏览器下载模式（browser_pool），也被一次性的 render_page() 复用。
     """
 
-    def __init__(self, proxy: Optional[dict], headed: bool = False) -> None:
+    def __init__(self, proxy: Optional[dict], headed: bool = False, geoip: bool = False,
+                 webrtc_spoof: bool = True) -> None:
         self.proxy = proxy
         self.headed = headed
+        self.geoip = geoip
+        self.webrtc_spoof = webrtc_spoof
         self.browser = None
         self.page = None
         self.doc: Optional[DocTracker] = None
@@ -203,8 +254,9 @@ class BrowserSession:
 
         args = [a for a in get_default_stealth_args() if a.split("=", 1)[0] != "--no-sandbox"]
         self.browser = await launch_async(
-            headless=not self.headed, proxy=self.proxy, stealth_args=False,
-            args=args + ["--disable-dev-shm-usage", "--window-size=1440,900"], env=browser_env(),
+            headless=not self.headed, proxy=self.proxy, stealth_args=False, geoip=self.geoip,
+            args=args + ["--disable-dev-shm-usage", "--window-size=1440,900"]
+            + (["--fingerprint-webrtc-ip=auto"] if self.webrtc_spoof else []), env=browser_env(),
         )
         self.page = await (await self.browser.new_context()).new_page()
         self.doc = DocTracker(self.page)
@@ -265,9 +317,9 @@ class BrowserSession:
 
 
 async def render_page(url: str, proxy: Optional[dict], timeout_s: float, settle_s: float = 2.0,
-                      headed: bool = False) -> RenderResult:
+                      headed: bool = False, geoip: bool = False, webrtc_spoof: bool = True) -> RenderResult:
     """一次性渲染一个 url：起一个浏览器 → render → 关。批量用 BrowserSession 复用同一浏览器。"""
-    session = BrowserSession(proxy, headed)
+    session = BrowserSession(proxy, headed, geoip, webrtc_spoof)
     try:
         await session.start()
         r = await session.render(url, timeout_s, settle_s)

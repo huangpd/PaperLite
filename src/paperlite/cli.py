@@ -106,6 +106,24 @@ def _open_db(args, create: bool = False) -> TaskDB:
     return TaskDB(db)
 
 
+def _require_geoip(cfg) -> None:
+    """geoip=true：启动前确保 GeoIP 库就位——缺失则限时下载一次；下不动就快速报错给手动预置指引
+    （而不是让 cloakbrowser 每次启动都卡 5 分钟重试）。"""
+    if not cfg.geoip:
+        return
+    from paperlite.browser import ensure_geoip_db
+    ok, path, url = ensure_geoip_db()
+    if ok:
+        return
+    raise SystemExit(
+        f"geoip = true，但 GeoIP 库下载不下来（服务器/受限网络常连不上 GitHub），这里先拦下不让它卡死。\n"
+        f"目标路径：{path}\n"
+        f"请手动装好再跑，二选一：\n"
+        f"  1) 能连 GitHub 的机器上下载后放到该路径（或在别处下好 scp 过去）：\n"
+        f"     curl -L --create-dirs -o '{path}' '{url}'\n"
+        f"  2) 不用 geoip（WebRTC 伪造仍由 webrtc_spoof 保留）：在 config.toml 的 [limits] 设 geoip = false")
+
+
 def _read_url_file(path: str):
     """txt：一行一个链接；CSV：表头含 url（或旧名 pdf_url），可选 doi / source / batch_no / url_type。"""
     with open(path, encoding="utf-8-sig", newline="") as f:
@@ -586,6 +604,7 @@ def main() -> None:
             cfg, proxy = _load(args.config)
         if args.headed:
             cfg = dataclasses.replace(cfg, headed=True)
+        _require_geoip(cfg)
         _browse(args, cfg, proxy, no_proxy=args.no_proxy)
         return
 
@@ -597,6 +616,7 @@ def main() -> None:
         return
 
     cfg, proxy = _load(args.config)                 # produce / download / run --curl
+    _require_geoip(cfg)                             # curl 模式过盾也用浏览器，同样需要 GeoIP 库
     store = IdentityStore(cfg.redis_url, cfg.key_prefix)
     store.ping()
     if args.cmd == "produce":
