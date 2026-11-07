@@ -154,7 +154,7 @@ def derive_volume(doi: str) -> Optional[str]:
 
 def pdf_path(base_dir: Path, doi: str, suffix: str = ".pdf") -> Path:
     """<base>/<h[0:2]>/<h[2:4]>/<doi>.pdf（网页任务为 .html），h = sha256(doi)；返回绝对路径。
-    base 是媒体文件根（out_root），不含主机层——doi 全局唯一，不同站点的文件也不会撞。"""
+    base 是输出目录（[paths].storage），不含主机层——doi 全局唯一，不同站点的文件也不会撞。"""
     digest = hashlib.sha256(doi.encode("utf-8")).hexdigest()
     readable = doi.strip().replace("/", "_")
     stem = _SAFE_NAME_RE.sub("_", readable).strip("._")

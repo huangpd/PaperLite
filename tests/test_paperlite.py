@@ -12,7 +12,7 @@ from unittest import mock
 
 from paperlite.browser_pool import BrowserPool
 from paperlite.classify import classify_html
-from paperlite.config import PoolConfig, RunConfig, proxy_settings
+from paperlite.config import Limits, RunConfig, proxy_settings
 from paperlite.consumer import Downloader, impersonate_for
 from paperlite.inspect import WindowInspector
 from paperlite.logutil import JsonFormatter
@@ -35,27 +35,27 @@ def ident(**kw) -> Identity:
 
 class ConfigTest(unittest.TestCase):
     def test_from_dict(self):
-        cfg = PoolConfig.from_dict({"request_gap_s": [1, 2]}, landing={"DL.ACM.ORG": "https://x/"})
+        cfg = Limits.from_dict({"request_gap_s": [1, 2]}, landing={"DL.ACM.ORG": "https://x/"})
         self.assertEqual(cfg.request_gap_s, (1.0, 2.0))
         self.assertEqual(cfg.landing_for("dl.acm.org"), "https://x/")
         self.assertEqual(cfg.landing_for("other.org"), "https://other.org/")
 
     def test_rejects_unknown_and_bad_gap(self):
         with self.assertRaises(ValueError):
-            PoolConfig.from_dict({"max_browser": 3})
+            Limits.from_dict({"max_browser": 3})
         with self.assertRaises(ValueError):
-            PoolConfig.from_dict({"request_gap_s": [5, 3]})
+            Limits.from_dict({"request_gap_s": [5, 3]})
 
     def test_page_interval_parsed_and_validated(self):
-        self.assertEqual(PoolConfig().page_interval_s, (10.0, 30.0))
-        self.assertEqual(PoolConfig.from_dict({"page_interval_s": [15, 40]}).page_interval_s, (15.0, 40.0))
+        self.assertEqual(Limits().page_interval_s, (10.0, 30.0))
+        self.assertEqual(Limits.from_dict({"page_interval_s": [15, 40]}).page_interval_s, (15.0, 40.0))
         with self.assertRaises(ValueError):
-            PoolConfig.from_dict({"page_interval_s": [30, 10]})
+            Limits.from_dict({"page_interval_s": [30, 10]})
 
     def test_title_window_must_cover_trigger(self):
-        self.assertEqual(PoolConfig().title_window_size, 500)
+        self.assertEqual(Limits().title_window_size, 500)
         with self.assertRaises(ValueError):
-            PoolConfig.from_dict({"title_dup_trigger": 10, "title_window_size": 9})
+            Limits.from_dict({"title_dup_trigger": 10, "title_window_size": 9})
 
     def test_default_run_config(self):
         run = RunConfig.from_dict({"command": "run", "mode": "browser", "proxy": False,
@@ -126,7 +126,7 @@ class ConfigTest(unittest.TestCase):
     def test_load_file(self):
         from paperlite.config import load
         with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
-            f.write('[proxy]\napi_url = "https://a/"\n[pool]\nmax_browsers = 3\n[landing]\n"h.org" = "https://h.org/x"\n')
+            f.write('[proxy]\napi_url = "https://a/"\n[limits]\nmax_browsers = 3\n[landing]\n"h.org" = "https://h.org/x"\n')
         try:
             cfg, proxy = load(Path(f.name))
             self.assertEqual((cfg.max_browsers, cfg.landing_for("h.org"), proxy.api_url), (3, "https://h.org/x", "https://a/"))
@@ -281,6 +281,87 @@ class WindowInspectorTest(unittest.TestCase):
         watcher.observe("10.1/c", "https://x/c", "Other C")
         self.assertEqual(watcher.observe("10.1/a3", "https://x/a3", "Repeated"), (0, 0))
         self.assertEqual(db.count_calls, 0)                  # 窗口内从未同时达到 3 条
+
+    def test_dead_404_titles_also_induce_rule(self):
+        # DOI 唯一却全是 "Page not found" → 和封面同理：归纳规则、标记其余 pending（失效页也算）
+        db = self.FakeDB()
+        watcher = WindowInspector(db, trigger=3, min_support=3, window_size=10)
+        base = "https://www.sciencedirect.com/science/article/abs/pii/S019566"
+        watcher.observe("10.1/s(03)94113-3", base + "1", "Page not found | ScienceDirect")
+        watcher.observe("10.1/s(03)94114-5", base + "2", "Page not found | ScienceDirect")
+        self.assertEqual(watcher.observe("10.1/s(03)94115-7", base + "3", "Page not found | ScienceDirect"), (1, 2))
+        self.assertEqual(len(db.flag_calls), 1)
+
+    def test_coarsen_not_degenerate(self):
+        from paperlite.inspect import _coarsen
+        pii = "https://www.sciencedirect.com/science/article/abs/pii/S0195668X0394"
+        self.assertEqual(_coarsen(pii), pii)                 # 完整识别码（长数字尾）不粗化，不退化成 /pii/S
+        self.assertEqual(_coarsen("10.1/j(23)0"), "10.1/j(23)")   # 短校验位仍粗化（卷期用）
+
+    def test_prefers_specific_prefix_not_whole_site(self):
+        flagged = []
+
+        class DB:
+            def count_pending_matching(self, dp, up):
+                return 20
+            def flag_suspects(self, dp, up, title, support, precision):
+                flagged.append((dp, up))
+                return 5
+
+        w = WindowInspector(DB(), trigger=10, min_support=10, window_size=50)
+        base = "https://www.sciencedirect.com/science/article/abs/pii/S0195668X0394"
+        for i in range(10):     # 10 条 EHJ 404，前缀一致
+            w.observe(f"10.1016/s0195-668x(03)941{i:02d}", f"{base}{i:03d}", "Page not found | ScienceDirect")
+        self.assertTrue(flagged)
+        dp, up = flagged[-1]
+        self.assertIn("S0195668X", up)                       # 保留 EHJ 识别码
+        self.assertNotEqual(up, "https://www.sciencedirect.com/science/article/abs/pii/S")  # 没退化成整站宽前缀
+
+
+class BrowserObserveWiringTest(unittest.TestCase):
+    """浏览器模式：不止成功页，404 等已加载的失效页也要喂给巡检器（不再只在成功分支调）。"""
+
+    def test_404_branch_feeds_inspector(self):
+        import asyncio
+        from types import SimpleNamespace
+        from paperlite.browser_pool import BrowserPool
+        from paperlite.browser import RenderResult
+        from paperlite.config import Limits
+        from paperlite.proxy import Lease
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        db = TaskDB(Path(tmp.name) / "tasks.db"); self.addCleanup(db.close)
+        db.import_urls([{"url": "https://www.sciencedirect.com/science/article/abs/pii/S1"}])
+        pool = BrowserPool(Limits(), None, db, Path(tmp.name) / "out", workers=1, no_proxy=True)
+        pool.inspector = mock.Mock()
+        pool.inspector.observe = mock.Mock(return_value=(0, 0))
+        task = db.claim("w")
+        r = RenderResult(ok=True, seconds=1.0, status=404, title="Page not found | ScienceDirect",
+                         url="https://www.sciencedirect.com/science/article/abs/pii/S1")
+        session = SimpleNamespace(render=mock.AsyncMock(return_value=r))
+        lease = Lease(server="x", exit_ip="1.2.3.4", area="", expires_at=time.time() + 600)
+        asyncio.run(pool._do_task(task, session, lease, "t"))
+        pool.inspector.observe.assert_called_once_with(task.doi, task.url, r.title)   # 404 分支喂了巡检
+        self.assertEqual(db.counts()[Status.FAILED], 1)                               # 且仍记为 failed
+
+    def test_challenge_timeout_not_fed(self):
+        # r.ok=False（过盾超时，标题是瞬时的 "Just a moment"）绝不能进巡检，否则会误标正常 pending
+        import asyncio
+        from types import SimpleNamespace
+        from paperlite.browser_pool import BrowserPool
+        from paperlite.browser import RenderResult
+        from paperlite.config import Limits
+        from paperlite.proxy import Lease
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        db = TaskDB(Path(tmp.name) / "tasks.db"); self.addCleanup(db.close)
+        db.import_urls([{"url": "https://www.sciencedirect.com/science/article/abs/pii/S2"}])
+        pool = BrowserPool(Limits(), None, db, Path(tmp.name) / "out", workers=1, no_proxy=True)
+        pool.inspector = mock.Mock()
+        task = db.claim("w")
+        r = RenderResult(ok=False, seconds=90.0, title="Just a moment...", error="TimeoutError")
+        session = SimpleNamespace(render=mock.AsyncMock(return_value=r))
+        lease = Lease(server="x", exit_ip="1.2.3.4", area="", expires_at=time.time() + 600)
+        asyncio.run(pool._do_task(task, session, lease, "t"))
+        pool.inspector.observe.assert_not_called()
 
 
 class TaskDBTest(unittest.TestCase):
@@ -499,79 +580,57 @@ class CliDbOptionTest(unittest.TestCase):
         self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
         with open(cfg, "rb") as f:
             raw = tomllib.load(f)
-        self.assertEqual(set(raw), {"proxy", "pool", "run", "landing"})
+        self.assertEqual(set(raw), {"proxy", "limits", "paths", "run", "landing"})
         with self.assertRaises(SystemExit):                     # 已存在不覆盖
             self.run_cli("init")
         self.run_cli("init", "--force")
 
-    def test_db_separate_from_out(self):
+    def test_db_arg_locates_db(self):
+        # 任务库由 --db 指定，与输出目录无关；import/retry/export 只认 --db
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             urls = tmp / "urls.txt"
             urls.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\nhttps://dl.acm.org/doi/pdf/10.1145/1.3\n")
-            out, db = tmp / "mnt" / "pdfs", tmp / "local" / "acm.db"
-            self.run_cli("import", "--out", str(out), "--db", str(db), "--urls", str(urls))
+            db = tmp / "local" / "acm.db"
+            self.run_cli("import", "--db", str(db), "--urls", str(urls))
             self.assertTrue(db.exists())
-            self.assertFalse((out / "tasks.db").exists())                 # 输出目录里没有任务库
-            self.run_cli("retry", "--db", str(db), "--status", "failed")  # 只给 --db 也行
+            self.run_cli("retry", "--db", str(db), "--status", "failed")
             csv_path = tmp / "x.csv"
             self.run_cli("export", "--db", str(db), "--file", str(csv_path))
             self.assertEqual(len(csv_path.read_text().strip().splitlines()), 3)
-            with self.assertRaises(SystemExit):
-                self.run_cli("export", "--file", str(csv_path))            # 两个都没给
+            with self.assertRaises(SystemExit):                               # 库不存在
+                self.run_cli("export", "--db", str(tmp / "nope.db"), "--file", str(csv_path))
 
-    def test_import_without_out_uses_host_dir(self):
+    def test_mixed_hosts_go_into_one_db(self):
+        # 弱化站点：各种主机混着导进同一个库，不按主机分目录
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            f = tmp / "mixed.txt"
+            f.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\nhttps://example.org/a.pdf\n")
+            db = tmp / "t.db"
+            self.run_cli("import", "--db", str(db), "--urls", str(f))
+            d = TaskDB(db)
+            try:
+                self.assertEqual(sorted(d.hosts()), ["dl.acm.org", "example.org"])   # 多主机同库
+                self.assertEqual(sum(d.counts().values()), 2)
+            finally:
+                d.close()
+
+    def test_db_from_config_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             cfg = tmp / "c.toml"
-            cfg.write_text(f'[pool]\nout_root = "{tmp / "pdfs"}"\n')
-            acm, other = tmp / "acm.txt", tmp / "other.txt"
-            acm.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\n")
-            other.write_text("https://example.org/a.pdf\n")
-            c = ["--config", str(cfg)]
-            self.run_cli(*c, "import", "--urls", str(acm))
-            self.assertTrue((tmp / "pdfs" / "dl.acm.org" / "tasks.db").exists())     # 输出目录按主机自动建
-            out_csv = tmp / "x.csv"
-            self.run_cli(*c, "export", "--file", str(out_csv))                      # 只有一个站点：不用指定
-            self.assertEqual(len(out_csv.read_text().strip().splitlines()), 2)
-            self.run_cli(*c, "import", "--urls", str(other))
-            with self.assertRaises(SystemExit) as e:
-                self.run_cli(*c, "export", "--file", str(out_csv))                  # 两个站点：要指定
-            self.assertIn("多个站点", str(e.exception))
-            self.run_cli(*c, "export", "--host", "example.org", "--file", str(out_csv))
-            self.assertIn("example.org", out_csv.read_text())
-            with self.assertRaises(SystemExit):
-                self.run_cli(*c, "retry", "--host", "nope.org", "--status", "failed")   # 不存在的站点不会凭空建库
-            self.assertFalse((tmp / "pdfs" / "nope.org").exists())
-
-    def test_task_db_path_precedence(self):
-        from paperlite.config import task_db_path
-        self.assertEqual(task_db_path("/mnt/g/acm", "/x/a.db", "/data/db"), Path("/x/a.db"))       # --db 最优先
-        p1 = task_db_path("/mnt/g/acm", None, "/data/db")
-        p2 = task_db_path("/mnt/h/acm", None, "/data/db")
-        self.assertEqual((p1.parent, p1.name[:4], p1.suffix), (Path("/data/db"), "acm-", ".db"))  # 配置 db_dir
-        self.assertNotEqual(p1, p2)                                                               # 同名输出目录不撞
-        self.assertEqual(task_db_path("/mnt/g/acm", None, ""), Path("/mnt/g/acm/tasks.db"))        # 默认
-        with self.assertRaises(ValueError):
-            task_db_path(None, None, "/data/db")
-
-    def test_db_dir_from_config(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            cfg = tmp / "c.toml"
-            cfg.write_text(f'[pool]\ndb_dir = "{tmp / "local"}"\n')         # import 只读 [pool]，不要求 [proxy]
+            dbfile = tmp / "local" / "t.db"
+            cfg.write_text(f'[paths]\ndb = "{dbfile}"\n')         # import 只读 [paths]，不要求 [proxy]
             urls = tmp / "u.txt"
             urls.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\n")
-            out = tmp / "mnt" / "acm"
-            self.run_cli("--config", str(cfg), "import", "--out", str(out), "--urls", str(urls))
-            dbs = list((tmp / "local").glob("acm-*.db"))
-            self.assertEqual(len(dbs), 1)
-            self.assertFalse((out / "tasks.db").exists())
+            self.run_cli("--config", str(cfg), "import", "--urls", str(urls))
+            self.assertTrue(dbfile.exists())                     # 用 [paths].db 的位置
 
 
 class ProducerTargetTest(unittest.TestCase):
     def test_target_follows_workers(self):
-        p = Producer(PoolConfig(max_identities=20, min_identities=2), mock.Mock(), mock.Mock(), "dl.acm.org")
+        p = Producer(Limits(max_identities=20, min_identities=2), mock.Mock(), mock.Mock(), "dl.acm.org")
         self.assertEqual(p.target(0), 2)      # 没有下载线程：只保预热数
         self.assertEqual(p.target(8), 8)
         self.assertEqual(p.target(50), 20)
@@ -591,7 +650,7 @@ class ProducerHedgeTest(unittest.TestCase):
         ips = mock.Mock()
         ips.extract_checked.return_value = Lease("1.2.3.4:80", "1.2.3.4", "", time.time() + 600)
         ips.s = PROXY
-        cfg = PoolConfig(max_browsers=5, hedge_after_s=0.05, pass_timeout_s=10)
+        cfg = Limits(max_browsers=5, hedge_after_s=0.05, pass_timeout_s=10)
         p = Producer(cfg, store, ips, "dl.acm.org")
         launched = []
 
@@ -618,7 +677,7 @@ class ProducerBreakerTest(unittest.TestCase):
         store = mock.Mock()
         store.paused_for.return_value = 0
         store.fresh_rejects.return_value = 5
-        p = Producer(PoolConfig(max_fresh_rejects=5, breaker_pause_s=600), store, mock.Mock(), "dl.acm.org")
+        p = Producer(Limits(max_fresh_rejects=5, breaker_pause_s=600), store, mock.Mock(), "dl.acm.org")
         self.assertTrue(p._breaker_open())
         store.trip.assert_called_once_with("dl.acm.org", 600, 5)
         store.paused_for.return_value = 590
@@ -687,7 +746,7 @@ class DownloaderTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.out = Path(self.tmp.name)
         self.db = TaskDB(self.out / "tasks.db")
-        self.cfg = PoolConfig(request_gap_s=(0, 0))
+        self.cfg = Limits(request_gap_s=(0, 0))
 
     def tearDown(self):
         self.db.close()
@@ -747,7 +806,7 @@ class DownloaderTest(unittest.TestCase):
 
         def refused(u):
             raise ConnectionError("curl: (7) Failed to connect")
-        self.cfg = PoolConfig(request_gap_s=(0, 0), max_tries=1)
+        self.cfg = Limits(request_gap_s=(0, 0), max_tries=1)
         self.run_with(store, {"1.1.1.1": challenge, "2.2.2.2": refused, "3.3.3.3": challenge},
                       ["https://dl.acm.org/doi/pdf/10.1145/1"])
         self.assertEqual(store.fresh_rejects, 1)            # 1.1.1.1 被拒计入；2.2.2.2 连不上不计，任务判失败后结束
@@ -759,7 +818,7 @@ class DownloaderTest(unittest.TestCase):
                 return Resp(403, b"challenge-platform", {"cf-mitigated": "challenge"})
             return Resp(200, b"<title>landing</title>") if "/doi/pdf/" not in u else Resp(200, FAKE_PDF)
         store = FakeStore([ident()])
-        self.cfg = PoolConfig(request_gap_s=(0, 0), max_url_challenges=2,
+        self.cfg = Limits(request_gap_s=(0, 0), max_url_challenges=2,
                               landing={"dl.acm.org": "https://dl.acm.org/doi/10.1145/landing"})
         bad, good = "https://dl.acm.org/doi/pdf/10.1145/bad", "https://dl.acm.org/doi/pdf/10.1145/good"
         dl = self.run_with(store, {"1.2.3.4": site}, [bad, good])
@@ -802,7 +861,7 @@ class DownloaderTest(unittest.TestCase):
         def site(u):
             calls.append(u)
             return Resp(404, b"<title>ACM Error: 404</title>")
-        self.cfg = PoolConfig(request_gap_s=(0, 0), volume_stop_after=3)
+        self.cfg = Limits(request_gap_s=(0, 0), volume_stop_after=3)
         urls = [f"https://dl.acm.org/doi/pdf/10.1145/1012326.{1012327 + i}" for i in range(11)]
         dl = self.run_with(FakeStore([ident()]), {"1.2.3.4": site}, urls)
         self.assertEqual(len(calls), 3)                     # 11 篇只请求了 3 篇
@@ -819,7 +878,7 @@ class DownloaderTest(unittest.TestCase):
         self.assertFalse(list(self.out.rglob("*.part")))
 
     def test_too_large_pdf_aborted(self):
-        self.cfg = PoolConfig(request_gap_s=(0, 0), max_file_size_mb=1)
+        self.cfg = Limits(request_gap_s=(0, 0), max_file_size_mb=1)
         url = "https://dl.acm.org/doi/pdf/10.1145/big"
         dl = self.run_with(FakeStore([ident()]), {"1.2.3.4": lambda u: Resp(200, b"%PDF-1.4" + b"x" * (1024 * 1024 + 10))}, [url])
         r = self.row(url)
@@ -871,7 +930,7 @@ class DownloaderTest(unittest.TestCase):
     def test_network_error_retries_then_fails(self):
         def boom(u):
             raise TimeoutError("curl: (28) Operation timed out")
-        self.cfg = PoolConfig(request_gap_s=(0, 0), max_tries=2)
+        self.cfg = Limits(request_gap_s=(0, 0), max_tries=2)
         url = "https://dl.acm.org/doi/pdf/10.1145/x"
         dl = self.run_with(FakeStore([ident()]), {"1.2.3.4": boom}, [url])
         self.assertEqual((dl.stats.success, dl.stats.failed), (0, 1))
@@ -886,7 +945,7 @@ class BrowserPoolTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.out = Path(self.tmp.name)
         self.db = TaskDB(self.out / "tasks.db")
-        self.cfg = PoolConfig(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, max_url_challenges=2)
+        self.cfg = Limits(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, max_url_challenges=2)
 
     def tearDown(self):
         self.db.close()
@@ -947,7 +1006,7 @@ class BrowserPoolTest(unittest.TestCase):
 
     def test_realtime_inspector_stops_matching_pending_pages(self):
         from paperlite.browser import RenderResult
-        self.cfg = PoolConfig(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1,
+        self.cfg = Limits(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1,
                               title_dup_trigger=3, title_window_size=10,
                               rule_min_support=3, rule_min_precision=1.0)
         urls = [f"https://example.org/cover/{i}" for i in range(6)]
@@ -1156,15 +1215,15 @@ class CliArgsTest(unittest.TestCase):
         self.fails("--version")          # version action 直接退出
         self.fails("不是命令")            # 未知命令报错退出
 
-    # README：所有命令可加 --out / --host / --db 指定站点和库
-    def test_site_args_on_site_commands(self):
+    # 所有操作命令可加 --db 指定任务库（覆盖 [paths].db）；没有 --out/--host 了
+    def test_db_arg_on_commands(self):
         for name in ("import", "run", "produce", "download", "status", "inspect", "retry", "export"):
             argv = [name] + (["--urls", "x.txt"] if name == "import" else
                              ["--status", "failed"] if name == "retry" else [])
-            ns = self.parse(*argv, "--out", "o", "--host", "h", "--db", "d.db")
-            self.assertEqual((ns.out, ns.host, ns.db), ("o", "h", "d.db"), name)
-        # turnstile 不是站点命令，没有 --out
-        self.fails("turnstile", "--out", "o")
+            self.assertEqual(self.parse(*argv, "--db", "d.db").db, "d.db", name)
+        self.assertEqual(self.parse("run", "--storage", "/mnt/x").storage, "/mnt/x")   # run/download 另有 --storage
+        self.fails("status", "--out", "o")        # --out 已移除
+        self.fails("import", "--host", "h")       # --host 已移除
 
     # README import 行：--urls 必填；--type 为 pdf|html 默认 pdf
     def test_import(self):
@@ -1189,17 +1248,17 @@ class CliArgsTest(unittest.TestCase):
     def test_run_config_file_positional(self):
         self.assertEqual(self.parse("run", "config.toml").config_file, "config.toml")
 
-    # 默认模式统一为 curl：run 子命令不带标志、[run] 省略 mode 都是 curl
-    def test_default_mode_is_curl(self):
+    # 默认模式 browser：run 子命令不带标志、[run] 省略 mode 都走浏览器
+    def test_default_mode_is_browser(self):
         from paperlite.config import RunConfig
         from paperlite.cli import _configured_run_args
         import argparse
-        self.assertEqual(RunConfig().mode, "curl")
+        self.assertEqual(RunConfig().mode, "browser")
         ns = self.parse("run")
-        self.assertFalse(ns.curl or ns.browser)               # run 分发时无标志即走 curl 分支
+        self.assertFalse(ns.curl or ns.browser)               # 无标志；分发按 "not --curl" → 浏览器分支
         mapped = _configured_run_args(argparse.Namespace(config=None, log_level="INFO"),
                                       RunConfig(command="run"))
-        self.assertTrue(mapped.curl and not mapped.browser)   # [run] 省略 mode → curl
+        self.assertTrue(mapped.browser and not mapped.curl)   # [run] 省略 mode → browser
 
     # README：produce 常驻，--keep 覆盖 min_identities
     def test_produce(self):
@@ -1250,3 +1309,79 @@ class CliArgsTest(unittest.TestCase):
     def test_init(self):
         self.assertFalse(self.parse("init").force)
         self.assertTrue(self.parse("init", "--force").force)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 代理分层体检：经代理探判定目标（curl 低层，拿 TCP/TLS/TTFB/总耗时四段），要求
+# 连通+TLS+2xx → 回显出口 IP == proxy_ip → 延迟不超阈值；两个目标任一通过即合格。
+# 用 mock _probe 测决策逻辑，不走真实网络。
+# ──────────────────────────────────────────────────────────────────────────
+class ProxyCheckTest(unittest.TestCase):
+    def _src(self, **kw):
+        from paperlite.proxy import IpSource
+        return IpSource(ProxySettings(api_url="https://api/x", **kw))
+
+    def _lease(self, ip="1.2.3.4"):
+        from paperlite.proxy import Lease
+        return Lease(server="1.2.3.4:8000", exit_ip=ip, area="", expires_at=time.time() + 600)
+
+    def _ok(self, egress="1.2.3.4", total_ms=500.0, status=200):
+        from paperlite.proxy import ProbeResult
+        return ProbeResult(ok=True, status=status, tcp_ms=30, tls_ms=200, ttfb_ms=total_ms * 0.8,
+                           total_ms=total_ms, egress=egress)
+
+    def _fail(self, error="CurlError: connect"):
+        from paperlite.proxy import ProbeResult
+        return ProbeResult(ok=False, error=error)
+
+    def test_extract_ip(self):
+        from paperlite.proxy import _extract_ip
+        self.assertEqual(_extract_ip("fl=1f\nip=203.0.113.7\nts=1.2"), "203.0.113.7")   # cloudflare trace
+        self.assertEqual(_extract_ip('{\n  "origin": "203.0.113.7"\n}'), "203.0.113.7")  # httpbin/ip
+        self.assertEqual(_extract_ip("no ip here"), "")
+
+    def test_passes_on_first_good_judge(self):
+        src = self._src()
+        with mock.patch.object(src, "_probe", return_value=self._ok("1.2.3.4")) as probe:
+            self.assertTrue(src._check(self._lease("1.2.3.4")))
+            self.assertEqual(probe.call_count, 1)            # 首个目标就过，不再探第二个
+
+    def test_connect_fail_rejected(self):
+        src = self._src()
+        with mock.patch.object(src, "_probe", return_value=self._fail()) as probe:
+            self.assertFalse(src._check(self._lease()))
+            self.assertEqual(probe.call_count, 2)            # 两个目标都探过才判死
+
+    def test_bad_status_rejected(self):
+        src = self._src()
+        with mock.patch.object(src, "_probe", return_value=self._ok(status=403)):
+            self.assertFalse(src._check(self._lease("1.2.3.4")))
+
+    def test_exit_ip_mismatch_rejected(self):
+        src = self._src()
+        with mock.patch.object(src, "_probe", return_value=self._ok(egress="9.9.9.9")):
+            self.assertFalse(src._check(self._lease("1.2.3.4")))   # 回显出口≠proxy_ip
+
+    def test_latency_gate_rejects_slow(self):
+        src = self._src(check_max_latency_ms=1000)
+        with mock.patch.object(src, "_probe", return_value=self._ok(total_ms=2000)):
+            self.assertFalse(src._check(self._lease("1.2.3.4")))   # 两目标都超阈值
+
+    def test_second_judge_denoise(self):
+        src = self._src()
+        with mock.patch.object(src, "_probe", side_effect=[self._fail(), self._ok("1.2.3.4")]):
+            self.assertTrue(src._check(self._lease("1.2.3.4")))    # 首个目标挂、备用好 → 整体通过
+
+    def test_ip_verify_skipped_when_unparsed(self):
+        src = self._src()                                    # verify_exit_ip 默认 True
+        with mock.patch.object(src, "_probe", return_value=self._ok(egress="")):
+            self.assertTrue(src._check(self._lease("1.2.3.4")))    # 抠不出回显 IP 时不因此误杀
+
+    def test_extract_checked_retries_then_raises(self):
+        from paperlite.proxy import ProxyUnavailable
+        src = self._src(check_max_tries=3)
+        with mock.patch.object(src, "_extract", return_value=self._lease()), \
+             mock.patch.object(src, "_check", return_value=False) as chk:
+            with self.assertRaises(ProxyUnavailable):
+                src.extract_checked()
+            self.assertEqual(chk.call_count, 3)              # 连续 3 个不过才放弃

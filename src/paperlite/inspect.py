@@ -46,9 +46,16 @@ def _lcp(xs: list[str]) -> str:
     return s
 
 
+_MAX_COARSEN = 3      # 粗化最多剥掉的末尾数字/校验位长度；更长说明剥的是完整识别码，不粗化
+
+
 def _coarsen(prefix: str) -> str:
-    """去掉前缀末尾的数字/校验位，得到更宽的候选（卷/刊级）。"""
-    return re.sub(r"[0-9xX]+$", "", prefix)
+    """去掉前缀末尾**很短**的数字/校验位，得到略宽的候选（卷/刊级）。
+    末尾数字串超过 _MAX_COARSEN 位＝完整识别码，不粗化——否则会退化成 `.../pii/S` 这种匹配整站的宽前缀。"""
+    m = re.search(r"[0-9xX]+$", prefix)
+    if not m or len(m.group()) > _MAX_COARSEN:
+        return prefix
+    return prefix[:m.start()]
 
 
 def _candidates(samples: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -70,7 +77,8 @@ def _matches(doi: str, url: str, dp: str, up: str) -> bool:
 
 
 class WindowInspector:
-    """浏览器采集用的增量巡检器，只观察本次进程最近 ``window_size`` 条成功结果。
+    """浏览器采集用的增量巡检器，观察本次进程最近 ``window_size`` 条**已加载页面**的标题
+    （成功页和 404 等失效页都算——DOI 唯一却得到相同标题，基本就是整批失效或整批封面）。
 
     每条结果只进入内存一次；标题达到阈值后，有新的同标题样本才重新评估。已经生成过的
     规则不会重复写入，但新样本确实跨越卷期时允许归纳出更宽的新规则。
@@ -93,7 +101,7 @@ class WindowInspector:
         self._lock = threading.Lock()
 
     def observe(self, doi: str, url: str, title: str) -> tuple[int, int]:
-        """加入一条刚成功的结果；返回本次新增的 ``(规则数, 标记数)``。"""
+        """加入一条刚加载出来的页面（成功或失效页）；返回本次新增的 ``(规则数, 标记数)``。"""
         nt = norm_title(title)
         if not nt:
             return 0, 0
@@ -126,7 +134,7 @@ class WindowInspector:
             pending = self.db.count_pending_matching(dp, up)
             if pending == 0:
                 continue
-            key = (pending, support)
+            key = (len(dp) + len(up), pending, support)   # 偏最具体：宁可少跳、分批触发，也不误标未采的活任务
             if best is None or key > best[0]:
                 best = (key, support, precision, dp, up)
         if best is None:
@@ -139,7 +147,7 @@ class WindowInspector:
             return 0, 0
         self._applied_rules.add((dp, up))
         logger.info("巡检窗口：标题重复 %d 次（%r）→ 规则 doi~%r url~%r"
-                    "（precision %.3f，窗口命中 %d）→ 标记 %d 条疑似封面，不再采",
+                    "（precision %.3f，窗口命中 %d）→ 标记 %d 条疑似失效/封面，不再采",
                     len(samples), original[:40], dp, up, precision, support, flagged)
         return 1, flagged
 
@@ -177,7 +185,7 @@ def inspect(db, trigger: int = 10, min_precision: float = 0.98, min_support: int
             pend = db.count_pending_matching(dp, up)
             if pend == 0:
                 continue
-            key = (pend, support)
+            key = (len(dp) + len(up), pend, support)   # 偏最具体：宁可少跳、分批触发，也不误标未采的活任务
             if best is None or key > best[0]:
                 best = (key, support, precision, dp, up)
         if best:
@@ -187,6 +195,6 @@ def inspect(db, trigger: int = 10, min_precision: float = 0.98, min_support: int
                 rules += 1
                 flagged += n
                 logger.info("巡检：标题重复 %d 次（%r）→ 规则 doi~%r url~%r（precision %.3f，已采命中 %d）"
-                            "→ 标记 %d 条疑似封面，不再采",
+                            "→ 标记 %d 条疑似失效/封面，不再采",
                             len(by_title[nt]), orig[nt][:40], dp, up, precision, support, n)
     return rules, flagged

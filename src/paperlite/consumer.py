@@ -44,7 +44,7 @@ import certifi
 from curl_cffi import requests as curl_requests
 
 from paperlite.classify import classify_html, page_title
-from paperlite.config import PoolConfig
+from paperlite.config import Limits
 from paperlite.proxy import ProxySettings
 from paperlite.store import Identity, IdentityStore
 from paperlite.tasks import Status, Task, TaskDB, UrlType, pdf_path, url_host
@@ -141,7 +141,7 @@ class DownloadStats:
 
 
 class Downloader:
-    def __init__(self, cfg: PoolConfig, store: IdentityStore, proxy: ProxySettings, db: TaskDB,
+    def __init__(self, cfg: Limits, store: IdentityStore, proxy: ProxySettings, db: TaskDB,
                  out_dir: Path, workers: int) -> None:
         self.cfg, self.store, self.proxy, self.db = cfg, store, proxy, db
         self.host = db.host()

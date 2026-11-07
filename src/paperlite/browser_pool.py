@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from paperlite.browser import BrowserSession
-from paperlite.config import PoolConfig
+from paperlite.config import Limits
 from paperlite.inspect import WindowInspector
 from paperlite.logutil import log_event
 from paperlite.proxy import IpSource, Lease, ProxySettings, ProxyUnavailable
@@ -48,7 +48,7 @@ class BrowserStats:
 class BrowserPool:
     """N 个 worker 协程并发，每个 worker 独占一个 浏览器+IP，串行领取任务下载。"""
 
-    def __init__(self, cfg: PoolConfig, proxy: Optional[ProxySettings], db: TaskDB, out: Path, workers: int,
+    def __init__(self, cfg: Limits, proxy: Optional[ProxySettings], db: TaskDB, out: Path, workers: int,
                  no_proxy: bool = False) -> None:
         if workers > cfg.max_browsers:
             logger.info("worker 数 %d 超过 max_browsers %d，按 %d 运行", workers, cfg.max_browsers, cfg.max_browsers)
@@ -167,6 +167,12 @@ class BrowserPool:
             return session, lease
         return None, None
 
+    async def _observe(self, task: Task, r) -> None:
+        """把真正加载出来的页面标题喂给巡检器——成功页和 404 等失效页都算（DOI 唯一却同标题
+        ≈ 整批失效或整批封面）。只排除 r.ok=False 的挑战/超时页（标题是瞬时的 'Just a moment'）。"""
+        if self.inspector is not None and r.title:
+            await asyncio.to_thread(self.inspector.observe, task.doi, task.url, r.title)
+
     async def _do_task(self, task: Task, session: BrowserSession, lease: Lease, name: str) -> None:
         t0 = time.monotonic()
         r = await session.render(task.url, self.cfg.pass_timeout_s)
@@ -188,6 +194,7 @@ class BrowserPool:
             await asyncio.to_thread(self.db.finish, task, Status.FAILED, http_status=code, elapsed_ms=elapsed,
                                     exit_ip=lease.exit_ip, error_kind=kind, error_message=f"HTTP {code}",
                                     final_url=r.url or None, title=r.title or None)
+            await self._observe(task, r)      # 失效页也进巡检：整批 404 同标题可归纳规则、跳过其余 pending
             self.stats.add("failed")
             logger.info("网页 HTTP %d %s %s", code, task.url, r.title)
             return
@@ -203,8 +210,7 @@ class BrowserPool:
         await asyncio.to_thread(self.db.finish, task, Status.SUCCESS, http_status=code, file_path=str(dest),
                                 file_size=len(body), elapsed_ms=elapsed, exit_ip=lease.exit_ip,
                                 title=r.title or None, final_url=r.url or None)
-        if self.inspector is not None:
-            await asyncio.to_thread(self.inspector.observe, task.doi, task.url, r.title)
+        await self._observe(task, r)
         self.stats.add("success")
         self.stats.add("pages")
         log_event(logger, logging.INFO, "page_saved", "页面保存成功",

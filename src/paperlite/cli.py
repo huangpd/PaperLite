@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PaperLite 命令行。一个站点（主机）一个输出目录，默认 <out_root>/<主机>（out_root 默认 pdfs），任务库是其中的 tasks.db。
-生产与消费可以分开跑（不同进程，只共享 Redis），也可以 run 一起跑。
+PaperLite 命令行。一份 config = 一个批次：各种主机的 URL 混着导进**一个任务库**，默认用**浏览器模式**统一跑。
+位置在 [paths] 里定义：db（任务库，本地盘）、storage（输出 PDF/HTML，可挂载），两者相互独立。
 
   paperlite init                                    # 在当前目录生成 config.toml 模板
-  paperlite import   --urls acm.txt                 # 导入任务（txt 一行一个，或带 url 列的 CSV）→ pdfs/dl.acm.org/
+  paperlite import   --urls mixed.csv               # 导入任务（txt 一行一个，或带 url 列的 CSV），多主机随便混
   paperlite import   --urls pages.txt --type html   # 要网页本身（存 .html），数据库 url_type = html
-  paperlite run      --workers 20                   # 同进程生产 + 消费，下载完退出
-  paperlite produce                                 # 只生产身份，常驻
-  paperlite download --workers 20                   # 只消费（需有生产者在跑）
-  paperlite status                                  # 任务统计 + 身份池
+  paperlite run config.toml                         # 按 [run] 启动（默认浏览器模式），下载完退出
+  paperlite run      --workers 20                   # 命令行临时跑（默认浏览器；--curl 走单主机 cookie 池）
+  paperlite status                                  # 任务统计（+ curl 模式下的身份池）
   paperlite retry    --status failed                # 把失败的重置为 pending
   paperlite export   --status non_pdf > non_pdf.csv
   paperlite turnstile --url <页面> --sitekey <key>  # 取 Turnstile token；--serve 8191 起 HTTP 服务
 
-站点：--out > --host / --urls 的主机 / --db 记录的主机 → <out_root>/<主机> > out_root 下唯一的站点；多个站点时须指定。
-任务库：--db > 配置 [pool] db_dir > <输出目录>/tasks.db（PDF 输出到 goofys / s3fs 这类对象存储挂载时，
-任务库必须放本地盘：SQLite 要随机写、文件锁和 mmap，FUSE 挂载不支持）。
+位置：任务库 = --db > [paths].db；输出目录 = --storage > [paths].storage。
+db 必须本地盘（SQLite 要随机写/文件锁/mmap，FUSE 挂载不支持）；storage 可放 goofys/s3fs 等对象存储挂载。
 
 配置查找顺序：--config > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml（paperlite init 生成）。
 也可以 python -m paperlite ...。
@@ -38,7 +36,7 @@ from pathlib import Path
 
 from paperlite import __version__
 from paperlite import config as config_mod
-from paperlite.config import PoolConfig, RunConfig
+from paperlite.config import Limits, Paths, RunConfig
 from paperlite.browser_pool import BrowserPool
 from paperlite.consumer import Downloader
 from paperlite import logutil
@@ -46,24 +44,24 @@ from paperlite.logutil import setup_logging
 from paperlite.producer import Producer
 from paperlite.proxy import IpSource, ProxySettings
 from paperlite.store import IdentityStore
-from paperlite.tasks import ERROR_KINDS, Status, TaskDB, UrlType, url_host
+from paperlite.tasks import ERROR_KINDS, Status, TaskDB, UrlType
 
 logger = logging.getLogger("paperlite")
 
 
 def _configured_run_args(args, run: RunConfig, config: str | None = None):
-    """把 [run] 转成与 ``paperlite run ...`` 相同的 argparse 参数。"""
+    """把 [run] 转成与 ``paperlite run ...`` 相同的 argparse 参数（db/storage 仍从 [paths] 取）。"""
     return argparse.Namespace(
         cmd="run", config=config if config is not None else args.config,
         log_level=args.log_level, log_format=getattr(args, "log_format", "auto"),
-        out=run.out or None, host=run.host or None, db=run.db or None,
+        db=None, storage=None,
         urls=run.urls or None, type=run.url_type, workers=run.workers,
         curl=run.mode == "curl", browser=run.mode == "browser",
         no_proxy=not run.proxy, headed=run.headed,
     )
 
 
-def _load(path: str | None) -> tuple[PoolConfig, ProxySettings]:
+def _load(path: str | None) -> tuple[Limits, ProxySettings]:
     try:
         return config_mod.load(config_mod.resolve_path(path))
     except FileNotFoundError as e:
@@ -72,54 +70,40 @@ def _load(path: str | None) -> tuple[PoolConfig, ProxySettings]:
         raise SystemExit(f"配置错误: {e}")
 
 
-def _pool_cfg(args) -> PoolConfig:
-    """只读 [pool]（out_root / db_dir 等）；没有配置文件时用默认值，import / status / retry / export 不必有代理配置。"""
+def _limits(args) -> Limits:
+    """只读 [limits]；没有配置文件时用默认值（import / status / retry / export 不必有代理配置）。"""
     try:
-        return config_mod.load_pool(config_mod.resolve_path(args.config))
+        return config_mod.load_limits(config_mod.resolve_path(args.config))
     except FileNotFoundError:
-        return PoolConfig()
+        return Limits()
     except (TypeError, ValueError) as e:
         raise SystemExit(f"配置错误: {e}")
 
 
-def _host_from_urls(path: str | None) -> str | None:
-    if not path:
-        return None
-    first = next(iter(_read_url_file(path)), None)
-    return url_host(first.get("url") or first.get("pdf_url") or "") if first else None
+def _paths(args) -> Paths:
+    """[paths]：db / storage / log_dir；没有配置文件时用默认值。"""
+    try:
+        return config_mod.load_paths(config_mod.resolve_path(args.config))
+    except FileNotFoundError:
+        return Paths()
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"配置错误: {e}")
 
 
-def _resolve_out(args, pool: PoolConfig) -> Path:
-    """站点输出目录：--out > --host / --urls / --db 的主机 → <out_root>/<主机> > out_root 下唯一的站点。"""
-    if getattr(args, "out", None):
-        return Path(args.out).expanduser()
-    host = getattr(args, "host", None) or _host_from_urls(getattr(args, "urls", None))
-    if not host and getattr(args, "db", None) and Path(args.db).expanduser().exists():
-        db = TaskDB(Path(args.db).expanduser())
-        host = db.host()
-        db.close()
-    root = Path(pool.out_root).expanduser()
-    if host:
-        return root / host
-    sites = sorted(d.name for d in root.iterdir() if d.is_dir()) if root.is_dir() else []
-    if len(sites) == 1:
-        return root / sites[0]
-    if not sites:
-        raise SystemExit(f"{root.resolve()} 下还没有站点：先 import --urls <文件>，或用 --out 指定输出目录")
-    raise SystemExit(f"{root.resolve()} 下有多个站点：{', '.join(sites)}；用 --host 或 --out 指定")
+def _db_file(args, paths: Paths) -> Path:
+    return Path(args.db).expanduser() if getattr(args, "db", None) else paths.db_path
 
 
-def _open_site(args, create: bool = False) -> tuple[Path, TaskDB]:
-    """返回 (输出目录, 任务库)。create=True（import / download / run）时建好输出目录。"""
-    pool = _pool_cfg(args)
-    out = _resolve_out(args, pool)
-    path = config_mod.task_db_path(str(out), getattr(args, "db", None), pool.db_dir)
-    if create:
-        out.mkdir(parents=True, exist_ok=True)
-    elif not path.exists():
-        raise SystemExit(f"任务库不存在: {path}（输出目录 {out}）；先 import，或检查 --out / --db / db_dir")
-    logger.debug("输出目录 %s，任务库 %s", out, path)
-    return out, TaskDB(path)
+def _storage_dir(args, paths: Paths) -> Path:
+    return Path(args.storage).expanduser() if getattr(args, "storage", None) else paths.storage_path
+
+
+def _open_db(args, create: bool = False) -> TaskDB:
+    """打开任务库（位置：--db > [paths].db）。create=False 且文件不存在就报错。"""
+    db = _db_file(args, _paths(args))
+    if not create and not db.exists():
+        raise SystemExit(f"任务库不存在: {db}（先 import，或用 --db 指定）")
+    return TaskDB(db)
 
 
 def _read_url_file(path: str):
@@ -167,14 +151,15 @@ class _ProducerThread:
 
 
 def _download(args, cfg, proxy, store, with_producer: bool) -> None:
-    out, db = _open_site(args, create=True)
+    db = _open_db(args, create=True)
     if args.urls:
         _import(db, args.urls, url_type=args.type)
     hs = db.hosts()
     if len(hs) > 1:
         db.close()
-        raise SystemExit(f"curl 模式（run / download / produce）需单主机，本库有 {len(hs)} 个：{'、'.join(hs[:5])}。"
-                         f"混合主机请用 paperlite run --browser")
+        raise SystemExit(f"curl 模式需单主机，本库有 {len(hs)} 个：{'、'.join(hs[:5])}。"
+                         f"混多主机请去掉 --curl 用浏览器模式")
+    out = _storage_dir(args, _paths(args))
     try:
         reclaimed = db.lock_for_download()
     except RuntimeError as e:
@@ -210,7 +195,7 @@ def _download(args, cfg, proxy, store, with_producer: bool) -> None:
                 s.non_pdf, s.failed, s.identities, s.rejected, s.challenged, s.volumes_stopped, s.inferred)
 
 
-def _report(dl: Downloader, store: IdentityStore, cfg: PoolConfig, stop: threading.Event) -> None:
+def _report(dl: Downloader, store: IdentityStore, cfg: Limits, stop: threading.Event) -> None:
     """每 30s 一行。速度按"已处理"（PDF + non_pdf + failed）算：non_pdf 成片时只看 PDF 数会误以为变慢。"""
     s = dl.stats
     last_done, last_pdf, last_t = 0, 0, time.monotonic()
@@ -228,29 +213,21 @@ def _report(dl: Downloader, store: IdentityStore, cfg: PoolConfig, stop: threadi
 
 
 def _status(args, cfg) -> None:
-    host = args.host
-    try:
-        _, db = _open_site(args)
-    except SystemExit as e:
-        if not host:                      # 只给了 --host 而本地没有这个站点的任务库：只看身份池
-            raise
-        print(e)
-        db = None
-    if db is not None:
-        host = host or db.host()
-        c = db.counts()
-        print(f"任务库 {db.path}（{host or '空'}）: 共 {sum(c.values())}  " +
-              "  ".join(f"{s} {c[s]}" for s in Status.ALL))
-        types = db.type_counts()
-        if len(types) > 1 or UrlType.PDF not in types:
-            for t, tc in sorted(types.items()):
-                print(f"  [{t}] 共 {sum(tc.values())}  " + "  ".join(f"{s} {tc[s]}" for s in Status.ALL if tc[s]))
-        for status, kind, n, inferred in db.kind_counts():
-            print(f"  {status:8s} {kind or '-':16s} {n}" + (f"（其中按卷期推断 {inferred}）" if inferred else ""))
-        v, n = db.volume_summary()
-        if v:
-            print(f"  按卷期停掉 {v} 个卷期，{n} 篇未请求（retry --stopped-volumes 可重新核实）")
-        db.close()
+    db = _open_db(args)
+    host = db.host()
+    c = db.counts()
+    print(f"任务库 {db.path}（{host or '空'}）: 共 {sum(c.values())}  " +
+          "  ".join(f"{s} {c[s]}" for s in Status.ALL))
+    types = db.type_counts()
+    if len(types) > 1 or UrlType.PDF not in types:
+        for t, tc in sorted(types.items()):
+            print(f"  [{t}] 共 {sum(tc.values())}  " + "  ".join(f"{s} {tc[s]}" for s in Status.ALL if tc[s]))
+    for status, kind, n, inferred in db.kind_counts():
+        print(f"  {status:8s} {kind or '-':16s} {n}" + (f"（其中按卷期推断 {inferred}）" if inferred else ""))
+    v, n = db.volume_summary()
+    if v:
+        print(f"  按卷期停掉 {v} 个卷期，{n} 篇未请求（retry --stopped-volumes 可重新核实）")
+    db.close()
     if not host:
         return
     try:
@@ -268,7 +245,7 @@ def _status(args, cfg) -> None:
 
 
 def _export(args) -> None:
-    _, db = _open_site(args)
+    db = _open_db(args)
     rows = db.rows(args.status)
     out = open(args.file, "w", newline="", encoding="utf-8") if args.file != "-" else sys.stdout
     w = csv.writer(out)
@@ -309,9 +286,10 @@ def _turnstile(args, parser) -> None:
 
 def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
     """浏览器下载模式：每个浏览器+IP 过盾一次后连续下同域名多篇（整页存 .html）。不用 Redis 身份池。"""
-    out, db = _open_site(args, create=True)
+    db = _open_db(args, create=True)
     if args.urls:
         _import(db, args.urls, url_type=args.type)
+    out = _storage_dir(args, _paths(args))
     try:
         reclaimed = db.lock_for_download()
     except RuntimeError as e:
@@ -347,8 +325,8 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
 
 def _inspect(args) -> None:
     """巡检：同标题重复到阈值就归纳 doi/url 规则、标记疑似封面的未采任务。"""
-    cfg = _pool_cfg(args)
-    _, db = _open_site(args)
+    cfg = _limits(args)
+    db = _open_db(args)
     try:
         if args.reset:
             print(f"已清除 {db.clear_suspects()} 条 suspect_cover 标记与全部规则，放回可采")
@@ -372,7 +350,7 @@ def _inspect(args) -> None:
         db.close()
 
 
-def _browse_report(pool: BrowserPool, cfg: PoolConfig, stop: threading.Event) -> None:
+def _browse_report(pool: BrowserPool, cfg: Limits, stop: threading.Event) -> None:
     s = pool.stats
     last_done, last_t = 0, time.monotonic()
     while not stop.wait(30):
@@ -393,25 +371,25 @@ def _raise_interrupt(signum, frame):
 _COMMANDS = {
     "init": "在当前目录生成配置模板 config.toml",
     "import": "导入任务（txt 一行一个链接，或带 url 列的 CSV）",
-    "run": "下载，下载完退出。默认 curl 模式（单主机）；--browser 走浏览器模式（可多主机、跟跳转）",
-    "produce": "只生产身份，常驻",
+    "run": "下载，下载完退出。默认浏览器模式（各种主机混着跑、跟跳转）；--curl 走单主机 cookie 池",
+    "produce": "只生产身份（curl 模式），常驻",
     "download": "只下载（curl 模式），需有生产者在跑",
-    "status": "任务统计、失败分类、身份池",
-    "inspect": "巡检：同标题重复到阈值就归纳 doi/url 规则，标记疑似封面的未采任务（不再采）",
+    "status": "任务统计、失败分类（curl 模式下含身份池）",
+    "inspect": "巡检：同标题重复到阈值就归纳 doi/url 规则，标记疑似失效/封面的未采任务（不再采）",
     "retry": "把 failed / non_pdf 的任务重置为 pending",
     "export": "导出任务为 CSV",
     "turnstile": "按 URL + sitekey 取 Cloudflare Turnstile token（--serve 起 HTTP 服务）",
     "help": "显示某个命令的帮助",
 }
 
-_DESCRIPTION = "浏览器过盾 cookie 池 + curl_cffi，单站点大批量下载 PDF\n\n命令:\n" + \
+_DESCRIPTION = "大批量下载 PDF/网页（过 Cloudflare）：各种主机混进一个库，默认浏览器模式统一跑\n\n命令:\n" + \
     "\n".join(f"  {k:<10}{v}" for k, v in _COMMANDS.items())
 
 _EPILOG = """示例:
-  paperlite init                         # 生成 config.toml，填好代理
-  paperlite import --urls acm.txt        # 导入 → pdfs/dl.acm.org/
-  paperlite run --workers 20             # curl 模式开跑（单主机），Ctrl+C 随时停，再执行从断点继续
-  paperlite run --browser --urls x.csv   # 浏览器模式：可混多主机、跟跳转、整页存 .html（加 --no-proxy 本地直连）
+  paperlite init                         # 生成 config.toml，填好 [proxy] 和 [paths]
+  paperlite import --urls mixed.csv      # 导入（多主机随便混）到 [paths].db
+  paperlite run config.toml              # 按 [run] 启动（默认浏览器模式），Ctrl+C 随时停，再执行从断点继续
+  paperlite run --workers 20             # 命令行临时跑（默认浏览器；--curl 走单主机 cookie 池）
   paperlite status
 
 用 paperlite help <命令> 查看某个命令的参数。"""
@@ -459,17 +437,13 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
                                     description=_COMMANDS[name])
         return parsers[name]
 
-    def site_args(p, out_required: bool = False):
-        p.add_argument("--out", required=out_required,
-                       help="站点输出目录（PDF、non_pdf/；默认 <out_root>/<主机>，见配置 out_root）")
-        p.add_argument("--host", help="站点主机，如 dl.acm.org（输出目录取 <out_root>/<主机>）")
-        p.add_argument("--db", help="任务库路径（优先于配置 db_dir；默认 <输出目录>/tasks.db）；"
-                                    "输出目录在 goofys 等对象存储挂载上时须在本地盘")
+    def site_args(p):
+        p.add_argument("--db", help="任务库文件（覆盖 [paths].db）；必须本地盘")
 
     p = cmd("init")
     p.add_argument("--force", action="store_true", help="已存在也覆盖")
     p = cmd("import")
-    p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 url 列的 CSV；须同一主机")
+    p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 url 列的 CSV；多主机可混")
     site_args(p)
     p.add_argument("--source", default="", help="写入 source")
     p.add_argument("--batch", default="", help="写入 batch_no")
@@ -480,6 +454,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
                                             "下载前一两分钟先启动可省掉冷启动的过盾等待")
     p = cmd("download")
     site_args(p)
+    p.add_argument("--storage", help="输出目录 PDF/HTML（覆盖 [paths].storage）；可挂载")
     p.add_argument("--urls", help="先导入这个文件（可选）")
     p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
     p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数，默认 20")
@@ -487,15 +462,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p.add_argument("config_file", nargs="?", metavar="[配置文件]",
                    help="给了就按它的 [run] 段启动（paperlite run config.toml），其余 run 参数忽略；省略则用下面的参数临时跑")
     site_args(p)
+    p.add_argument("--storage", help="输出目录 PDF/HTML（覆盖 [paths].storage）；可挂载")
     p.add_argument("--urls", help="先导入这个文件（可选）")
     p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
     p.add_argument("--workers", type=int, default=20,
-                   help="并发数：curl 模式 = 下载线程/身份数；--browser 模式 = 同时打开的浏览器数。默认 20（浏览器模式建议调小）")
+                   help="并发数：浏览器模式 = 同时打开的浏览器数；--curl 模式 = 下载线程/身份数。默认 20")
     g = p.add_mutually_exclusive_group()
-    g.add_argument("--curl", action="store_true", help="curl 模式（默认）：浏览器过盾存 cookie、curl 批量下，省资源；须单主机")
-    g.add_argument("--browser", action="store_true", help="浏览器模式：每浏览器+IP 过盾一次后连续下同域名多篇、整页存 .html；可混多主机、能跟跳转")
-    p.add_argument("--no-proxy", action="store_true", help="仅 --browser：直连本机 IP、不取代理（本地测试，无需代理配置）")
-    p.add_argument("--headed", action="store_true", help="仅 --browser：有界面运行（调试）")
+    g.add_argument("--browser", action="store_true", help="浏览器模式（默认）：每浏览器+IP 过盾一次后连续下、整页存 .html；可混多主机、能跟跳转")
+    g.add_argument("--curl", action="store_true", help="curl 模式：浏览器过盾存 cookie、curl 批量下，省资源；须单主机")
+    p.add_argument("--no-proxy", action="store_true", help="仅浏览器模式：直连本机 IP、不取代理（本地测试，无需代理配置）")
+    p.add_argument("--headed", action="store_true", help="仅浏览器模式：有界面运行（调试）")
     p = cmd("status")
     site_args(p)
     p = cmd("inspect")
@@ -536,10 +512,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
 def main() -> None:
     ap, parsers = _build_parser()
     args = ap.parse_args()
-    pool_for_logging = None
     if args.cmd is None:
         try:
-            pool_for_logging, run = config_mod.load_run(config_mod.resolve_path(args.config))
+            run = config_mod.load_run(config_mod.resolve_path(args.config))
         except FileNotFoundError:
             ap.print_help()
             return
@@ -551,7 +526,7 @@ def main() -> None:
         args = _configured_run_args(args, run)
     elif args.cmd == "run" and args.config_file:          # paperlite run config.toml
         try:
-            pool_for_logging, run = config_mod.load_run(config_mod.resolve_path(args.config_file))
+            run = config_mod.load_run(config_mod.resolve_path(args.config_file))
         except FileNotFoundError as e:
             raise SystemExit(str(e))
         except (TypeError, ValueError) as e:
@@ -561,8 +536,7 @@ def main() -> None:
         (parsers[args.command] if args.command else ap).print_help()
         return
 
-    pool_for_logging = pool_for_logging or _pool_cfg(args)
-    log_path = setup_logging(args.log_level, pool_for_logging.log_dir, stderr=args.cmd == "export",
+    log_path = setup_logging(args.log_level, _paths(args).log_dir, stderr=args.cmd == "export",
                              fmt=getattr(args, "log_format", "auto"))
     for noisy in ("asyncio", "curl_cffi"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -580,16 +554,16 @@ def main() -> None:
             config_mod.write_example(path, args.force)
         except FileExistsError as e:
             sys.exit(str(e))
-        logger.info("已生成 %s：填好 [proxy] 的提取接口和代理账号密码再用", path.resolve())
+        logger.info("已生成 %s：填好 [proxy] 的接口和代理账号密码、[paths] 的 db/storage 再用", path.resolve())
         return
     if args.cmd == "import":
-        out, db = _open_site(args, create=True)
+        db = _open_db(args, create=True)
         _import(db, args.urls, args.source, args.batch, args.type)
-        logger.info("输出目录 %s，任务库 %s", out, db.path)
+        logger.info("任务库 %s", db.path)
         db.close()
         return
     if args.cmd == "retry":
-        _, db = _open_site(args)
+        db = _open_db(args)
         if args.stopped_volumes:
             v, n = db.reset_stopped_volumes()
             print(f"已重置 {v} 个被停卷期的 {n} 个任务为 pending")
@@ -604,9 +578,9 @@ def main() -> None:
         _turnstile(args, parsers["turnstile"])
         return
 
-    if args.cmd == "run" and args.browser:          # 浏览器模式
+    if args.cmd == "run" and not args.curl:         # 浏览器模式（默认）
         if args.no_proxy:
-            cfg = _pool_cfg(args)
+            cfg = _limits(args)
             proxy = None
         else:
             cfg, proxy = _load(args.config)
@@ -618,22 +592,19 @@ def main() -> None:
     if args.cmd == "inspect":
         _inspect(args)
         return
-
-    cfg, proxy = _load(args.config)
     if args.cmd == "status":
-        _status(args, cfg)
+        _status(args, _limits(args))
         return
 
+    cfg, proxy = _load(args.config)                 # produce / download / run --curl
     store = IdentityStore(cfg.redis_url, cfg.key_prefix)
     store.ping()
     if args.cmd == "produce":
-        host = args.host
+        db = _open_db(args)
+        host = db.host()
+        db.close()
         if not host:
-            _, db = _open_site(args)
-            host = db.host()
-            db.close()
-            if not host:
-                raise SystemExit("任务库是空的，先 import")
+            raise SystemExit("任务库是空的，先 import")
         if args.keep is not None:
             cfg = dataclasses.replace(cfg, min_identities=args.keep)
         producer = _ProducerThread(cfg, store, proxy, host)

@@ -1,5 +1,5 @@
 # PaperLite 配置。paperlite init 生成为 ./config.toml 再填写（在当前目录运行时自动读取；别处运行用 --config 或 PAPERLITE_CONFIG）。
-# config.toml 含代理密码，不要提交、不要同步到别处公开。
+# 一份 config = 一个批次：各种主机的 URL 混着导进一个库，默认浏览器模式统一跑。config.toml 含代理密码，不要提交、不要公开同步。
 
 [proxy]
 api_url = ""                  # 短效代理提取接口（每次返回一个 IP，青果格式 JSON），必填
@@ -7,46 +7,49 @@ scheme = "http"
 username = ""
 password = ""
 lease_s = 600                 # 单个 IP 最长使用时间（秒），与接口返回的 deadline 取较早者
-check_url = "https://www.cloudflare.com/cdn-cgi/trace"   # 新 IP 体检地址，收到任意 HTTP 响应即合格
+# 新 IP 分层体检：① TCP 连代理端口 → ② 经代理 GET 判定目标要 2xx → ③ 核对回显出口 IP == proxy_ip → ④ 往返延迟不超阈值
+check_url = "https://www.cloudflare.com/cdn-cgi/trace"   # 首选判定目标（回显出口 IP）
+check_url2 = "https://httpbin.org/ip"                    # 备用判定目标，去单点抖动；两者任一通过即合格
+connect_timeout_s = 3         # 先 TCP 连代理端口，连不上快速弃
+check_timeout_s = 10          # 单次体检 HTTP 请求超时
+check_max_latency_ms = 3000   # 体检往返延迟超过此值即弃（慢代理大概率过盾也慢）；0 关闭
+verify_exit_ip = true         # 核对回显出口 IP 是否等于 proxy_ip（证明真转发、非劫持/透明）
 
-[pool]
-redis_url = "redis://127.0.0.1:6379/0"
-out_root = "file"             # 默认输出根目录，站点目录为 <out_root>/<主机>
-db_dir = "db"                # 任务库目录（本地盘）。设置后任务库放这里：<目录>/<输出目录名>-<路径哈希>.db；
-                              # 留空则放输出目录里的 tasks.db。PDF 输出到 goofys 等挂载上时必须设置（或每次用 --db）
-log_dir = "log"               # 日志目录；非空时同时打印到终端并写入 .jsonl 日志文件
+[paths]                       # 位置：db 与 storage 相互独立
+db      = "tasks.db"          # 任务库（SQLite）。必须本地盘：要随机写/文件锁/mmap，goofys/s3fs 等 FUSE 挂载不支持
+storage = "/obs"              # 输出目录（PDF/HTML）。可放对象存储挂载（顺序写）
+log_dir = "log"               # 日志目录；非空时同时打印到终端并写入 .jsonl；留空则只打终端
+
+[limits]                      # 并发与行为（不含存储路径）
+# redis_url = "redis://127.0.0.1:6379/0"   # 仅 curl 模式用（浏览器模式不用 Redis）
 max_browsers = 20             # 同时运行的浏览器上限
-max_identities = 20           # 健康身份上限；实际按在线下载线程数生产
-min_identities = 0            # 没有下载线程时也保持的预热身份数
-refill_before_s = 90          # 身份剩余寿命低于此值就提前生产替补
+max_identities = 20           # curl 模式健康身份上限；实际按在线下载线程数生产
+min_identities = 0            # curl 模式没有下载线程时也保持的预热身份数
 pass_timeout_s = 90           # 单次过盾等待上限
 hedge_after_s = 45            # 过盾超过此时长还没成功，就另开一个浏览器补位（成功的多在 30s 内）
-debug_dir = ""                # 过盾失败截图目录，空则不截图
-max_fresh_rejects = 5         # 连续这么多个新身份一篇没下成就被拒 → 暂停生产（站点规则变了，别烧代理配额）
-breaker_pause_s = 600         # 暂停时长（秒），之后放一个身份试探
-request_gap_s = [3, 5]        # 同一 IP 两次请求的随机间隔（秒）
-page_interval_s = [10, 30]    # 浏览器下载模式（paperlite browse）同一浏览器两篇之间的随机间隔（秒），避开同域名频率限制
-download_timeout_s = 120      # 卡顿超时：连续这么久收不到数据才算超时（不限总时长，大文件慢慢下也行）
-max_file_size_mb = 200        # 单个 PDF 超过就中止
-max_tries = 3                 # 单条 URL 网络错误重试次数（cookie 被拒不计）
+request_gap_s = [3, 5]        # 同一 IP 两次请求的随机间隔（秒）curl模式
+page_interval_s = [10, 30]    # 浏览器模式：同一浏览器两篇之间的随机间隔（秒），避开同域名频率限制
+download_timeout_s = 120      # 流式下载卡顿超时：连续这么久收不到数据才算超时（不限总时长）
+max_file_size_mb = 200        # 单个 PDF 上限，超过中止
+max_tries = 3                 # 网络错误重试次数（cookie 被拒不计）
 max_url_challenges = 3        # 单条 URL 带有效 cookie 仍被挑战满这么多次 → failed / challenge_failed
-volume_stop_after = 3         # 同一卷期（DOI 点号前那段）还没下到 PDF、已有这么多篇 404/订阅/摘要页 → 停掉该卷期其余任务；0 关闭
-title_dup_trigger = 10        # 巡检：同一标题重复这么多篇就归纳 doi/url 规则、标记疑似封面的未采任务（不再采）；0 关闭
-title_window_size = 500       # 实时巡检只看本次运行最近这么多条成功结果，不反复扫描历史任务
+volume_stop_after = 3         # curl 模式：同卷期接连这么多篇无 PDF 就停该卷期其余任务；0 关闭
+max_fresh_rejects = 5         # 连续这么多个新身份一用就被拒 → 熔断暂停生产
+breaker_pause_s = 600         # 熔断暂停时长（秒），之后放一个身份试探
+debug_dir = ""                # 过盾失败截图目录，空则不截图
+title_dup_trigger = 10        # 巡检：同一标题重复这么多篇就归纳 doi/url 规则、标记疑似失效/封面的未采任务（不再采）；0 关闭
+title_window_size = 500       # 实时巡检只看本次运行最近这么多条已加载页面
 rule_min_precision = 0.98     # 规则在已采数据上的最低精确率（防止把真文章误标）
 rule_min_support = 10         # 规则在已采数据上的最低命中数
 
-[run]                         # 配置后可只执行：paperlite run config.toml
-command = "run"               # 填 "run" 启用；留空则 paperlite run config.toml 仍可用，裸 paperlite 只打印帮助
-mode = "curl"                 # curl（单主机，默认）/ browser（可混多主机）
+[run]                         # 配置后一行启动：paperlite run config.toml
+command = "run"               # 填 "run"：裸 paperlite（不带子命令）也按此启动；留空则裸 paperlite 只打印帮助
+mode = "browser"              # browser（各种主机混着跑，默认）/ curl（单主机 cookie 池）
 proxy = true                  # false 等价于 --no-proxy（仅 browser）
-workers = 20                  # curl=下载线程数；browser=同时打开的浏览器数
-urls = ""                    # 可选：启动时先导入 URL 文件
-url_type = "pdf"             # pdf / html
-out = ""                      # 可选精确输出目录；非空时覆盖 [pool] out_root
-host = ""
-db = ""                       # 可选精确数据库文件；非空时覆盖 [pool] db_dir
-headed = false
+workers = 20                  # browser=同时打开的浏览器数；curl=下载线程数
+urls = ""                     # 可选：启动时先导入这个 URL 文件
+url_type = "html"              # pdf / html
+headed = false                # 仅 browser：有界面（调试）
 
-[landing]                     # 各主机的过盾落地页（任意会触发挑战的普通页面）；未配置的用主机首页
+[landing]                     # 可选：各主机的过盾落地页（任意会触发挑战的普通页面）；未配置的用主机首页
 "dl.acm.org" = "https://dl.acm.org/doi/10.1145/3779295"

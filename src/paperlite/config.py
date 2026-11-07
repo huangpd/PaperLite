@@ -4,13 +4,16 @@
 paperlite/config.py
 ─────────────────────
 读 config.toml（模板见包内 config.example.toml，paperlite init 生成）。查找顺序：--config 参数 > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml。
+
+一份 config = 一个批次。各种主机的 URL 混着导进同一个任务库，默认用浏览器模式统一跑。
+
   [proxy]    代理提取接口与鉴权
-  [pool]     生产 / 消费参数
-  [run]      省略子命令时的默认运行参数
-  [landing]  主机 → 过盾落地页
+  [limits]   并发与行为（浏览器数、过盾超时、请求间隔、熔断、巡检阈值……）
+  [paths]    位置：db（任务库，本地盘）、storage（输出 PDF/HTML，可挂载）、log_dir
+  [run]      paperlite run config.toml 时的启动参数
+  [landing]  主机 → 过盾落地页（可选）
 """
 
-import hashlib
 import os
 import tomllib
 from importlib import resources
@@ -40,11 +43,32 @@ def write_example(path: Path, force: bool = False) -> None:
 
 
 @dataclass(frozen=True)
-class PoolConfig:
+class Paths:
+    """位置。db 与 storage 相互独立：storage 可放对象存储挂载，db 必须本地盘。"""
+
+    db: str = "tasks.db"              # 任务库文件（SQLite，必须本地盘：要随机写/文件锁/mmap）
+    storage: str = "output"           # 输出目录（PDF/HTML），可在 goofys/s3fs 等挂载上
+    log_dir: str = "log"              # 日志目录；非空时同时写终端和按启动时间命名的 .jsonl；空则只打终端
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "Paths":
+        _reject_unknown("paths", raw, cls)
+        return cls(**raw)
+
+    @property
+    def db_path(self) -> Path:
+        return Path(self.db).expanduser()
+
+    @property
+    def storage_path(self) -> Path:
+        return Path(self.storage).expanduser()
+
+
+@dataclass(frozen=True)
+class Limits:
+    """并发与行为。不含任何存储路径（那些在 [paths]）。"""
+
     redis_url: str = "redis://127.0.0.1:6379/0"
-    out_root: str = "pdfs"            # 不给 --out 时的输出根目录：每个站点 <out_root>/<主机>
-    db_dir: str = ""                  # 任务库目录；设置后任务库放这里（<目录>/<输出目录名>-<路径哈希>.db），不放输出目录
-    log_dir: str = ""                 # 日志目录；非空时同时写终端和按启动时间命名的日志文件
     key_prefix: str = "paperlite"
     # 生产
     max_browsers: int = 20            # 同时运行的浏览器上限
@@ -62,7 +86,7 @@ class PoolConfig:
     min_left_s: float = 20            # 身份剩余寿命低于此值不再发请求
     lease_ttl_s: float = 120          # 下载线程占用身份的心跳 TTL；进程崩溃后到期自动归还
     request_gap_s: tuple[float, float] = (3.0, 5.0)   # 同一 IP 两次请求的随机间隔
-    page_interval_s: tuple[float, float] = (10.0, 30.0)   # 浏览器下载模式：同一浏览器两篇之间的随机间隔（避开同域名频率限制）
+    page_interval_s: tuple[float, float] = (10.0, 30.0)   # 浏览器模式：同一浏览器两篇之间的随机间隔
     connect_timeout_s: float = 15
     download_timeout_s: float = 120   # 流式下载的卡顿超时：连续这么久收不到数据才算超时（不是总时长上限）
     min_file_size: int = 1024         # PDF 小于此字节数视为不完整，计一次重试
@@ -70,9 +94,9 @@ class PoolConfig:
     max_tries: int = 3                # 单条 URL 的网络错误重试次数（cookie 被拒不计）
     max_url_challenges: int = 3       # 单条 URL 带有效 cookie 仍被挑战满这么多次 → failed / challenge_failed
     volume_stop_after: int = 3        # 同一卷期还没下到 PDF、已有这么多篇 404/订阅/摘要页 → 停掉该卷期其余任务；0 关闭
-    # 巡检：同标题重复到阈值就归纳 doi/url 规则，把疑似封面的 pending 标记跳过（见 inspect.py）
+    # 巡检：同标题重复到阈值就归纳 doi/url 规则，把疑似失效/封面的 pending 标记跳过（见 inspect.py）
     title_dup_trigger: int = 10       # 同一标题重复这么多篇就触发巡检；0 关闭巡检
-    title_window_size: int = 500      # 实时巡检只保留本次运行最近这么多条成功结果
+    title_window_size: int = 500      # 实时巡检只保留本次运行最近这么多条已加载页面
     rule_min_precision: float = 0.98  # 归纳出的规则在已采数据上的最低精确率，防止把真文章误标
     rule_min_support: int = 10        # 规则在已采数据上的最低命中数
 
@@ -80,8 +104,8 @@ class PoolConfig:
         return self.landing.get(host) or f"https://{host}/"
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any], landing: dict[str, str] | None = None) -> "PoolConfig":
-        _reject_unknown("pool", raw, cls)
+    def from_dict(cls, raw: dict[str, Any], landing: dict[str, str] | None = None) -> "Limits":
+        _reject_unknown("limits", raw, cls)
         kwargs = dict(raw)
         for key in ("request_gap_s", "page_interval_s"):
             if key in kwargs:
@@ -101,17 +125,14 @@ class PoolConfig:
 
 @dataclass(frozen=True)
 class RunConfig:
-    """只传 ``--config`` 时采用的默认命令参数。command 为空则仍显示帮助。"""
+    """paperlite run config.toml（或裸 paperlite）启动时采用的参数。command 为空则裸命令只显示帮助。"""
 
     command: str = ""
-    mode: str = "curl"
+    mode: str = "browser"             # 默认浏览器模式（可混多主机）；curl 为单主机 cookie 池
     proxy: bool = True
     workers: int = 20
     urls: str = ""
     url_type: str = "pdf"
-    out: str = ""
-    host: str = ""
-    db: str = ""
     headed: bool = False
 
     @classmethod
@@ -144,40 +165,33 @@ def _read(path: Path) -> dict[str, Any]:
                                 f"或用 --config / 环境变量 {CONFIG_ENV} 指定）")
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    _reject_unknown("顶层", raw, None, allowed={"proxy", "pool", "run", "landing"})
+    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "landing"})
     return raw
 
 
-def load(path: Path | None = None) -> tuple[PoolConfig, ProxySettings]:
+def load_limits(path: Path | None = None) -> Limits:
+    """只读 [limits] / [landing]，不校验代理。"""
     raw = _read(path or resolve_path())
-    return (PoolConfig.from_dict(raw.get("pool", {}), raw.get("landing", {})),
+    return Limits.from_dict(raw.get("limits", {}), raw.get("landing", {}))
+
+
+def load_paths(path: Path | None = None) -> Paths:
+    """只读 [paths]（db / storage / log_dir）。import / status / retry / export 只需要这个。"""
+    raw = _read(path or resolve_path())
+    return Paths.from_dict(raw.get("paths", {}))
+
+
+def load(path: Path | None = None) -> tuple[Limits, ProxySettings]:
+    """读 [limits] + [proxy]（校验代理）。run / produce / download 用。"""
+    raw = _read(path or resolve_path())
+    return (Limits.from_dict(raw.get("limits", {}), raw.get("landing", {})),
             proxy_settings(raw.get("proxy", {})))
 
 
-def load_pool(path: Path | None = None) -> PoolConfig:
-    """只读 [pool]，不校验代理（import / retry / export 只需要 db_dir 这类设置）。"""
+def load_run(path: Path | None = None) -> RunConfig:
+    """读 [run]。"""
     raw = _read(path or resolve_path())
-    return PoolConfig.from_dict(raw.get("pool", {}), raw.get("landing", {}))
-
-
-def load_run(path: Path | None = None) -> tuple[PoolConfig, RunConfig]:
-    """读取无需子命令即可启动所需的 [pool] / [run]；不强制校验代理配置。"""
-    raw = _read(path or resolve_path())
-    return (PoolConfig.from_dict(raw.get("pool", {}), raw.get("landing", {})),
-            RunConfig.from_dict(raw.get("run", {})))
-
-
-def task_db_path(out: str | None, db: str | None, db_dir: str = "") -> Path:
-    """任务库位置：--db > 配置 db_dir（<db_dir>/<输出目录名>-<完整路径哈希前 6 位>.db）> <--out>/tasks.db。"""
-    if db:
-        return Path(db).expanduser()
-    if not out:
-        raise ValueError("需要 --db 或 --out 指定任务库")
-    if db_dir:
-        full = Path(out).expanduser().resolve()
-        tag = hashlib.sha256(str(full).encode("utf-8")).hexdigest()[:6]
-        return Path(db_dir).expanduser() / f"{full.name or 'root'}-{tag}.db"
-    return Path(out) / "tasks.db"
+    return RunConfig.from_dict(raw.get("run", {}))
 
 
 def _reject_unknown(section: str, raw: dict, cls, allowed: set[str] | None = None) -> None:

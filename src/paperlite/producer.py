@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass
 
 from paperlite.browser import pass_challenge
-from paperlite.config import PoolConfig
+from paperlite.config import Limits
 from paperlite.proxy import IpSource, ProxyUnavailable
 from paperlite.store import Identity, IdentityStore
 
@@ -41,7 +41,7 @@ class ProducerStats:
 
 
 class Producer:
-    def __init__(self, cfg: PoolConfig, store: IdentityStore, ips: IpSource, host: str) -> None:
+    def __init__(self, cfg: Limits, store: IdentityStore, ips: IpSource, host: str) -> None:
         self.cfg, self.store, self.ips, self.host = cfg, store, ips, host
         self.landing = cfg.landing_for(host)
         self.stats = ProducerStats()
