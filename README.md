@@ -1,148 +1,146 @@
-# PaperLite：单站点大批量 PDF 下载
+# PaperLite：大批量下载 PDF / 网页（过 Cloudflare）
 
-专门处理**单一站点、大量 URL**：用浏览器持续生产过 Cloudflare 的 cookie，curl_cffi 领用下载。生产与消费只通过 Redis 交互，可以分开跑在不同进程上；任务与结果存在站点输出目录的 SQLite 库 `tasks.db` 里。多站点、通用的路由和兜底由 `paper_downloader` 负责。
+**用本工具第一个要定的是模式，按"要下几个站点"选**：
 
-独立项目（原 `paper_downloader/cookie_pool/`，2026-10-25 拆出）：自己的依赖和 venv，配置是运行目录的 `config.toml`，不依赖 `paper_downloader` 的任何代码，也不用 PostgreSQL。
+- **同一站点、海量 URL → curl 模式（默认）**：浏览器只负责持续过 Cloudflare、把身份（IP + cookie + UA）攒进 Redis 池，curl_cffi 领用后高速批量下载。省资源、吞吐最高；代价是一个任务库只能一个主机（混了会直接报错提示改用浏览器）。
+- **多个站点混在一起 → 浏览器模式（`run --browser`）**：每个浏览器 + IP 过一次盾后连续下同域名多篇，不同主机的页面各自过盾，能自己跟跳转、整页存 `.html`。一个库可混多主机。
+
+早期版本以"主机"为中心（一主机一库，到处 `--host`）；改版后一个库可容纳多主机，主机不再是硬边界——真正先定的就是上面这个"单站点还是跨站点"，`--host` / `--out` 只是在本地有多个站点目录时用来选哪个。
+
+生产与下载只通过 Redis 交互，可分进程、分机器跑；任务与结果存站点输出目录下的 SQLite 库 `tasks.db`。
+
+独立项目（原 `paper_downloader/cookie_pool/`，2026-10-25 拆出）：自带依赖和 venv，配置是运行目录的 `config.toml`，不依赖 `paper_downloader`，不用 PostgreSQL。
 
 ## 快速开始
 
-需要：Python ≥ 3.11、Redis、一个短效代理提取接口（每次返回一个新 IP，青果格式）。
+需要 Python ≥ 3.11、Redis、一个短效代理提取接口（每次返回一个新 IP，青果格式）。
 
 ```bash
 pip install paperlite                     # 或 uv tool install paperlite；国内加 -i https://pypi.tuna.tsinghua.edu.cn/simple
 mkdir work && cd work
-paperlite init                            # 生成 ./config.toml（权限 600），填 [proxy] 的提取接口和代理账号密码
+paperlite init                            # 生成 ./config.toml（权限 600）
 
-# Redis：只监听本机、不落盘（身份 10 分钟就过期，不需要持久化）
-docker run -d --name cf-redis -p 127.0.0.1:6379:6379 redis:latest redis-server --save "" --appendonly no
-
-# 导入并开跑：输出目录按主机自动定为 pdfs/dl.acm.org，下载完自动退出
-paperlite import --urls acm.txt
-paperlite run --workers 20
+# Redis：只监听本机
+docker run -d --name paperlite-redis -p 127.0.0.1:6379:6379 redis:latest redis-server --save ""
 ```
 
-从源码装（开发、改代码）：
+然后编辑 `config.toml`：填 `[proxy]` 的提取接口和代理账号密码，再在 `[run]` 里把这次要跑的东西写全（模式、URL 文件、输出目录……见下「配置文件启动」）。之后每次就一行：
+
+```bash
+paperlite run config.toml                # 按该文件的 [run] 导入 + 下载，下载完自动退出
+```
+
+**推荐把每次运行都落到配置文件里**：命令行参数跑完就忘，配置文件一直留在本地——哪个库、哪个站点、什么模式，打开文件就知道，换机器、重跑、交接都照着它来。想临时试一把也可以直接敲子命令（`paperlite import --urls acm.txt` 然后 `paperlite run`），参数见下「命令」。
+
+从源码装（开发）：
 
 ```bash
 git clone https://github.com/huangpd/PaperLite.git && cd PaperLite
-uv sync                                   # 国内服务器：uv venv && uv pip install -e . --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+uv sync                                    # 国内：uv venv && uv pip install -e . --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 uv run paperlite init
-uv run paperlite import --urls data/acm.txt
-uv run paperlite run --workers 20
 ```
 
-运行中每 30 秒打印一行进度（已处理条数、PDF 篇数、身份池、近 30 秒速度）。随时 Ctrl+C，在途任务会放回 pending，再执行同一条命令就从断点继续。
+运行中每 30 秒打印一行进度。随时 Ctrl+C（或 SIGTERM）优雅退出：在途任务放回 pending、身份还池、释放生产者锁，再跑同一条命令从断点继续。
 
-`paperlite` 是安装时生成的命令（`pyproject.toml` 的 `[project.scripts]`），后面的 `run` / `import` / `status` 是它的子命令。pip 安装的直接写 `paperlite ...`；源码目录里下面统一写成 `uv run paperlite ...`，这几种写法等价：
+> `paperlite` 是安装生成的命令，下文统一写 `uv run paperlite ...`（源码目录内）。用清华源手动装的环境请改用 `.venv/bin/paperlite`——`uv run` 会按 `uv.lock` 去官方源重新同步，国内服务器会卡住。
 
-```bash
-uv run paperlite status                           # uv 自动用项目 venv，不用激活
-.venv/bin/paperlite status                         # 直接调 venv 里的命令（服务器上推荐，见下）
-source .venv/bin/activate && paperlite status
-.venv/bin/python -m paperlite status
-```
-
-用清华源手动装的环境（`uv pip install`，不是 `uv sync`）请用 `.venv/bin/paperlite`：`uv run` 会按 `uv.lock` 去官方源重新同步依赖，国内服务器上会卡住。
-
-## 命令一览
+## 命令
 
 | 命令 | 作用 |
 |---|---|
-| `uv run paperlite init [--force]` | 在当前目录生成配置模板 `config.toml`（或写到 `--config` 指定的路径） |
-| `uv run paperlite import --urls <文件> [--type pdf\|html]` | 导入任务。txt 一行一个链接，或带 `url` 列（可选 `doi` / `source` / `batch_no` / `url_type`；旧名 `pdf_url` / `paper_uid` 仍兼容）的 CSV。`--type html` 表示要网页本身（整页存 `.html`），CSV 的 `url_type` 列逐行覆盖；`run` / `download --urls` 同样可加 `--type`。重复导入不重置已有任务；可混多个主机（`run --browser` 按每条 URL 各自过盾）|
-| `uv run paperlite run [--urls <文件>] [--workers 20]` | 下载，下载完退出。默认 **curl 模式**（浏览器过盾存 cookie、curl 批量下，省资源，须单主机）；加 `--browser` 走**浏览器模式**（每浏览器+IP 过盾一次后连续下同域名多篇、整页存 `.html`，可混多主机、浏览器自己跟跳转；`--no-proxy` 本地直连不用代理）|
-| `uv run paperlite produce [--keep N]` | 只生产身份，常驻 |
-| `uv run paperlite download [--workers 20]` | 只下载，需有生产者在跑 |
-| `uv run paperlite status` | 各状态数量、失败 / non_pdf 按 `error_kind` 分组、被停卷期、身份池 |
-| `uv run paperlite retry --status failed [--kind network]` | 把失败（或 `non_pdf`）重置为 pending |
-| `uv run paperlite retry --stopped-volumes` | 重新核实按卷期停掉的任务 |
-| `uv run paperlite export [--status non_pdf] [--file x.csv]` | 导出任务表为 CSV（默认输出到标准输出） |
-| `uv run paperlite turnstile --url <页面> --sitekey <key> [--proxy ...] [--json]` | 按目标页 + sitekey 取 Cloudflare Turnstile token；`--serve 8191` 起 HTTP 服务（见下） |
+| `init [--force]` | 生成配置模板 `config.toml` |
+| `import --urls <文件> [--type pdf\|html]` | 导入任务。txt 一行一链接，或带 `url` 列的 CSV（可选 `doi`/`source`/`batch_no`/`url_type`）。重复导入不重置已有任务 |
+| `run [--urls <文件>] [--workers 20]` | 下载，完成即退出。模式见上文（默认 curl / 单主机；`--browser` 可混多主机；`--browser --no-proxy` 本地直连） |
+| `produce [--keep N]` | 只生产身份，常驻 |
+| `download [--workers 20]` | 只下载，需另有生产者在跑 |
+| `status` | 各状态数量、失败按 `error_kind` 分组、停卷期、身份池 |
+| `retry --status failed [--kind network]` | 把失败（或 `non_pdf`）重置为 pending |
+| `retry --stopped-volumes` | 让被停卷期重新抽样核实 |
+| `export [--status non_pdf] [--file x.csv]` | 导出任务表为 CSV |
+| `inspect` | 巡检：同标题重复到阈值就归纳 doi/url 规则，标记疑似封面的未采任务 |
+| `turnstile --url <页> --sitekey <key>` | 取 Cloudflare Turnstile token（见下） |
 
-所有命令都可以加 `--out` / `--host` / `--db` 指定站点和任务库；只有一个站点时都不用写：
+日常跑 `run` 建议写进 `[run]`（见下），不用在命令行堆参数。下面这些 flag 仍然可用，适合临时一次性操作：`--out`（站点输出目录）、`--host`（主机，目录取 `<out_root>/<主机>`）、`--db`（任务库路径）。本地只有一个站点目录时都能省略，多个时才需要指定选哪个。全局参数：`--config` / `--log-level` / `--log-format` / `--version`。
 
-- **站点输出目录**：`--out` > `--host`、`--urls` 里链接的主机、`--db` 记录的主机 → `<out_root>/<主机>`（`out_root` 默认 `pdfs`）> `out_root` 下唯一的站点。有多个站点时会列出来，用 `--host dl.acm.org` 选一个。
-- **任务库**：`--db` > 配置 `[pool] db_dir`（`<db_dir>/<输出目录名>-<路径哈希>.db`）> `<输出目录>/tasks.db`。全局参数：`--config <文件>`、`--log-level`、`--version`。
+**日志**：一份事件流，终端和文件各自渲染。日志文件（`[pool] log_dir`）始终是 JSON Lines，字段齐全、好检索。终端默认 `--log-format auto`——交互式窗口给人类可读文本（`时间 级别 消息  key=val`，按级别着色，认 `NO_COLOR`），被重定向 / 管道 / docker 采集（非 TTY）时自动转 JSON。所以交互盯着跑是文本、`nohup paperlite run ... > run.log` 落盘的 `run.log` 是 JSON，都不用加参数。要手动固定就用 `--log-format text` / `json`。
 
-## Turnstile token（通用）
+定位规则（命令行不指定时的默认）——**站点目录**：`--out` > `--host` / URL 主机 / `--db` 记录的主机 → `<out_root>/<主机>` > `out_root` 下唯一站点；**任务库**：`--db` > `[pool] db_dir`（`<db_dir>/<目录名>-<哈希>.db`）> `<输出目录>/tasks.db`。
 
-给出目标页 URL 和 sitekey 就能拿 token，不依赖站点配置和 Redis：
+> curl 模式（`run` 默认 / `download` / `produce`）要求任务库里只有一个主机，混了会报错并提示用 `run --browser`；浏览器模式不限。
+
+## 常用操作
 
 ```bash
-uv run paperlite turnstile --url https://example.com/login --sitekey 0x4AAAA... --json
-# {"ok": true, "token": "1.xxxx…", "user_agent": "Mozilla/5.0 …", "seconds": 15.3, "clicks": 2, "error": ""}
+# 后台跑 + 停止
+setsid nohup .venv/bin/paperlite run --workers 20 > logs/acm.log 2>&1 < /dev/null &
+kill <pid>                                 # 或 pkill -f "paperlite run"（注意别连执行它的 shell 一起杀）
 
-uv run paperlite turnstile --serve 8191 --concurrency 4        # HTTP 服务
-curl localhost:8191/solve -d '{"url":"https://example.com/login","sitekey":"0x4AAAA...","proxy":"http://u:p@1.2.3.4:8000"}'
+# 输出目录在对象存储挂载（goofys/s3fs）上：任务库必须放本地盘
+#   SQLite 要随机写/文件锁/mmap，FUSE 不支持；PDF 是顺序写可以放挂载上
 ```
-
-原理：用 CloakBrowser 打开目标 URL，但拦截这一个文档请求、换成只渲染该 sitekey 的最小页面（origin 仍是目标站，Turnstile 的 hostname 校验能过），
-在 `challenges.cloudflare.com` 的 iframe 上按坐标点复选框，从 callback 拿 token。卡在 "Verifying…" 时每 8 秒补点一次（实测只点一次常卡到超时）。
-可选 `action` / `cdata` 要与目标站一致（在页面的 `turnstile.render(...)` 参数或 `data-action` / `data-cdata` 里找）。
-token 一次性、约 300 秒有效；有的站会校验提交 token 的 IP/UA，提交时用同一代理和返回的 `user_agent`。
-
-过盾（`produce` / `run`）遇到交互式 Turnstile（如 ScienceDirect 的 "Are you a robot?" 页）也会自动点击，逻辑同上，见 `turnstile.py`。
-
-## 常见场景
-
-**PDF 存到 goofys / s3fs 等对象存储挂载上**：任务库必须放本地盘。SQLite 要随机写、文件锁和 mmap，FUSE 挂载不支持；PDF 是顺序写入，可以放在挂载上（每篇最后的改名在 S3 上是一次复制 + 删除）。推荐在配置里设一次任务库目录，之后只写 `--out`：
 
 ```toml
 [pool]
-db_dir = "/data/paperlite/db"   # 任务库自动放这里：<目录>/<输出目录名>-<路径哈希>.db，如 acm-3f2a1c.db
+db_dir = "/data/paperlite/db"              # 任务库自动放这里，输出目录随便挂
 ```
 
-```bash
-uv run paperlite import --urls data/acm.txt --out /mnt/goofys/acm
-uv run paperlite run --out /mnt/goofys/acm --workers 20      # 或在配置里设 out_root = "/mnt/goofys"，之后不用写 --out
+- **生产/下载分开**：生产者常驻，下载随用随开；多机下载共用一个 Redis（`redis_url` 指同一台，跨机需改监听并加密码）。同主机同时只一个生产者干活，多开待命，前一个退出 15 秒内接手。
+- **省冷启动**：第一个身份要等一次过盾（约 20 秒）。下载前先 `produce --keep 20` 养身份，代价是没人下载时也耗 IP。
+- **换站点**：`[landing]` 加一行该主机的落地页（任意会触发挑战的普通页），`[proxy] check_url` 换成该站可达地址；`classify.py` 的 non_pdf 判断按 ACM 写的，换站要看一下。
+
+## 配置文件启动（`[run]`）
+
+把一次运行的参数写进配置的 `[run]` 段，然后 `paperlite run config.toml` 就按这个文件启动，等价于一条展开的 `paperlite run ...`。参数都在文件里，命令行不用堆 `--out`/`--host`/`--db`——不怕忘、换机器重跑和交接都照着文件来。给了配置文件时，命令行其余 `run` 参数被忽略，一切以 `[run]` 为准。
+
+```toml
+[run]                 # 配置后一行启动：paperlite run config.toml
+command = "run"       # 填 "run"：裸 paperlite（不带子命令）也按此启动；留空则裸 paperlite 只打印帮助（run config.toml 仍可用）
+mode = "curl"         # curl（单主机，默认）/ browser（可混多主机）；省略按 curl
+proxy = true          # false 等价于 --no-proxy（仅 browser）
+workers = 20          # curl=下载线程数；browser=同时打开的浏览器数
+urls = "acm.txt"      # 可选：启动时先导入这个 URL 文件
+url_type = "pdf"      # pdf / html
+out = ""              # 可选：精确输出目录，非空覆盖 [pool] out_root
+host = ""             # 可选：站点主机，目录取 <out_root>/<主机>
+db = ""               # 可选：精确任务库文件，非空覆盖 [pool] db_dir
+headed = false        # 仅 browser：有界面（调试）
 ```
 
-也可以不改配置、每次用 `--db /data/paperlite/acm.db` 指定（优先于 `db_dir`）。
-
-**后台运行与停止**：
-
-```bash
-setsid nohup .venv/bin/paperlite run --workers 20 > logs/acm.log 2>&1 < /dev/null &
-tail -f logs/acm.log
-kill <pid>                                # 或 pkill -f "paperlite run"
-```
-
-SIGTERM 与 Ctrl+C 一样优雅退出：在途任务放回 pending、在用身份还回池里、生产者关掉浏览器并释放生产者锁。注意 `pkill -f` 的匹配串若也出现在执行它的 shell 命令行里（如 `ssh host '...paperlite run...; pkill -f paperlite'`），会连那个 shell 一起杀掉。
-
-**生产与下载分开跑**：生产者常驻，下载进程随用随开；多台机器的下载进程可以共用一个 Redis（`redis_url` 指向同一台；默认只监听本机，跨机器要改监听地址并加密码）。同一主机同时只有一个生产者干活，多开的待命，前一个退出或崩溃后 15 秒内接手。
-
-**省掉冷启动**：第一个身份要等一次过盾（约 20 秒）。下载前一两分钟先 `uv run paperlite produce --keep 20` 养着身份，代价是没人下载时也在消耗 IP。
-
-**重跑**：`retry --status failed` 重跑失败的（可加 `--kind network` / `challenge_failed` 只重跑某一类）；`retry --stopped-volumes` 让被停掉的卷期重新抽样核实。
-
-**换别的站点**：在 `config.toml` 的 `[landing]` 加一行该主机的落地页（任意会触发挑战的普通页面），`[proxy] check_url` 换成该站可达的地址；`classify.py` 里的 non_pdf 判断是按 ACM 页面写的，换站点要看一下。
+`import` / `status` / `retry` / `export` 等仍走子命令（它们各有专属参数，没有配置等价物）。
 
 ## 主要配置（config.toml）
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `[proxy] api_url` / `username` / `password` | | 提取接口与代理鉴权（必填） |
-| `out_root` | `pdfs` | 不给 `--out` 时的输出根目录，站点目录为 `<out_root>/<主机>` |
-| `db_dir` | 空 | 任务库目录（本地盘）；留空则放 `<--out>/tasks.db`。输出目录在对象存储挂载上时必须设置 |
+| `out_root` | `pdfs` | 不给 `--out` 时的输出根目录 |
+| `db_dir` | 空 | 任务库目录（本地盘）；留空则放 `<--out>/tasks.db`。挂载到对象存储时必须设 |
 | `max_browsers` | 20 | 同时过盾的浏览器上限 |
-| `max_identities` / `min_identities` | 20 / 0 | 健康身份上限 / 没人下载时也养着的身份数；实际按在线下载线程数生产 |
-| `pass_timeout_s` / `hedge_after_s` | 90 / 45 | 单次过盾上限 / 过盾超过这么久就另开一个补位 |
+| `max_identities` / `min_identities` | 20 / 0 | 健康身份上限 / 没人下载时养着的数；实际按在线下载线程数生产 |
+| `pass_timeout_s` / `hedge_after_s` | 90 / 45 | 单次过盾上限 / 超过这么久就另开一个补位 |
 | `request_gap_s` | [3, 5] | 同一 IP 两次请求的随机间隔 |
 | `download_timeout_s` | 120 | 卡顿超时：连续这么久收不到数据才算超时（不限总时长） |
-| `max_file_size_mb` | 200 | 单个 PDF 上限，超过中止 |
+| `max_file_size_mb` | 200 | 单个 PDF 上限 |
 | `max_tries` | 3 | 网络错误重试次数（cookie 被拒不计） |
-| `max_url_challenges` | 3 | 单条 URL 带有效 cookie 仍被挑战满这么多次 → `challenge_failed` |
-| `volume_stop_after` | 3 | 同一卷期接连这么多篇没有 PDF 就停掉该卷期其余任务；0 关闭 |
+| `max_url_challenges` | 3 | 单 URL 带有效 cookie 仍被挑战满这么多次 → `challenge_failed` |
+| `volume_stop_after` | 3 | 同卷期接连这么多篇无 PDF 就停该卷期其余任务；0 关闭 |
 | `max_fresh_rejects` / `breaker_pause_s` | 5 / 600 | 新身份接连一用就被拒时熔断暂停生产 |
-| `debug_dir` | 空 | 过盾失败截图目录 |
 
-完整列表和注释见 `paperlite init` 生成的模板（源码 `src/paperlite/config.example.toml`）。配置查找顺序：`--config` > 环境变量 `PAPERLITE_CONFIG` > 当前目录的 `config.toml`。
+完整列表见 `paperlite init` 生成的模板（`src/paperlite/config.example.toml`）。查找顺序：`--config` > 环境变量 `PAPERLITE_CONFIG` > 当前目录 `config.toml`。
 
-## 速度与 IP 用量（ACM 实测）
+## Turnstile token（通用）
 
-- 20 个下载线程：稳定后每分钟处理 120–160 条（PDF 约 140 篇），单篇下载平均 2.6 秒；线程数只影响速度，不影响 IP 用量。
-- 每个身份（IP + cookie）用约 9 分钟，下 60–70 篇；加上过盾失败（成功率 60%–90%），**每 1 万篇约需 180–300 个 IP**。
-- 换成 30 分钟时效的 IP，同样篇数只要约 1/3 的 IP。
+给目标页 URL 和 sitekey 即可取 token，不依赖站点配置和 Redis：
+
+```bash
+uv run paperlite turnstile --url https://example.com/login --sitekey 0x4AAAA... --json
+# {"ok": true, "token": "1.xxxx…", "user_agent": "...", "seconds": 15.3, ...}
+
+uv run paperlite turnstile --serve 8191 --concurrency 4        # HTTP 服务
+curl localhost:8191/solve -d '{"url":"...","sitekey":"0x4AAAA...","proxy":"http://u:p@1.2.3.4:8000"}'
+```
+
+原理：CloakBrowser 打开目标 URL 但拦截该文档、换成只渲染此 sitekey 的最小页（origin 仍是目标站，能过 hostname 校验），在 Turnstile iframe 上按坐标点复选框，从 callback 拿 token；卡 "Verifying…" 时每 8 秒补点一次。token 一次性、约 300 秒有效，有的站校验提交 IP/UA，须用同一代理和返回的 `user_agent`。过盾（`produce`/`run`）遇交互式 Turnstile 也自动点，见 `turnstile.py`。
 
 ## 测试
 
@@ -151,104 +149,55 @@ uv run pytest                                              # Redis 相关的会�
 PAPERLITE_TEST_REDIS=redis://127.0.0.1:6379/0 uv run pytest   # 连真实 Redis 全跑
 ```
 
-## 为什么这样设计
-
-- **cf_clearance 绑定 IP + UA**：同 IP 带 cookie → 200 PDF；同 IP 不带 cookie → 403；cookie 换到别的 IP → 403。所以身份 = IP + cookie + UA，三者一起存、一起用。
-- **身份寿命 ≈ IP 寿命**：青果短效 IP 只有 10 分钟（接口 `deadline`），cookie 本身更长，身份过期取两者较早者。每个身份约 9 分钟后就要换新，必须持续生产。
-- **cookie 在有效期内一直可用**：同一 IP 每 3–5 秒一次请求，下载 900+ 篇期间 cookie 被拒只有 3 次（都是复用上一轮的旧身份）。
-- **过盾要么很快、要么卡死**：成功的多在 12–30 秒（个别 70 秒）；失败的停在 Turnstile "Verifying…" 一直转圈，等到 120 秒也不会过（不是要手动勾选）。所以默认 `pass_timeout_s = 90`，并做**对冲**：过盾超过 `hedge_after_s = 45` 秒还没成功，就另开一个浏览器补位，旧的继续跑到超时。没有对冲时，卡住的过盾占着生产名额 2 分钟，6 个下载线程只等到 2 个身份（20 篇/分钟）。
-- **机房 IP 会要求手动勾选**：hw1 直连出口拿到的是要手动勾选的 Turnstile 复选框，必须走代理。
-- **站点会单独盯上某些 URL**（2026-10-25 实测）：同一个新 cookie、同一 IP，`1010832.*` 正常拿到 PDF，`1005062.*`（14 篇，连摘要页）一律 403 挑战，多半是前一晚在这几条上反复请求了几百次。原先把"被挑战"一律当成 cookie 坏了：丢身份、任务放回队首，于是每个新身份第一次请求都撞上它们，一篇也下不了。现在遇到挑战先用落地页验身份：落地页正常 → 只是这条 URL 被盯上，`challenge_count+1` 排到后面；落地页也被挑战 → 身份坏了才丢。不用"下一条也被挑战"来判身份，因为被盯上的论文往往成批相邻，会把好身份接连误杀。
-- **代理偶尔成批断连**：2026-10-25 00:28 有 13 个不同 IP 在 28 秒内先后报 `curl: (56) Connection closed abruptly`，原先一律丢身份，健康身份从 17 掉到 7、补了约 1.5 分钟。现在 (56) 先用同一身份重试一次。
-- **收尾不再白补身份**：只剩别的线程的在途任务时，空等的下载线程注销需求并把身份还回池里（之前最后 1 条重试时生产者仍按 20 个线程补身份，停止时池里空闲 20 个）。
-- **冷启动**：第一个身份要等一次过盾（实测约 20 秒）。想省掉就在下载前一两分钟先 `uv run paperlite produce --keep 20`，代价是没人下载时也在消耗 IP。
-- **流式下载**：超时是卡顿超时（`download_timeout_s`：连续这么久收不到数据），不是总时长，2 Mbps 的代理上大文件也不会被掐断；内存里最多一个 256KB 的块。`%PDF-` 须在前 1024 字节内、之前只允许空白 / BOM（写盘时去掉），与 paper_downloader 一致；小于 `min_file_size`（1024 字节）计一次重试，超过 `max_file_size_mb`（200）中止判 `failed / extract_failed`。
-- **熔断**：2026-10-24 22:38 实测，新过盾的身份全部一篇没下成就被 403 挑战（原因待查，同时代理配额耗尽），没有保护时 1 分钟烧掉 16 个 IP。现在连续 `max_fresh_rejects`（5）个新身份一用就被拒，生产者暂停 `breaker_pause_s`（600s）并告警，之后放一个身份试探，再被拒立刻重新暂停。网络错误不计入。
-- **过盾失败直接换 IP**：同一 IP 重试很少成功，换 IP 更快。
-
-## 目录
-
-```
-PaperLite/
-  pyproject.toml  uv.lock  README.md  LICENSE  .gitignore
-  config.toml              # paperlite init 生成（含代理密码，不提交）
-  src/paperlite/           # 代码（src 布局：测试跑的是安装好的包，不会误用源码目录）；config.example.toml 是配置模板
-  tests/
-  data/                    # URL 清单等输入数据（不提交）
-```
-
-## 结构
-
-| 模块 | 职责 |
-|---|---|
-| `store.py` | Redis 身份池：`add` / `claim`（Lua 原子领用，独占）/ `heartbeat` / `release` / `discard` / `reap` / `stats` |
-| `producer.py` | 按需生产：目标健康身份数 = clamp(在线下载线程数, `min_identities`, `max_identities`)，最多 `max_browsers` 个浏览器同时过盾 |
-| `browser.py` | 一次过盾：独立 CloakBrowser 进程（一 IP 一指纹）经代理打开落地页，等挑战消失并拿到 `cf_clearance` |
-| `turnstile.py` | Turnstile 控件定位与点击（`TurnstileClicker`）、按 sitekey 取 token（`solve_turnstile`）、HTTP 服务 |
-| `consumer.py` | 下载线程：从任务库领任务、从身份池领身份，同 IP 请求间隔 `request_gap_s`；**流式下载**（先读 1024 字节判文件头，是 PDF 就边下边写 `.part`、完成后原子改名；不是 PDF 只读前 256KB）；cookie 被拒/IP 封禁/IP 掉线/寿命将尽就丢弃身份，任务放回不计重试 |
-| `tasks.py` | SQLite 任务库（表结构见下） |
-| `proxy.py` | 调短效代理提取接口拿新 IP 并体检（每个身份一个 IP，用完即弃） |
-| `classify.py` | PDF 链接返回 HTML 时判 `error_kind`：`not_found` / `blocked` / `paywall` / `landing_page` |
-| `config.py` | 读 `config.toml` 的 `[proxy]` / `[pool]` / `[landing]` |
-| `cli.py` | 命令行（`paperlite` 命令 / `python -m paperlite`） |
-
-Redis 键（`{prefix}:{host}:...`）：`id:{id}` 身份 hash（EXPIREAT 到期自动删）、`ready` / `inuse` 两个按过期时间排序的 zset、`lease:{id}` 占用锁（带 TTL，下载进程崩溃后由 `reap` 归还）、`workers` 在线下载线程心跳、`fresh_rejects` / `paused` 熔断计数与暂停标记、`producer` 生产者锁（同一主机同时只有一个生产者干活，多开的待命，前一个退出或崩溃后 15 秒内接手）。**Redis 里不存代理密码**，只存 `ip:port`，消费者用本地 `config.toml` 补鉴权。
-
-生产者只看两个数：健康身份数（剩余寿命 > `refill_before_s` 的空闲+占用）和在线下载线程数。所以：
-- 在用身份临近过期前就会开始生产替补，下载线程几乎不空等；
-- 下载结束、线程注销后目标降为 `min_identities`，不再白白过盾。
-
 ## 任务库 tasks.db
 
-表 `paper_pdf_resources`，结构参照 paper_downloader 的 PostgreSQL 的同名表，同名列含义与取值一致：
+表 `paper_pdf_resources`（结构对齐 paper_downloader 的 PG 同名表）。关键列：
 
 | 列 | 说明 |
 |---|---|
 | `id` | 自增主键，按它的顺序领取 |
-| `url_key` | sha256(规范化 `url`)，32 字节，唯一：协议和域名转小写、去掉 `#片段` |
-| `doi` | 导入列 `doi` 给的值（小写）；没给则从链接回退推导（提取 DOI/PII，认不出用 `url-<url_key 前 16 位>`）。决定文件名 |
-| `url` / `source` / `batch_no` | 导入时的原值（旧名 `pdf_url` 仍可作为 CSV 表头导入） |
-| `url_type` | `pdf`（默认）= 链接应返回 PDF；`html` = 要网页本身：2xx 时整页存为 `.html`、记 `success`，404/410 记 `failed / not_found`，其他 4xx 记 `failed`；挑战、封禁、5xx、网络错误的处理同 PDF。跳转由框架自己跟：curl 跟 HTTP 3xx 和中转页的 meta refresh（如 linkinghub 的 Redirecting 页）；跳到别的主机后被 Cloudflare 挑战，就用浏览器经同一出口打开、自动过挑战后保存最终页面（并发受 `max_browsers` 限制）。0.1.2 及以前的库打开时自动补这一列（PG 版没有这列） |
-| `final_url` | 网页任务实际保存的最终地址（跟完跳转后） |
-| `volume` | DOI 后缀点号前的卷期号（`10.1145/1012326.1012328` → `1012326`），导入时提取；新式纯数字 DOI 为空，不参与卷期停止 |
-| `status` | `pending` → `running` → `success` / `non_pdf` / `failed`（CHECK 约束） |
-| `error_kind` | 最近一次没成功的类别：`not_found` / `paywall` / `landing_page`（non_pdf）；`network` / `server_error` / `extract_failed`（过小或超过大小上限）；`challenge_failed`（URL 被单独挑战满次数）；`blocked` 只用于丢弃身份，不落到最终结果 |
-| `title` | 网页/non_pdf 任务的页面 `<title>`（成功、non_pdf、404 都记） |
-| `error_message` | 只记错误信息（失败原因、按卷期推断说明等）；不再存标题 |
-| `http_status` / `file_size` / `elapsed_ms` | 最近一次尝试的 HTTP 状态、响应字节数、耗时（毫秒） |
-| `exit_ip` | 最近一次尝试用的出口 IP（paper_downloader 没有这列） |
-| `retry_count` | 网络错误、5xx 才计；cookie 被拒、IP 封禁不计 |
-| `inferred` | 1 = 按卷期推断、没有实际请求（见下「卷期停止」） |
-| `challenge_count` | 带有效 cookie 仍被站点挑战的次数（站点单独盯上了这条 URL）；领取按它从小到大排，被挑战过的排到后面；满 `max_url_challenges`（3）判 `failed / challenge_failed`（PG 版没有这列） |
-| `file_path` | 成功后的**绝对**文件路径：`<out>/<h[0:2]>/<h[2:4]>/<doi 的 / 换成 _>.pdf`（网页任务为 `.html`），`h = sha256(doi)`。文件名用 doi；想去掉主机层就把 `--out` 传成不含主机的目录 |
-| `claimed_by` | 领取它的 `主机名-进程号-线程号` |
-| `created_at` / `updated_at` | 北京时间文本 `YYYY-MM-DD HH:MM:SS` |
+| `url_key` | sha256(规范化 url)，唯一 |
+| `doi` | 导入值（小写）或从链接回退推导；决定文件名 |
+| `url` / `source` / `batch_no` | 导入原值 |
+| `url_type` | `pdf`（默认，应返回 PDF）/ `html`（要网页本身，整页存 `.html`） |
+| `volume` | DOI 卷期号（`10.1145/1012326.1012328` → `1012326`），用于卷期停止 |
+| `status` | `pending` → `running` → `success` / `non_pdf` / `failed` |
+| `error_kind` | `not_found`/`paywall`/`landing_page`（non_pdf）；`network`/`server_error`/`extract_failed`；`challenge_failed` |
+| `title` / `final_url` | 页面标题；网页任务跟完跳转的最终地址 |
+| `http_status` / `file_size` / `elapsed_ms` / `exit_ip` | 最近一次尝试的指标 |
+| `retry_count` / `challenge_count` | 网络错误/5xx 计数；带有效 cookie 仍被挑战的次数 |
+| `inferred` | 1 = 按卷期推断、未实际请求 |
+| `file_path` | 成功后绝对路径 `<out>/<h[0:2]>/<h[2:4]>/<doi>.pdf`，`h=sha256(doi)` |
 
-另有 `meta` 表记录本库的主机；`volume_stops` 表记录被停掉的卷期（判停类别、作为依据的几篇、停掉的任务数、时间）。直接查库：`sqlite3 pdfs/acm/tasks.db "SELECT status, error_kind, count(*) FROM paper_pdf_resources GROUP BY 1, 2"`。
+查库：`sqlite3 pdfs/acm/tasks.db "SELECT status,error_kind,count(*) FROM paper_pdf_resources GROUP BY 1,2"`。另有 `meta`（本库主机）、`volume_stops`（被停卷期）、`skip_rules`（巡检规则）表。
 
-## 卷期停止
+## 设计要点
 
-ACM 的 404 和"没有 PDF"基本按卷期整组出现（2671 条实测：9 个 404 卷期、11 个无 PDF 卷期，组内 100% 一致；有 PDF 的卷期里只有零星卷首语、"(abstract)" 条目）。所以：
+- **身份 = IP + cookie + UA**：cf_clearance 绑 IP + UA，三者一起存一起用，换任意一个都 403。青果短效 IP 约 10 分钟，身份过期取 IP 与 cookie 较早者，约 9 分钟换新，故须持续生产。
+- **过盾要么快要么卡死**：成功多在 12–30 秒，失败停在 "Verifying…" 转到超时。默认 `pass_timeout_s=90` 并对冲：超 `hedge_after_s=45` 秒没过就另开浏览器补位，旧的继续跑到超时。机房直连出口会要求手动勾选，必须走代理。
+- **被挑战 ≠ 身份坏**：站点会单独盯上某些 URL（往往成批相邻）。遇挑战先用落地页验身份——落地页正常只是这条 URL 被盯上（`challenge_count+1` 排后面），落地页也被挑战才丢身份。不能用"下一条也被挑战"判身份，否则会把好身份接连误杀。
+- **熔断**：连续 `max_fresh_rejects` 个新身份一用就被拒 → 生产者暂停 `breaker_pause_s` 并告警，之后放一个试探；网络错误不计入。防代理配额耗尽时 1 分钟烧光 IP。
+- **卷期停止**：ACM 的 404 / 无 PDF 基本按卷期整组出现。未下到 PDF 的卷期同时最多放 `volume_stop_after` 篇，都 non_pdf 就停该卷期其余 pending（记 `inferred=1`，未请求）；下到过一篇 PDF 的卷期永不停。`retry --stopped-volumes` 重新核实。
+- **流式下载**：卡顿超时而非总时长，慢代理上大文件不被掐断；`%PDF-` 须在前 1024 字节内。网络错误 `(56)` 先用同一身份重试一次再丢。
+- **巡检**（浏览器模式）：同标题重复到 `title_dup_trigger` 次，从 doi/url 两维归纳规则、用已采数据验精确率，达标才把命中的 pending 标 `suspect_cover` 跳过。只看本次运行的内存滑动窗口。
 
-- 卷期还没下到过 PDF 时，同时最多放 `volume_stop_after`（默认 3）篇出去，其余线程去领别的卷期（同卷期的任务在表里挨着，不限流的话 20 个线程会同时冲进同一卷期）。
-- 这几篇都是 `not_found` / `paywall` / `landing_page` → 停掉该卷期其余 pending：记 `non_pdf`、`inferred = 1`，`error_kind` 取样本里最多的类别，`error_message` 写明"按卷期推断…未请求"。
-- 下到过一篇 PDF 的卷期永远不停；网络错误、被挑战不计。
-- `uv run paperlite retry --stopped-volumes` 重新核实：被停卷期的 non_pdf（样本 + 推断）全部放回 pending，重新抽 3 篇。只放回推断的那部分没用，样本还在会立刻再停。
-- `volume_stop_after = 0` 关闭。
+性能（ACM 实测）：20 线程每分钟处理 120–160 条（PDF 约 140）；每身份用约 9 分钟下 60–70 篇，含过盾失败，**每 1 万篇约需 180–300 个 IP**（换 30 分钟时效 IP 约 1/3）。踩坑细节见 `POSTMORTEMS.md`。
 
-70 万条 ACM 实测：导入 7.9 秒，63.7 万条有卷期号、22,926 个卷期；领取一次 0.5–5 ms。
+## 目录
 
-## non_pdf 分类（ACM）
-
-| error_kind | 判断依据 | 含义 |
-|---|---|---|
-| `not_found` | 标题含 "Error: 404" | DOI 在 ACM 上不存在 |
-| `paywall` | 正文有 "Features requiring a subscription" 横幅 | 页面提示有订阅功能 |
-| `landing_page` | 其余 | 普通摘要页 |
-
-返回 HTML 的原始页面存在 `<out>/non_pdf/<文件名>.html`。
-
-注意：
-- ACM 每个页面的导航栏都有 "Basic Edition"（包括 404 页），不能据此判订阅。
-- 实测 `paywall` 和 `landing_page` 两类页面上都**没有任何 PDF / 全文入口**。横幅只说明页面上有灰掉的订阅功能，不能证明订阅后就有 PDF。
-- 标题含 "IP blocked" 时判 `blocked`：丢弃该身份、任务放回，不算 non_pdf。
+```
+src/paperlite/     代码（src 布局；config.example.toml 是配置模板）
+  store.py         Redis 身份池（Lua 原子领用、租约、生产者锁）
+  producer.py      按需生产身份、控制并发过盾
+  browser.py       一次过盾（独立 CloakBrowser 进程经代理打开落地页）
+  turnstile.py     Turnstile 定位点击、按 sitekey 取 token、HTTP 服务
+  browser_pool.py  浏览器模式的浏览器复用
+  consumer.py      下载线程（领任务+身份、流式下载、身份健康判定）
+  tasks.py         SQLite 任务库、卷期停止
+  inspect.py       巡检归纳规则
+  classify.py      non_pdf 分类（not_found/paywall/landing_page）
+  proxy.py         短效代理取 IP 并体检
+  config.py cli.py 配置 / 命令行
+tests/             pytest（unittest 风格；Redis 用例按 PAPERLITE_TEST_REDIS 门控）
+config.toml        paperlite init 生成（含代理密码，不提交）
+```
