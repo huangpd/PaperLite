@@ -10,6 +10,7 @@ paperlite-monitor：监控面板端命令。
 
 import argparse
 import dataclasses
+import math
 import logging
 import random
 import sys
@@ -45,7 +46,10 @@ def _serve(cfg: MonitorConfig, consume: bool) -> None:
     from paperlite.monitor.dashboard import make_server
     from paperlite.monitor.db import MonitorDB
 
-    db = MonitorDB(cfg.db_path, cfg.retention_days)
+    if not cfg.loopback_only and not cfg.auth_enabled:
+        raise SystemExit(f"面板监听 {cfg.bind}（非本机）却没设密码：任何人都能看。请在 [monitor] 设 password"
+                         f"（或 token），或改回 bind = \"127.0.0.1\" 再由 HTTPS 反代对外。见 docs/MONITOR.md")
+    db = MonitorDB(cfg.db_path, cfg.retention_days, cfg.raw_retention_hours)
     db.prune(force=True)
     stop = threading.Event()
     if consume:
@@ -54,8 +58,10 @@ def _serve(cfg: MonitorConfig, consume: bool) -> None:
         threading.Thread(target=consume_forever, args=(cfg, db, stop), name="consumer", daemon=True).start()
     srv = make_server(cfg, db)
     host = "127.0.0.1" if cfg.bind in ("0.0.0.0", "") else cfg.bind
-    logger.info("监控大屏 http://%s:%d/%s  数据库 %s（保留 %d 天）", host, cfg.port,
-                f"?token={cfg.token}" if cfg.token else "", cfg.db_path.resolve(), cfg.retention_days)
+    auth = (f"登录用户 {cfg.username}" if cfg.password else "") + \
+           ("，另可用 token" if cfg.token else "") or "未设密码（仅本机可访问）"
+    logger.info("监控大屏 http://%s:%d/  %s  数据库 %s（保留 %d 天）", host, cfg.port, auth,
+                cfg.db_path.resolve(), cfg.retention_days)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -128,7 +134,13 @@ def demo_messages(now: float, days: int = 30, scale: int = 1) -> list[dict]:
             "host": host, "passed": passed, "ok": ok, "status": status, "waf": waf,
             "elapsed_ms": int(rnd.lognormvariate(0, 0.45) * base_ms) if passed else 90000,
             "error": "" if passed else "TimeoutError: 90s 内页面未稳定"}))
-    for i, (node, vendor, batch) in enumerate(insts):
+    for i, (node, vendor, batch) in enumerate(insts):                 # 历史心跳：每 15 分钟一次，在线数有起伏
+        for k in range(days * 96, 0, -1):
+            ts = now - k * 900
+            online = max(0, min(20, round([17, 19, 8][i] + 3 * math.sin(ts / 20000 + i) + rnd.uniform(-2, 2))))
+            out.append(env(schema.HEARTBEAT, ts, node, vendor, batch, {
+                "mode": "browser", "browsers_online": online, "workers": 20, "pending": 0, "running": online,
+                "success": 0, "failed": 0}))
         out.append(env(schema.HEARTBEAT, now - i * 5, node, vendor, batch, {
             "mode": "browser", "browsers_online": [18, 20, 7][i], "workers": 20,
             "pending": [12034, 4410, 960][i], "running": [18, 20, 7][i], "success": [8231, 5120, 2210][i],
@@ -141,7 +153,7 @@ def demo_messages(now: float, days: int = 30, scale: int = 1) -> list[dict]:
 def _demo(cfg: MonitorConfig, scale: int) -> None:
     from paperlite.monitor.db import MonitorDB
 
-    db = MonitorDB(cfg.db_path, cfg.retention_days)
+    db = MonitorDB(cfg.db_path, cfg.retention_days, cfg.raw_retention_hours)
     n = db.ingest(demo_messages(time.time(), scale=scale))
     db.close()
     logger.info("已写入 %d 条模拟数据到 %s", n, cfg.db_path)

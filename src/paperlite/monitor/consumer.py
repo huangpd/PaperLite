@@ -37,18 +37,18 @@ def consume_forever(cfg: MonitorConfig, db: MonitorDB, stop: threading.Event) ->
             ch.basic_qos(prefetch_count=_BATCH * 2)
             logger.info("已连接 RabbitMQ，消费队列 %s", cfg.queue)
             backoff = 1.0
-            pending_tag, n = None, 0
+            pending_tag, batch = None, []
             for method, _props, body in ch.consume(cfg.queue, inactivity_timeout=1.0):
                 if method is not None:
                     try:
-                        db.ingest([schema.decode(body)], commit=False)
+                        batch.append(schema.decode(body))
                     except Exception as e:
                         logger.debug("丢弃无法解析的监控消息: %s", e)
-                    pending_tag, n = method.delivery_tag, n + 1
-                if pending_tag is not None and (n >= _BATCH or method is None):
-                    db.commit()                                   # 先落盘再 ack：崩溃最多重放，不丢
+                    pending_tag = method.delivery_tag
+                if pending_tag is not None and (len(batch) >= _BATCH or method is None):
+                    db.ingest(batch)                              # 整批聚合入库并提交，之后才 ack：崩溃最多重放，不丢
                     ch.basic_ack(pending_tag, multiple=True)
-                    pending_tag, n = None, 0
+                    pending_tag, batch = None, []
                 if method is None:
                     db.prune()
                 if stop.is_set():

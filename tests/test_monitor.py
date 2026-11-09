@@ -141,7 +141,8 @@ class MonitorDBTest(unittest.TestCase):
         self.assertEqual((d["pages"]["attempts"], d["pages"]["success"], d["pages"]["failed"]), (4, 2, 2))
         self.assertEqual(d["pages"]["success_rate"], 0.5)
         self.assertEqual(d["pages"]["pass_rate"], 0.75)
-        self.assertEqual((d["pages"]["avg_ms"], d["pages"]["p95_ms"]), (2000, 3000))   # 耗时不含没过盾的 90s 超时
+        self.assertEqual(d["pages"]["avg_ms"], 2000)                     # 耗时不含没过盾的 90s 超时
+        self.assertAlmostEqual(d["pages"]["p95_ms"], 3000, delta=3000 * 0.07)   # 直方图分位，误差 ±6%
         self.assertEqual((d["ip"]["checked"], d["ip"]["passed"]), (3, 1))
         self.assertEqual({r["reason"] for r in d["ip"]["fail_reasons"]}, {"slow", "exit_ip_mismatch"})
         self.assertEqual([x["host"] for x in d["domains"]], ["a.org"])
@@ -189,8 +190,10 @@ class MonitorDBTest(unittest.TestCase):
     def test_prune_and_timeline(self):
         now = self.now
         self.db.ingest([page(now - 40 * 86400), page(now - 100)])
-        self.assertEqual(self.db.prune(now=now, force=True), 1)
-        tl = self.db.summary("1d", now=now)["timeline"]
+        self.db.prune(now=now, force=True)
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM page_h").fetchone()[0], 1)   # 过期汇总已删
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM page").fetchone()[0], 1)
+        tl = self.db.summary("1d", now=now)["trend"]
         self.assertEqual(sum(b["attempts"] for b in tl), 1)
         self.assertGreaterEqual(len(tl), 24)
         with self.assertRaises(ValueError):
@@ -229,6 +232,51 @@ class DashboardHttpTest(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
                 db.close()
+
+
+class DashboardAuthTest(unittest.TestCase):
+    def _serve(self, cfg):
+        from paperlite.monitor.dashboard import make_server
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        db = MonitorDB(Path(tmp.name) / "m.db"); self.addCleanup(db.close)
+        srv = make_server(cfg, db)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close); self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def _get(self, url, user=None, pw=None):
+        import base64
+        req = urllib.request.Request(url)
+        if user is not None:
+            req.add_header("Authorization", "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode())
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, {k.lower(): v for k, v in r.headers.items()}
+        except urllib.error.HTTPError as e:
+            return e.code, {k.lower(): v for k, v in e.headers.items()}
+
+    def test_basic_auth(self):
+        base = self._serve(MonitorConfig(port=0, username="ops", password="密码 with:colon"))
+        code, h = self._get(base + "/")
+        self.assertEqual(code, 401)
+        self.assertIn("Basic", h.get("www-authenticate", ""))            # 浏览器据此弹登录框
+        self.assertEqual(self._get(base + "/", "ops", "wrong")[0], 401)
+        self.assertEqual(self._get(base + "/", "admin", "密码 with:colon")[0], 401)
+        self.assertEqual(self._get(base + "/", "ops", "密码 with:colon")[0], 200)   # 非 ASCII / 含冒号密码
+        self.assertEqual(self._get(base + "/api/summary", "ops", "密码 with:colon")[0], 200)
+        self.assertEqual(self._get(base + "/health")[0], 200)             # 健康检查不需要登录
+
+    def test_token_and_password_either_works(self):
+        base = self._serve(MonitorConfig(port=0, password="p", token="t"))
+        self.assertEqual(self._get(base + "/api/summary?token=t")[0], 200)
+        self.assertEqual(self._get(base + "/api/summary", "admin", "p")[0], 200)
+        self.assertEqual(self._get(base + "/api/summary?token=x")[0], 401)
+
+    def test_refuses_public_bind_without_auth(self):
+        from paperlite.monitor import cli
+        with self.assertRaises(SystemExit) as e:
+            cli._serve(MonitorConfig(bind="0.0.0.0", port=0), consume=False)
+        self.assertIn("password", str(e.exception))
 
 
 class BrowserPoolMonitorWiringTest(unittest.TestCase):

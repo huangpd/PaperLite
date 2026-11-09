@@ -24,8 +24,11 @@ class MonitorConfig:
     db: str = "monitor.db"                # 面板入库的 SQLite（本地盘）
     bind: str = "127.0.0.1"
     port: int = 8700
-    token: str = ""                       # 非空则访问面板需 ?token=… （公网暴露时务必设置）
-    retention_days: int = 30
+    username: str = "admin"               # 面板登录用户名（HTTP Basic，浏览器弹框输入）
+    password: str = ""                    # 面板登录密码；非空即开启登录。监听非本机地址时必须设（或设 token）
+    token: str = ""                       # 可选：给脚本/监控系统用的只读令牌（?token=… 或请求头 X-Token）
+    retention_days: int = 30              # 小时汇总（大屏 1/7/30 天）保留天数
+    raw_retention_hours: int = 48         # 原始事件（实时事件流、明细）保留小时数；量大时调小
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "MonitorConfig":
@@ -38,9 +41,19 @@ class MonitorConfig:
             raise ValueError("[monitor] heartbeat_s 必须大于 0")
         if cfg.retention_days < 1:
             raise ValueError("[monitor] retention_days 至少 1")
+        if cfg.raw_retention_hours < 2:
+            raise ValueError("[monitor] raw_retention_hours 至少 2（实时事件流看最近 1 小时）")
         if cfg.enabled and not cfg.amqp_url:
             raise ValueError("[monitor] enabled = true 时 amqp_url 必填")
         return cfg
+
+    @property
+    def auth_enabled(self) -> bool:
+        return bool(self.password or self.token)
+
+    @property
+    def loopback_only(self) -> bool:
+        return self.bind in ("127.0.0.1", "localhost", "::1")
 
     @property
     def node_name(self) -> str:

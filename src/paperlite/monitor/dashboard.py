@@ -3,9 +3,12 @@
   GET /                      大屏页面（每 10s 自动刷新）
   GET /api/summary?window=1d|7d|30d   全部聚合数字（JSON）
   GET /health
-配置了 token 时，页面与接口都要带 ?token=…（或请求头 X-Token）。
+鉴权（/health 除外）：配了 password → HTTP Basic（浏览器弹框）；配了 token → ?token=… 或请求头 X-Token。
+两者都配时任一通过即可。都没配则不鉴权（只应在 bind 本机时这样用，cli 会拦）。
+Basic 鉴权密码按明文传输，公网务必在前面加 HTTPS 反代（见 docs/MONITOR.md）。
 """
 
+import base64
 import hmac
 import json
 import logging
@@ -36,10 +39,15 @@ def make_server(cfg: MonitorConfig, db: MonitorDB) -> ThreadingHTTPServer:
             self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
 
         def _authorized(self, qs) -> bool:
-            if not cfg.token:
+            if not cfg.auth_enabled:
                 return True
-            given = (qs.get("token") or [""])[0] or self.headers.get("X-Token", "")
-            return hmac.compare_digest(given.encode(), cfg.token.encode())
+            if cfg.token:
+                given = (qs.get("token") or [""])[0] or self.headers.get("X-Token", "")
+                if given and hmac.compare_digest(given.encode(), cfg.token.encode()):
+                    return True
+            if cfg.password:
+                return _basic_ok(self.headers.get("Authorization", ""), cfg.username, cfg.password)
+            return False
 
         def do_GET(self):
             u = urlsplit(self.path)
@@ -47,7 +55,16 @@ def make_server(cfg: MonitorConfig, db: MonitorDB) -> ThreadingHTTPServer:
             if u.path == "/health":
                 return self._json(200, {"ok": True})
             if not self._authorized(qs):
-                return self._json(401, {"error": "需要 token"})
+                body = json.dumps({"error": "需要登录"}, ensure_ascii=False).encode()
+                self.send_response(401)
+                if cfg.password:
+                    self.send_header("WWW-Authenticate", 'Basic realm="PaperLite monitor", charset="UTF-8"')
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                logger.info("面板鉴权失败 %s %s", self.address_string(), u.path)
+                return
             if u.path == "/":
                 return self._send(200, page, "text/html; charset=utf-8")
             if u.path == "/api/summary":
@@ -67,3 +84,17 @@ def make_server(cfg: MonitorConfig, db: MonitorDB) -> ThreadingHTTPServer:
     srv = ThreadingHTTPServer((cfg.bind, cfg.port), Handler)
     srv.daemon_threads = True
     return srv
+
+
+def _basic_ok(header: str, username: str, password: str) -> bool:
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() != "basic" or not value:
+        return False
+    try:
+        user, _, pw = base64.b64decode(value.strip(), validate=True).decode("utf-8").partition(":")
+    except Exception:
+        return False
+    # 两项都比完再判，避免按用户名是否正确产生时间差
+    ok_user = hmac.compare_digest(user.encode(), username.encode())
+    ok_pw = hmac.compare_digest(pw.encode(), password.encode())
+    return ok_user and ok_pw

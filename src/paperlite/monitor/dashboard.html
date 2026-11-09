@@ -6,249 +6,509 @@
 <title>PaperLite 监控</title>
 <style>
 :root {
-  --bg: #0d1117; --panel: #161b22; --panel-2: #1c2230; --line: #2a3140;
-  --text: #e6edf3; --muted: #8b95a5; --faint: #5b6577;
-  --ok: #3fb950; --warn: #d29922; --bad: #f85149; --accent: #58a6ff;
-  --cf: #f38020; --aws: #ff9900; --dd: #a371f7;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: light;
+  --page: #f3f5f9; --card: #ffffff; --card-2: #f6f8fb; --line: #e4e8ef; --grid: #edf0f4; --axis: #c9cfd9;
+  --ink: #111827; --ink-2: #4b5563; --muted: #8a93a3;
+  --side: #1b2540; --side-2: #243052; --side-ink: #c7cee0; --side-active: #2a78d6;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --good: #0ca30c; --warn: #fab219; --serious: #ec835a; --crit: #d03b3b; --good-ink: #006300;
+  --cf: #eb6834; --aws: #eda100; --dd: #6250d6;
+  --tile-blue: #e8f1fd; --tile-green: #e5f6ef; --tile-violet: #efecfc; --tile-orange: #fdefe8; --tile-aqua: #e3f5f4;
+  --shadow: 0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.06);
 }
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    --bg: #f6f8fa; --panel: #ffffff; --panel-2: #f0f3f6; --line: #d8dee4;
-    --text: #1f2328; --muted: #59636e; --faint: #8c959f;
-    --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --accent: #0969da;
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0f1420; --card: #171d2b; --card-2: #1d2434; --line: #283044; --grid: #222a3b; --axis: #39425a;
+    --ink: #eef1f6; --ink-2: #c3c9d6; --muted: #8a93a8;
+    --side: #0b1020; --side-2: #161d33;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --good-ink: #0ca30c;
+    --cf: #d95926; --aws: #c98500; --dd: #9085e9;
+    --tile-blue: #1b2b45; --tile-green: #16332a; --tile-violet: #262445; --tile-orange: #3a2419; --tile-aqua: #153232;
+    --shadow: none;
   }
 }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0f1420; --card: #171d2b; --card-2: #1d2434; --line: #283044; --grid: #222a3b; --axis: #39425a;
+  --ink: #eef1f6; --ink-2: #c3c9d6; --muted: #8a93a8;
+  --side: #0b1020; --side-2: #161d33;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --good-ink: #0ca30c;
+  --cf: #d95926; --aws: #c98500; --dd: #9085e9;
+  --tile-blue: #1b2b45; --tile-green: #16332a; --tile-violet: #262445; --tile-orange: #3a2419; --tile-aqua: #153232;
+  --shadow: none;
+}
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text);
-  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
-header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; padding: 14px 20px;
-  border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
-h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .3px; }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-right: 6px; }
-.dot.live { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-.seg button { background: transparent; color: var(--muted); border: 0; padding: 5px 14px; cursor: pointer; font: inherit; }
-.seg button.on { background: var(--accent); color: #fff; }
-.meta { color: var(--muted); font-size: 12px; margin-left: auto; }
-main { padding: 16px 20px 40px; display: grid; gap: 16px; max-width: 1680px; margin: 0 auto; }
-.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
-.card h2 { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 10px; letter-spacing: .5px; }
-.big { font: 600 28px/1.1 var(--mono); }
-.big small { font-size: 14px; color: var(--muted); font-weight: 400; }
-.sub { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
-.sub b { color: var(--text); font-family: var(--mono); font-weight: 600; }
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-@media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
-.wafs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-@media (max-width: 700px) { .wafs { grid-template-columns: 1fr; } }
-.waf { border-left: 3px solid var(--line); padding-left: 12px; }
-.waf.cloudflare { border-color: var(--cf); } .waf.aws_waf { border-color: var(--aws); } .waf.datadome { border-color: var(--dd); }
-.waf .name { font-weight: 600; margin-bottom: 4px; }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-td { padding: 6px 8px; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); white-space: nowrap; }
-td.num, th.num { text-align: right; font-family: var(--mono); }
-td.host { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+body { margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+svg { display: block; }
+.ico { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.num, .tab { font-variant-numeric: tabular-nums; }
+
+/* 布局 */
+.shell { display: grid; grid-template-columns: 216px 1fr; min-height: 100vh; background: linear-gradient(to right, var(--side) 216px, transparent 216px); }
+aside { background: var(--side); color: var(--side-ink); position: sticky; top: 0; height: 100vh; padding: 18px 12px; display: flex; flex-direction: column; gap: 4px; }
+.brand { display: flex; gap: 10px; align-items: center; color: #fff; font-weight: 600; font-size: 15px; line-height: 1.2; padding: 4px 10px 22px; }
+.brand .logo { display: flex; gap: 3px; align-items: flex-end; height: 22px; }
+.brand .logo i { width: 5px; border-radius: 2px; background: var(--side-active); }
+nav a { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border-radius: 8px; color: var(--side-ink); text-decoration: none; font-size: 14px; }
+nav a:hover { background: var(--side-2); color: #fff; }
+nav a.on { background: var(--side-active); color: #fff; }
+aside .foot { margin-top: auto; padding: 10px 12px; font-size: 12px; color: #7f8aa5; }
+main { min-width: 0; }
+header { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
+  padding: 14px 24px; background: color-mix(in srgb, var(--page) 88%, transparent); backdrop-filter: blur(8px); }
+.state { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; flex: none; }
+.dot.on { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); }
+.sep { width: 1px; height: 16px; background: var(--line); }
+.updated { color: var(--ink-2); font-size: 13px; }
+.tools { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+.seg { display: inline-flex; background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 3px; box-shadow: var(--shadow); }
+.seg button { border: 0; background: transparent; color: var(--ink-2); font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 6px; cursor: pointer; }
+.seg button.on { background: var(--s1); color: #fff; }
+.iconbtn { border: 1px solid var(--line); background: var(--card); color: var(--ink-2); border-radius: 9px; width: 36px; height: 36px; display: grid; place-items: center; cursor: pointer; box-shadow: var(--shadow); }
+.content { padding: 4px 24px 40px; display: grid; gap: 16px; max-width: 1640px; }
+.row { display: grid; gap: 16px; }
+.r-kpi { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.r-2a { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); align-items: start; }
+.r-2b { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
+@media (max-width: 1380px) { .r-kpi { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 1100px) { .r-2a, .r-2b { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 860px) {
+  .shell { grid-template-columns: 1fr; background: none; }
+  aside { position: sticky; top: 0; z-index: 6; height: auto; flex-direction: row; align-items: center; padding: 8px 12px; overflow-x: auto; }
+  .brand { padding: 0 8px 0 0; font-size: 13px; } .brand span { display: none; }
+  nav { display: flex; gap: 2px; } nav a { padding: 7px 10px; white-space: nowrap; font-size: 13px; } nav a .ico { display: none; }
+  aside .foot { display: none; }
+  header { position: static; padding: 12px 16px; } .tools { margin-left: 0; width: 100%; justify-content: space-between; }
+  .content { padding: 4px 16px 32px; }
+  .card > h2 .hint { margin-left: 0; flex-basis: 100%; white-space: normal; }
+  .r-kpi { grid-template-columns: minmax(0, 1fr); }
+  html { scroll-padding-top: 60px; }
+}
+
+/* 卡片 */
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; box-shadow: var(--shadow); min-width: 0; }
+.card > h2 { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; white-space: nowrap; margin: 0 0 14px; font-size: 16px; font-weight: 600; }
+.card > h2 .ico { color: var(--s1); width: 20px; height: 20px; }
+.card > h2 .hint { margin-left: auto; font-size: 12px; font-weight: 400; color: var(--muted); }
+.kpi { display: flex; gap: 16px; align-items: flex-start; }
+.tile { width: 52px; height: 52px; border-radius: 12px; display: grid; place-items: center; flex: none; }
+.tile .ico { width: 26px; height: 26px; }
+.t-green { background: var(--tile-green); color: var(--good-ink); } .t-blue { background: var(--tile-blue); color: var(--s1); }
+.t-violet { background: var(--tile-violet); color: var(--dd); } .t-orange { background: var(--tile-orange); color: var(--s2); }
+.t-aqua { background: var(--tile-aqua); color: var(--s3); }
+.kpi .label { color: var(--ink-2); font-size: 13px; }
+.kpi .value { font-size: 30px; font-weight: 650; letter-spacing: -.5px; line-height: 1.15; margin: 4px 0 6px; }
+.kpi .value small { font-size: 14px; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+.kpi .meta { font-size: 13px; color: var(--ink-2); display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.kpi .meta b { color: var(--ink); font-weight: 600; }
+.delta { font-size: 12px; font-weight: 600; white-space: nowrap; }
+.delta.up { color: var(--good-ink); } .delta.down { color: var(--crit); } .delta.flat { color: var(--muted); }
+
+/* 趋势小图 */
+.multiples { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+@media (max-width: 700px) { .multiples { grid-template-columns: minmax(0, 1fr); } }
+.mini h3 { margin: 0 0 2px; font-size: 13px; font-weight: 500; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
+.mini h3 i { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
+.mini .now { font-size: 20px; font-weight: 650; margin-bottom: 4px; }
+.chart { position: relative; width: 100%; }
+.chart svg { width: 100%; overflow: visible; }
+
+/* 表格 */
 .scroll { overflow-x: auto; }
-.bar { display: inline-block; vertical-align: middle; width: 70px; height: 6px; border-radius: 3px; background: var(--panel-2); margin-right: 8px; overflow: hidden; }
-.bar i { display: block; height: 100%; }
-.tag { font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--panel-2); color: var(--muted); }
-.tag.cloudflare { color: var(--cf); } .tag.aws_waf { color: var(--aws); } .tag.datadome { color: var(--dd); }
-.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .muted { color: var(--muted); }
-.vendor { margin-bottom: 14px; }
-.vendor .vh { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
-.vendor .vh b { font-size: 15px; }
-#timeline { width: 100%; height: 160px; display: block; }
-.legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 6px; }
-.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; background: var(--c); }
-.events { max-height: 420px; overflow-y: auto; font-size: 12px; font-family: var(--mono); }
-.ev { display: grid; grid-template-columns: 64px 64px 1fr; gap: 8px; padding: 4px 0; border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent); }
-.ev .t { color: var(--faint); } .ev .k { color: var(--muted); }
-.ev.warn .m, .ev.warning .m { color: var(--warn); } .ev.error .m, .ev.critical .m { color: var(--bad); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; font-weight: 500; color: var(--ink-2); background: var(--card-2); padding: 9px 10px; white-space: nowrap; }
+th:first-child { border-radius: 8px 0 0 8px; } th:last-child { border-radius: 0 8px 8px 0; }
+td { padding: 9px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; }
+td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.rate { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.meter { width: 52px; height: 6px; border-radius: 3px; background: var(--grid); overflow: hidden; }
+.meter i { display: block; height: 100%; border-radius: 3px; }
+.sdot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.waf-tag { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); }
+.waf-tag i { width: 8px; height: 8px; border-radius: 2px; }
+
+/* 厂商矩阵 */
+.matrix td, .matrix th { text-align: center; }
+.matrix td:first-child, .matrix th:first-child { text-align: left; font-weight: 500; }
+.matrix td.cell { padding: 7px 10px; }
+.matrix .cell b { display: block; font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.matrix .cell span { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.matrix .cell .bar { height: 3px; border-radius: 2px; margin: 5px auto 0; width: 48px; background: var(--grid); overflow: hidden; }
+.matrix .cell .bar i { display: block; height: 100%; }
+.vsub { font-size: 12px; color: var(--muted); font-weight: 400; display: block; }
+
+/* WAF */
+.wafs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 760px) { .wafs { grid-template-columns: minmax(0, 1fr); } }
+.waf { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; position: relative; overflow: hidden; }
+.waf::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--c); }
+.waf .name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.waf .big { font-size: 26px; font-weight: 650; margin: 6px 0 4px; }
+.waf .big small { font-size: 13px; font-weight: 400; color: var(--muted); }
+.waf .facts { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); }
+.waf .facts b { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+/* 环形图 */
+.donut-wrap { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+.donut { position: relative; flex: none; }
+.donut .center { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; pointer-events: none; }
+.donut .center b { font-size: 24px; font-weight: 650; }
+.donut .center span { font-size: 12px; color: var(--muted); }
+.legend { display: grid; gap: 12px; min-width: 180px; flex: 1; }
+.legend div { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.legend div i { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.legend div b { margin-left: auto; font-variant-numeric: tabular-nums; }
+.legend div span.n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 56px; text-align: right; }
+
+/* IP */
+.ipgrid { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 20px 28px; align-items: center; }
+@media (max-width: 640px) { .ipgrid { grid-template-columns: minmax(0, 1fr); } }
+.ipfacts { display: grid; grid-template-columns: auto auto; gap: 8px 22px; font-size: 14px; color: var(--ink-2); }
+.ipfacts b { color: var(--ink); font-size: 18px; font-variant-numeric: tabular-nums; }
+.subhead { font-size: 13px; color: var(--ink-2); margin: 0 0 6px; }
+.reasons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.reasons span { font-size: 12px; background: var(--card-2); border: 1px solid var(--line); padding: 3px 9px; border-radius: 12px; color: var(--ink-2); }
+.reasons b { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+/* 实时 */
+.freq { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.freq span { font-size: 12px; background: var(--card-2); border: 1px solid var(--line); padding: 3px 10px; border-radius: 12px; }
+.freq b { font-variant-numeric: tabular-nums; }
+.feed { max-height: 360px; overflow-y: auto; }
+.ev { display: grid; grid-template-columns: 10px 64px 54px minmax(0, 1fr); gap: 10px; align-items: center; padding: 6px 0; font-size: 13px; border-bottom: 1px solid var(--grid); }
+.ev:last-child { border-bottom: 0; }
+.ev .t { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+.ev .k { color: var(--muted); font-size: 12px; }
 .ev .m { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.freq { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.freq span { font-size: 12px; background: var(--panel-2); padding: 3px 9px; border-radius: 12px; }
-.freq b { font-family: var(--mono); color: var(--accent); }
-.empty { color: var(--faint); padding: 12px 0; font-size: 13px; }
-.err { background: color-mix(in srgb, var(--bad) 15%, var(--panel)); border: 1px solid var(--bad); color: var(--text); padding: 10px 14px; border-radius: 8px; display: none; }
+.empty { color: var(--muted); padding: 18px 0; text-align: center; font-size: 13px; }
+.err { background: color-mix(in srgb, var(--crit) 10%, var(--card)); border: 1px solid var(--crit); padding: 10px 14px; border-radius: 10px; display: none; }
+
+/* 悬浮提示 */
+#tip { position: fixed; z-index: 50; pointer-events: none; background: var(--ink); color: var(--card); font-size: 12px; line-height: 1.5;
+  padding: 7px 10px; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); opacity: 0; transition: opacity .08s; max-width: 280px; }
+#tip b { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
-<header>
-  <h1><span class="dot" id="livedot"></span>PaperLite 监控大屏</h1>
-  <div class="seg" id="win">
-    <button data-w="1d" class="on">最近 1 天</button><button data-w="7d">7 天</button><button data-w="30d">30 天</button>
-  </div>
-  <div class="meta" id="meta">加载中…</div>
-</header>
-<main>
-  <div class="err" id="err"></div>
+<div class="shell">
+  <aside>
+    <div class="brand"><div class="logo"><i style="height:10px"></i><i style="height:22px"></i><i style="height:15px"></i></div><span>PaperLite<br>Crawler Monitor</span></div>
+    <nav id="nav">
+      <a href="#overview" class="on"><svg class="ico" viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>总览</a>
+      <a href="#ip"><svg class="ico" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>IP 质检</a>
+      <a href="#browsers"><svg class="ico" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg>浏览器监控</a>
+      <a href="#domains"><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>域名分析</a>
+      <a href="#vendors"><svg class="ico" viewBox="0 0 24 24"><circle cx="7" cy="8" r="3"/><circle cx="17" cy="8" r="3"/><path d="M2 20c0-3 2.2-5 5-5s5 2 5 5M12 20c0-3 2.2-5 5-5s5 2 5 5"/></svg>厂商分析</a>
+      <a href="#waf"><svg class="ico" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8 8 9 4.6-1 8-4.5 8-9V6z"/><path d="M12 8v5M12 16h.01"/></svg>WAF 过盾</a>
+      <a href="#live"><svg class="ico" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>实时日志</a>
+    </nav>
+    <div class="foot" id="foot">PaperLite monitor</div>
+  </aside>
 
-  <section class="kpis">
-    <div class="card"><h2>IP 质检</h2><div class="big" id="ip-rate">–</div>
-      <div class="sub"><span>质检 <b id="ip-n">–</b></span><span>通过 <b id="ip-ok">–</b></span><span>均延迟 <b id="ip-ms">–</b></span></div></div>
-    <div class="card"><h2>浏览器</h2><div class="big" id="br-online">–</div>
-      <div class="sub"><span>启动成功率 <b id="br-rate">–</b></span><span>启动 <b id="br-n">–</b></span><span>异常 <b id="br-exc">–</b></span><span>均过盾 <b id="br-pass">–</b></span></div></div>
-    <div class="card"><h2>页面采集</h2><div class="big" id="pg-rate">–</div>
-      <div class="sub"><span>成功 <b id="pg-ok">–</b></span><span>失败 <b id="pg-fail">–</b></span><span>过盾率 <b id="pg-pass">–</b></span></div></div>
-    <div class="card"><h2>页面耗时（已加载页）</h2><div class="big" id="pg-avg">–</div>
-      <div class="sub"><span>P95 <b id="pg-p95">–</b></span><span>尝试 <b id="pg-n">–</b></span></div></div>
-    <div class="card"><h2>实时任务</h2><div class="big" id="rt-pending">–</div>
-      <div class="sub"><span>进行中 <b id="rt-running">–</b></span><span>在线终端 <b id="rt-inst">–</b></span></div></div>
-  </section>
+  <main>
+    <header>
+      <div class="state"><span class="dot" id="livedot"></span><span id="livetext">连接中…</span></div>
+      <span class="sep"></span>
+      <span class="updated" id="updated">更新时间：–</span>
+      <div class="tools">
+        <div class="seg" id="win"><button data-w="1d">24 小时</button><button data-w="7d">7 天</button><button data-w="30d">30 天</button></div>
+        <button class="iconbtn" id="theme" title="切换深色 / 浅色"><svg class="ico" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg></button>
+      </div>
+    </header>
 
-  <section class="card">
-    <h2>采集趋势（成功 / 过盾但失败 / 未过盾）</h2>
-    <svg id="timeline" preserveAspectRatio="none"></svg>
-    <div class="legend"><span style="--c:var(--ok)">成功</span><span style="--c:var(--warn)">过盾但 HTTP 失败</span><span style="--c:var(--bad)">未过盾</span></div>
-  </section>
+    <div class="content">
+      <div class="err" id="err"></div>
 
-  <section class="card">
-    <h2>WAF 过盾分析（页面 + 热身落地页；过盾 = 页面真加载出来）</h2>
-    <div class="wafs" id="wafs"></div>
-  </section>
+      <section class="row r-kpi" id="overview">
+        <div class="card kpi"><div class="tile t-green"><svg class="ico" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></div>
+          <div><div class="label" id="k-ip-label">IP 质检数</div><div class="value num" id="k-ip">–</div><div class="meta"><span>通过率 <b id="k-ip-rate">–</b></span><span id="k-ip-d"></span></div></div></div>
+        <div class="card kpi"><div class="tile t-blue"><svg class="ico" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01M8 14h3M8 17h6"/></svg></div>
+          <div><div class="label">当前在线浏览器</div><div class="value num" id="k-br">–</div><div class="meta"><span>启动成功率 <b id="k-br-rate">–</b></span><span>异常 <b id="k-br-exc">–</b></span></div></div></div>
+        <div class="card kpi"><div class="tile t-violet"><svg class="ico" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></svg></div>
+          <div><div class="label" id="k-pg-label">HTML 成功数</div><div class="value num" id="k-pg">–</div><div class="meta"><span>成功率 <b id="k-pg-rate">–</b></span><span id="k-pg-d"></span></div></div></div>
+        <div class="card kpi"><div class="tile t-orange"><svg class="ico" viewBox="0 0 24 24"><path d="M4 14a1 1 0 0 1-.8-1.6l9.9-10.2a.5.5 0 0 1 .9.5l-1.9 6A1 1 0 0 0 13 10h7a1 1 0 0 1 .8 1.6l-9.9 10.2a.5.5 0 0 1-.9-.5l1.9-6A1 1 0 0 0 11 14z"/></svg></div>
+          <div><div class="label">页面平均耗时</div><div class="value num" id="k-ms">–</div><div class="meta"><span>P95 <b id="k-p95">–</b></span><span id="k-ms-d"></span></div></div></div>
+        <div class="card kpi"><div class="tile t-aqua"><svg class="ico" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg></div>
+          <div><div class="label">实时任务（待下载）</div><div class="value num" id="k-pend">–</div><div class="meta"><span>进行中 <b id="k-run">–</b></span><span>在线终端 <b id="k-inst">–</b></span></div></div></div>
+      </section>
 
-  <section class="card">
-    <h2>域名：成功率 / 过盾率 / 耗时（IP 过质检后，能否过该域名风控）</h2>
-    <div class="scroll"><table id="domains"></table></div>
-  </section>
+      <section class="row r-2a">
+        <div class="card"><h2><svg class="ico" viewBox="0 0 24 24"><path d="m3 17 6-6 4 4 8-8M14 7h7v7"/></svg>核心指标趋势<span class="hint" id="trend-hint"></span></h2>
+          <div class="multiples">
+            <div class="mini"><h3><i style="background:var(--s1)"></i>HTML 成功率</h3><div class="now num" id="m1-now">–</div><div class="chart" id="m1"></div></div>
+            <div class="mini"><h3><i style="background:var(--s3)"></i>在线浏览器数</h3><div class="now num" id="m2-now">–</div><div class="chart" id="m2"></div></div>
+            <div class="mini"><h3><i style="background:var(--s2)"></i>平均耗时</h3><div class="now num" id="m3-now">–</div><div class="chart" id="m3"></div></div>
+          </div></div>
+        <div class="card" id="vendors"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M5 21V10M12 21V4M19 21v-7"/></svg>代理厂商 × 域名成功率<span class="hint">成功 / 失败 次数</span></h2>
+          <div class="scroll" id="matrix"></div></div>
+      </section>
 
-  <section class="grid2">
-    <div class="card"><h2>代理厂商 × 域名成功率</h2><div id="vendors"></div></div>
-    <div class="card"><h2>实时：域名访问频率（近 5 分钟）与事件</h2>
-      <div class="freq" id="freq"></div>
-      <div class="events" id="events"></div></div>
-  </section>
+      <section class="card" id="waf"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8 8 9 4.6-1 8-4.5 8-9V6z"/></svg>WAF 过盾分析<span class="hint">页面 + 热身落地页；过盾 = 页面真加载出来</span></h2>
+        <div class="wafs" id="wafs"></div></section>
 
-  <section class="grid2">
-    <div class="card"><h2>终端</h2><div class="scroll"><table id="instances"></table></div></div>
-    <div class="card"><h2>IP 质检不通过原因</h2><div class="scroll"><table id="reasons"></table></div></div>
-  </section>
-</main>
+      <section class="row r-2b">
+        <div class="card" id="domains"><h2><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>域名整体表现<span class="hint">IP 过质检后，能否过该域名风控</span></h2>
+          <div class="scroll"><table id="domtable"></table></div></div>
+        <div class="card"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M21 12A9 9 0 1 1 12 3v9z"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/></svg>采集结果分布</h2>
+          <div class="donut-wrap"><div class="donut" id="outdonut"></div><div class="legend" id="outlegend"></div></div></div>
+      </section>
+
+      <section class="row r-2a">
+        <div class="card" id="ip"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>IP 质检情况</h2>
+          <div class="ipgrid">
+            <div class="donut-wrap"><div class="donut" id="ipdonut"></div>
+              <div class="ipfacts"><span>通过</span><b id="ip-ok">–</b><span>失败</span><b id="ip-fail">–</b><span>均延迟</span><b id="ip-ms">–</b></div></div>
+            <div><p class="subhead" id="ipbars-title">通过率</p><div class="chart" id="ipbars"></div></div>
+          </div>
+          <div class="reasons" id="reasons"></div></div>
+        <div class="card" id="live"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>实时动态<span class="hint">近 1 小时 · 域名频率为近 5 分钟</span></h2>
+          <div class="freq" id="freq"></div><div class="feed" id="feed"></div></div>
+      </section>
+
+      <section class="card" id="browsers"><h2><svg class="ico" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg>浏览器与终端<span class="hint" id="br-hint"></span></h2>
+        <div class="scroll"><table id="insttable"></table></div></section>
+    </div>
+  </main>
+</div>
+<div id="tip"></div>
 <script>
 (() => {
   const qs = new URLSearchParams(location.search);
   const token = qs.get("token") || "";
-  let win = qs.get("window") || localStorageGet("win") || "1d";
+  const store = { get: k => { try { return localStorage.getItem("plmon-" + k); } catch (e) { return null; } },
+                  set: (k, v) => { try { localStorage.setItem("plmon-" + k, v); } catch (e) {} } };
+  let win = qs.get("window") || store.get("win") || "1d";
+  let last = null;
   const $ = id => document.getElementById(id);
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-  const pct = v => v == null ? "–" : (v * 100).toFixed(v >= 0.999 || v === 0 ? 0 : 1) + "%";
-  const num = v => v == null ? "–" : Number(v).toLocaleString();
-  const ms = v => v == null ? "–" : v >= 10000 ? (v / 1000).toFixed(0) + "s" : v >= 1000 ? (v / 1000).toFixed(1) + "s" : v + "ms";
-  const cls = v => v == null ? "muted" : v >= 0.9 ? "ok" : v >= 0.6 ? "warn" : "bad";
-  const color = v => `var(--${cls(v) === "muted" ? "faint" : cls(v)})`;
-  const bar = v => `<span class="bar"><i style="width:${v == null ? 0 : Math.round(v * 100)}%;background:${color(v)}"></i></span>`;
-  const rateCell = v => `<td class="num">${bar(v)}<span class="${cls(v)}">${pct(v)}</span></td>`;
-  const wafName = {cloudflare: "Cloudflare", aws_waf: "AWS WAF", datadome: "DataDome", none: "无"};
-  const tm = t => new Date(t * 1000).toLocaleTimeString([], {hour12: false});
-  function localStorageGet(k) { try { return localStorage.getItem("pl-mon-" + k); } catch (e) { return null; } }
-  function localStorageSet(k, v) { try { localStorage.setItem("pl-mon-" + k, v); } catch (e) {} }
+  const num = v => v == null ? "–" : Number(v).toLocaleString("zh-CN");
+  const kfmt = v => v == null ? "–" : v >= 1e4 ? (v / 1e3).toFixed(1) + "k" : String(v);
+  const pct = v => v == null ? "–" : (v * 100).toFixed(v === 1 || v === 0 ? 0 : 1) + "%";
+  const dur = v => v == null ? "–" : v >= 60000 ? (v / 60000).toFixed(1) + "min" : v >= 1000 ? (v / 1000).toFixed(1) + "s" : Math.round(v) + "ms";
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const status = v => v == null ? "var(--muted)" : v >= 0.9 ? "var(--good)" : v >= 0.7 ? "var(--warn)" : "var(--crit)";
+  const statusWord = v => v == null ? "" : v >= 0.9 ? "良好" : v >= 0.7 ? "一般" : "偏低";
+  const WAF = { cloudflare: ["Cloudflare", "var(--cf)"], aws_waf: ["AWS WAF", "var(--aws)"], datadome: ["DataDome", "var(--dd)"], none: ["无 WAF", "var(--axis)"] };
+  const winName = { "1d": "24 小时", "7d": "7 天", "30d": "30 天" };
+  const tm = (t, w) => { const d = new Date(t * 1000), p = n => String(n).padStart(2, "0");
+    return w === "1d" ? `${p(d.getHours())}:00` : w === "7d" ? `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}时` : `${d.getMonth() + 1}/${d.getDate()}`; };
+  const clock = t => new Date(t * 1000).toLocaleTimeString("zh-CN", { hour12: false });
 
-  document.querySelectorAll("#win button").forEach(b => {
-    b.classList.toggle("on", b.dataset.w === win);
-    b.onclick = () => { win = b.dataset.w; localStorageSet("win", win);
-      document.querySelectorAll("#win button").forEach(x => x.classList.toggle("on", x === b)); load(); };
-  });
+  /* ── 主题 / 时间窗 / 导航 ── */
+  const saved = store.get("theme");
+  if (saved) document.documentElement.dataset.theme = saved;
+  $("theme").onclick = () => {
+    const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = dark ? "light" : "dark"; store.set("theme", dark ? "light" : "dark");
+    if (last) render(last);
+  };
+  const setWin = w => { win = w; store.set("win", w); document.querySelectorAll("#win button").forEach(b => b.classList.toggle("on", b.dataset.w === w)); };
+  setWin(win);
+  document.querySelectorAll("#win button").forEach(b => b.onclick = () => { setWin(b.dataset.w); load(); });
+  const links = [...document.querySelectorAll("#nav a")];
+  const spy = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting)
+    links.forEach(a => a.classList.toggle("on", a.getAttribute("href") === "#" + e.target.id)); }), { rootMargin: "-30% 0px -60% 0px" });
+  links.forEach(a => { const s = $(a.getAttribute("href").slice(1)); if (s) spy.observe(s); });
+
+  /* ── 悬浮提示 ── */
+  const tip = $("tip");
+  const showTip = (html, ev) => { tip.innerHTML = html; tip.style.opacity = 1;
+    const x = Math.min(ev.clientX + 14, innerWidth - tip.offsetWidth - 8), y = Math.max(8, ev.clientY - tip.offsetHeight - 12);
+    tip.style.left = x + "px"; tip.style.top = y + "px"; };
+  const hideTip = () => { tip.style.opacity = 0; };
+
+  /* ── 图表：单轴折线（带十字线），柱状，环形 ── */
+  function line(el, pts, { color, fmt, yMin, yMax, label }) {
+    const W = el.clientWidth || 300, H = 190, L = 40, R = 6, T = 8, B = 20;
+    const vals = pts.map(p => p.v).filter(v => v != null);
+    if (!vals.length) { el.innerHTML = `<div class="empty">该时间窗无数据</div>`; return; }
+    let lo = yMin ?? Math.min(...vals), hi = yMax ?? Math.max(...vals);
+    if (yMin == null) lo = Math.max(0, lo - (hi - lo) * 0.15 - 1e-9);
+    if (hi === lo) hi = lo + 1;
+    const x = i => L + (W - L - R) * (pts.length === 1 ? 0.5 : i / (pts.length - 1));
+    const y = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+    let s = "";
+    [0, 0.5, 1].forEach(f => { const v = lo + (hi - lo) * f, yy = y(v);
+      s += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" stroke="var(--grid)"/>`;
+      s += `<text x="${L - 6}" y="${yy + 3.5}" font-size="10.5" fill="var(--muted)" text-anchor="end" class="tab">${fmt(v, true)}</text>`; });
+    s += `<line x1="${L}" x2="${W - R}" y1="${H - B}" y2="${H - B}" stroke="var(--axis)"/>`;
+    const step = Math.max(1, Math.ceil(pts.length / Math.max(2, Math.floor((W - L) / 70))));
+    pts.forEach((p, i) => { if (i % step === 0) s += `<text x="${x(i)}" y="${H - 5}" font-size="10.5" fill="var(--muted)" text-anchor="middle">${tm(p.t, win)}</text>`; });
+    let d = "", pen = false;
+    pts.forEach((p, i) => { if (p.v == null) { pen = false; return; } d += (pen ? "L" : "M") + x(i).toFixed(1) + "," + y(p.v).toFixed(1); pen = true; });
+    s += `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    pts.forEach((p, i) => { if (p.v != null && (i === 0 || pts[i - 1].v == null) && (i === pts.length - 1 || pts[i + 1].v == null))
+      s += `<circle cx="${x(i)}" cy="${y(p.v)}" r="3" fill="${color}"/>`; });
+    s += `<g class="hover" style="display:none"><line y1="${T}" y2="${H - B}" stroke="var(--axis)" stroke-dasharray="3 3"/><circle r="4.5" fill="${color}" stroke="var(--card)" stroke-width="2"/></g>`;
+    s += `<rect x="${L}" y="0" width="${W - L - R}" height="${H}" fill="transparent"/>`;
+    el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" height="${H}" role="img" aria-label="${esc(label)}">${s}</svg>`;
+    const svg = el.firstChild, g = svg.querySelector(".hover");
+    svg.addEventListener("mousemove", ev => {
+      const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * W / r.width;
+      const i = Math.max(0, Math.min(pts.length - 1, Math.round((px - L) / ((W - L - R) / Math.max(1, pts.length - 1)))));
+      const p = pts[i]; g.style.display = "";
+      g.querySelector("line").setAttribute("x1", x(i)); g.querySelector("line").setAttribute("x2", x(i));
+      const c = g.querySelector("circle"); c.style.display = p.v == null ? "none" : ""; if (p.v != null) { c.setAttribute("cx", x(i)); c.setAttribute("cy", y(p.v)); }
+      showTip(`${tm(p.t, win)}<br>${esc(label)} <b>${p.v == null ? "无数据" : fmt(p.v)}</b>${p.extra || ""}`, ev);
+    });
+    svg.addEventListener("mouseleave", () => { g.style.display = "none"; hideTip(); });
+  }
+
+  function bars(el, pts, { fmt, label }) {
+    const W = el.clientWidth || 300, H = 120, L = 40, R = 4, T = 8, B = 20;
+    if (!pts.some(p => p.v != null)) { el.innerHTML = `<div class="empty">该时间窗无 IP 质检</div>`; return; }
+    const lo = Math.max(0, Math.floor((Math.min(...pts.filter(p => p.v != null).map(p => p.v)) - 0.05) * 10) / 10), hi = 1;
+    const y = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+    const bw = (W - L - R) / pts.length, gap = Math.min(4, bw * 0.3);
+    let s = "";
+    [lo, (lo + hi) / 2, hi].forEach(v => { s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)"/>
+      <text x="${L - 6}" y="${y(v) + 3.5}" font-size="10.5" fill="var(--muted)" text-anchor="end" class="tab">${Math.round(v * 100)}%</text>`; });
+    const step = Math.max(1, Math.ceil(pts.length / Math.max(2, Math.floor((W - L) / 70))));
+    pts.forEach((p, i) => {
+      const x0 = L + i * bw + gap / 2, w = Math.max(1, bw - gap);
+      if (p.v != null) { const top = y(p.v), h = H - B - top, r = Math.min(4, w / 2, h);
+        s += `<path d="M${x0},${H - B}V${top + r}Q${x0},${top} ${x0 + r},${top}H${x0 + w - r}Q${x0 + w},${top} ${x0 + w},${top + r}V${H - B}Z" fill="${status(p.v)}" data-i="${i}"/>`; }
+      s += `<rect x="${L + i * bw}" y="${T}" width="${bw}" height="${H - T - B}" fill="transparent" data-i="${i}"/>`;
+      if (i % step === 0) s += `<text x="${x0 + w / 2}" y="${H - 5}" font-size="10.5" fill="var(--muted)" text-anchor="middle">${tm(p.t, win)}</text>`;
+    });
+    s += `<line x1="${L}" x2="${W - R}" y1="${H - B}" y2="${H - B}" stroke="var(--axis)"/>`;
+    el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" height="${H}" role="img" aria-label="${esc(label)}">${s}</svg>`;
+    el.firstChild.addEventListener("mousemove", ev => { const i = ev.target.dataset && ev.target.dataset.i; if (i == null) return hideTip();
+      const p = pts[+i]; showTip(`${tm(p.t, win)}<br>${esc(label)} <b>${p.v == null ? "无数据" : fmt(p.v)}</b>${p.extra || ""}`, ev); });
+    el.firstChild.addEventListener("mouseleave", hideTip);
+  }
+
+  function donut(el, segs, center, size = 150) {
+    const total = segs.reduce((a, s) => a + s.value, 0), R = size / 2, w = 16, r = R - w / 2, C = 2 * Math.PI * r;
+    let s = `<circle cx="${R}" cy="${R}" r="${r}" fill="none" stroke="var(--grid)" stroke-width="${w}"/>`, off = 0;
+    const shown = segs.filter(x => x.value > 0), gapLen = shown.length > 1 ? 2 : 0;
+    if (total) shown.forEach(x => { const len = C * x.value / total;
+      s += `<circle cx="${R}" cy="${R}" r="${r}" fill="none" stroke="${x.color}" stroke-width="${w}" stroke-dasharray="${Math.max(0, len - gapLen)} ${C}"
+        stroke-dashoffset="${-off}" transform="rotate(-90 ${R} ${R})" data-l="${esc(x.label)}" data-v="${x.value}" style="cursor:default"/>`; off += len; });
+    el.innerHTML = `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" role="img" aria-label="${esc(center[1])}">${s}</svg><div class="center"><b class="num">${center[0]}</b><span>${center[1]}</span></div>`;
+    el.firstChild.addEventListener("mousemove", ev => { const t = ev.target; if (!t.dataset.l) return hideTip();
+      showTip(`${t.dataset.l} <b>${num(+t.dataset.v)}</b>（${pct(total ? t.dataset.v / total : null)}）`, ev); });
+    el.firstChild.addEventListener("mouseleave", hideTip);
+  }
+
+  /* ── 环比 ── */
+  function delta(cur, prev, { kind, betterLow }) {
+    if (cur == null || prev == null) return "";
+    const d = kind === "pt" ? (cur - prev) * 100 : (cur - prev) / Math.max(prev, 1e-9) * 100;
+    if (Math.abs(d) < 0.05) return `<span class="delta flat">持平</span>`;
+    const up = d > 0, good = betterLow ? !up : up;
+    return `<span class="delta ${good ? "up" : "down"}" title="较上一个同长时间窗">${up ? "↑" : "↓"}${Math.abs(d).toFixed(1)}${kind === "pt" ? "pt" : "%"}</span>`;
+  }
+
+  const meter = v => `<span class="rate"><span class="meter"><i style="width:${v == null ? 0 : Math.round(v * 100)}%;background:${status(v)}"></i></span><span class="tab">${pct(v)}</span></span>`;
 
   async function load() {
     try {
-      const r = await fetch(`api/summary?window=${win}` + (token ? `&token=${encodeURIComponent(token)}` : ""));
-      if (!r.ok) throw new Error((await r.json()).error || r.status);
-      render(await r.json());
-      $("err").style.display = "none";
+      const r = await fetch(`api/summary?window=${win}` + (token ? `&token=${encodeURIComponent(token)}` : ""), { credentials: "same-origin" });
+      if (!r.ok) throw new Error(r.status === 401 ? "需要登录（刷新页面重新输入密码）" : ((await r.json().catch(() => ({}))).error || "HTTP " + r.status));
+      last = await r.json(); render(last); $("err").style.display = "none";
     } catch (e) {
       $("err").textContent = "加载失败：" + e.message; $("err").style.display = "block";
-      $("livedot").classList.remove("live");
+      $("livedot").classList.remove("on"); $("livetext").textContent = "连接异常";
     }
   }
 
   function render(d) {
-    const {ip, browser: br, pages: pg, realtime: rt} = d;
-    $("livedot").classList.toggle("live", rt.online_instances > 0);
-    $("meta").textContent = `在线终端 ${rt.online_instances} · 更新于 ${tm(d.now)} · 每 10s 刷新`;
-    $("ip-rate").innerHTML = `<span class="${cls(ip.pass_rate)}">${pct(ip.pass_rate)}</span> <small>通过率</small>`;
-    $("ip-n").textContent = num(ip.checked); $("ip-ok").textContent = num(ip.passed); $("ip-ms").textContent = ms(ip.avg_ms);
-    $("br-online").innerHTML = `${num(br.online)} <small>/ ${num(br.target)} 在线</small>`;
-    $("br-rate").textContent = pct(br.start_rate); $("br-n").textContent = num(br.starts);
-    $("br-exc").textContent = num(br.exceptions); $("br-exc").className = br.exceptions ? "bad" : "";
-    $("br-pass").textContent = br.avg_pass_s == null ? "–" : br.avg_pass_s + "s";
-    $("pg-rate").innerHTML = `<span class="${cls(pg.success_rate)}">${pct(pg.success_rate)}</span> <small>成功率</small>`;
-    $("pg-ok").textContent = num(pg.success); $("pg-fail").textContent = num(pg.failed); $("pg-pass").textContent = pct(pg.pass_rate);
-    $("pg-avg").innerHTML = `${ms(pg.avg_ms)} <small>平均</small>`; $("pg-p95").textContent = ms(pg.p95_ms); $("pg-n").textContent = num(pg.attempts);
-    $("rt-pending").innerHTML = `${num(rt.pending)} <small>待下载</small>`;
-    $("rt-running").textContent = num(rt.running); $("rt-inst").textContent = num(rt.online_instances);
+    const { ip, browser: br, pages: pg, realtime: rt, prev } = d, wn = winName[d.window];
+    $("livedot").classList.toggle("on", rt.online_instances > 0);
+    $("livetext").textContent = rt.online_instances > 0 ? `运行中 · ${rt.online_instances} 个终端` : "无终端在线";
+    $("updated").textContent = `更新时间：${new Date(d.now * 1000).toLocaleString("zh-CN", { hour12: false })}`;
+    $("foot").textContent = `每 10 秒刷新 · 窗口 ${wn}`;
 
-    timeline(d.timeline, d.window);
+    $("k-ip-label").textContent = `${wn} IP 质检数`;
+    $("k-ip").textContent = num(ip.checked); $("k-ip-rate").textContent = pct(ip.pass_rate);
+    $("k-ip-d").innerHTML = delta(ip.pass_rate, prev.ip.pass_rate, { kind: "pt" });
+    $("k-br").innerHTML = `${num(br.online)} <small>/ ${num(br.target)}</small>`;
+    $("k-br-rate").textContent = pct(br.start_rate); $("k-br-exc").textContent = num(br.exceptions);
+    $("k-pg-label").textContent = `${wn} HTML 成功数`;
+    $("k-pg").textContent = num(pg.success); $("k-pg-rate").textContent = pct(pg.success_rate);
+    $("k-pg-d").innerHTML = delta(pg.success_rate, prev.pages.success_rate, { kind: "pt" });
+    $("k-ms").textContent = dur(pg.avg_ms); $("k-p95").textContent = dur(pg.p95_ms);
+    $("k-ms-d").innerHTML = delta(pg.avg_ms, prev.pages.avg_ms, { kind: "rel", betterLow: true });
+    $("k-pend").textContent = num(rt.pending); $("k-run").textContent = num(rt.running); $("k-inst").textContent = num(rt.online_instances);
 
-    $("wafs").innerHTML = d.waf.map(w => `<div class="waf ${w.waf}">
-      <div class="name">${wafName[w.waf]}</div>
-      <div class="big"><span class="${cls(w.pass_rate)}">${pct(w.pass_rate)}</span> <small>过盾率</small></div>
-      <div class="sub"><span>尝试 <b>${num(w.attempts)}</b></span><span>过盾 <b>${num(w.passed)}</b></span>
-      <span>均耗时 <b>${ms(w.avg_ms)}</b></span><span>P95 <b>${ms(w.p95_ms)}</b></span></div></div>`).join("");
+    /* 趋势小图：三张各自单轴 */
+    const tr = d.trend;
+    $("trend-hint").textContent = { "1d": "按小时", "7d": "每 6 小时", "30d": "按天" }[d.window];
+    const lastv = k => { for (let i = tr.length - 1; i >= 0; i--) if (tr[i][k] != null) return tr[i][k]; return null; };
+    $("m1-now").textContent = pct(lastv("success_rate")); $("m2-now").textContent = lastv("online") == null ? "–" : num(lastv("online"));
+    $("m3-now").textContent = dur(lastv("avg_ms"));
+    line($("m1"), tr.map(p => ({ t: p.t, v: p.success_rate, extra: `<br>尝试 ${num(p.attempts)} · 成功 ${num(p.success)}` })),
+         { color: "var(--s1)", fmt: (v, axis) => axis ? Math.round(v * 100) + "%" : pct(v), label: "HTML 成功率" });
+    line($("m2"), tr.map(p => ({ t: p.t, v: p.online })), { color: "var(--s3)", fmt: (v, axis) => axis ? Math.round(v) : v.toFixed(1), yMin: 0, label: "在线浏览器（平均）" });
+    line($("m3"), tr.map(p => ({ t: p.t, v: p.avg_ms })), { color: "var(--s2)", fmt: (v, axis) => dur(v), yMin: 0, label: "平均耗时" });
 
-    const freq = Object.fromEntries(rt.domain_freq.map(f => [f.host, f.per_min]));
-    $("domains").innerHTML = d.domains.length ? `<tr><th>域名</th><th>WAF</th><th class="num">尝试</th><th class="num">成功</th>
-      <th class="num">成功率</th><th class="num">过盾率</th><th class="num">平均耗时</th><th class="num">P95</th><th class="num">当前 篇/分</th></tr>` +
+    /* 厂商 × 域名矩阵 */
+    const vs = d.vendors.slice(0, 6);
+    const byV = vs.map(v => Object.fromEntries(v.domains.map(x => [x.host, x])));
+    const cell = x => x ? `<td class="cell"><b>${pct(x.success_rate)}</b><span>${kfmt(x.success)} / ${kfmt(x.attempts - x.success)}</span><div class="bar"><i style="width:${Math.round(x.success_rate * 100)}%;background:${status(x.success_rate)}"></i></div></td>`
+                        : `<td class="cell"><span>–</span></td>`;
+    $("matrix").innerHTML = vs.length ? `<table class="matrix"><tr><th>域名 \\ 厂商</th>${vs.map(v => `<th>${esc(v.vendor)}</th>`).join("")}</tr>` +
+      `<tr><td><span class="vsub">IP 质检通过率</span></td>${vs.map(v => `<td class="cell"><span>${pct(v.ip_pass_rate)}（${kfmt(v.ip_checked)}）</span></td>`).join("")}</tr>` +
+      d.domains.slice(0, 12).map(dm => `<tr><td title="${esc(dm.host)}">${esc(dm.host.replace(/^www\./, ""))}</td>${byV.map(b => cell(b[dm.host])).join("")}</tr>`).join("") +
+      `<tr><td>合计</td>${vs.map(v => cell(v.attempts ? { success_rate: v.success_rate, success: v.success, attempts: v.attempts } : null)).join("")}</tr></table>`
+      : `<div class="empty">该时间窗无数据</div>`;
+
+    /* WAF */
+    $("wafs").innerHTML = d.waf.map(w => `<div class="waf" style="--c:${WAF[w.waf][1]}">
+      <div class="name">${WAF[w.waf][0]}<span class="sdot" style="background:${status(w.pass_rate)}" title="${statusWord(w.pass_rate)}"></span></div>
+      <div class="big num">${pct(w.pass_rate)} <small>过盾率${w.pass_rate == null ? "" : " · " + statusWord(w.pass_rate)}</small></div>
+      <div class="facts"><span>尝试 <b>${num(w.attempts)}</b></span><span>过盾 <b>${num(w.passed)}</b></span><span>均耗时 <b>${dur(w.avg_ms)}</b></span><span>P95 <b>${dur(w.p95_ms)}</b></span></div></div>`).join("");
+
+    /* 域名表 */
+    $("domtable").innerHTML = d.domains.length ? `<tr><th>域名</th><th>WAF</th><th class="r">访问次数</th><th class="r">成功率</th><th class="r">过盾率</th><th class="r">平均耗时</th><th class="r">P95</th><th class="r">当前 篇/分</th></tr>` +
       d.domains.map(x => `<tr><td class="host" title="${esc(x.host)}">${esc(x.host)}</td>
-        <td><span class="tag ${x.waf}">${wafName[x.waf] || esc(x.waf)}</span></td>
-        <td class="num">${num(x.attempts)}</td><td class="num">${num(x.success)}</td>
-        ${rateCell(x.success_rate)}${rateCell(x.pass_rate)}
-        <td class="num">${ms(x.avg_ms)}</td><td class="num">${ms(x.p95_ms)}</td>
-        <td class="num">${freq[x.host] ?? "–"}</td></tr>`).join("")
+        <td><span class="waf-tag"><i style="background:${WAF[x.waf] ? WAF[x.waf][1] : "var(--axis)"}"></i>${WAF[x.waf] ? WAF[x.waf][0] : esc(x.waf)}</span></td>
+        <td class="r">${num(x.attempts)}</td><td class="r">${meter(x.success_rate)}</td><td class="r tab">${pct(x.pass_rate)}</td>
+        <td class="r">${dur(x.avg_ms)}</td><td class="r">${dur(x.p95_ms)}</td><td class="r">${x.per_min || "–"}</td></tr>`).join("")
       : `<tr><td class="empty">该时间窗内没有页面采集记录</td></tr>`;
 
-    $("vendors").innerHTML = d.vendors.length ? d.vendors.map(v => `<div class="vendor">
-      <div class="vh"><b>${esc(v.vendor)}</b><span class="muted">IP 质检通过率 <span class="${cls(v.ip_pass_rate)}">${pct(v.ip_pass_rate)}</span>（${num(v.ip_checked)}）</span>
-      <span class="muted">总成功率 <span class="${cls(v.success_rate)}">${pct(v.success_rate)}</span>（${num(v.attempts)}）</span></div>
-      <div class="scroll"><table><tr><th>域名</th><th class="num">尝试</th><th class="num">成功率</th><th class="num">过盾率</th><th class="num">平均耗时</th></tr>
-      ${v.domains.map(x => `<tr><td class="host">${esc(x.host)}</td><td class="num">${num(x.attempts)}</td>${rateCell(x.success_rate)}${rateCell(x.pass_rate)}<td class="num">${ms(x.avg_ms)}</td></tr>`).join("")}
-      </table></div></div>`).join("") : `<div class="empty">暂无数据</div>`;
+    /* 结果分布 */
+    const o = d.outcomes, segs = [
+      { label: "HTML 成功", value: o.success, color: "var(--good)" },
+      { label: "过盾但 HTTP 失败", value: o.http_failed, color: "var(--serious)" },
+      { label: "未过盾（超时/拦截）", value: o.not_passed, color: "var(--crit)" }];
+    donut($("outdonut"), segs, [pct(pg.success_rate), "成功率"]);
+    const ot = o.success + o.http_failed + o.not_passed;
+    $("outlegend").innerHTML = segs.map(s => `<div><i style="background:${s.color}"></i>${s.label}<span class="n">${num(s.value)}</span><b>${pct(ot ? s.value / ot : null)}</b></div>`).join("");
 
-    $("freq").innerHTML = rt.domain_freq.length ? rt.domain_freq.map(f => `<span>${esc(f.host)} <b>${f.per_min}</b>/分</span>`).join("")
-      : `<span class="muted">近 5 分钟无访问</span>`;
-    $("events").innerHTML = rt.events.length ? rt.events.map(e => `<div class="ev ${esc(e.level)}">
-      <span class="t">${tm(e.ts)}</span><span class="k">${esc(e.type)}</span><span class="m" title="${esc(e.inst)} ${esc(e.msg)}">${esc(e.msg)}</span></div>`).join("")
+    /* IP */
+    donut($("ipdonut"), [{ label: "通过", value: ip.passed, color: "var(--good)" }, { label: "不通过", value: ip.failed, color: "var(--crit)" }], [pct(ip.pass_rate), "通过率"], 132);
+    $("ip-ok").textContent = num(ip.passed); $("ip-fail").textContent = num(ip.failed); $("ip-ms").textContent = dur(ip.avg_ms);
+    $("ipbars-title").textContent = `近 ${wn} 通过率（${{ "1d": "按小时", "7d": "每 6 小时", "30d": "按天" }[d.window]}）`;
+    bars($("ipbars"), tr.map(p => ({ t: p.t, v: p.ip_pass_rate, extra: `<br>质检 ${num(p.ip_checked)}` })), { fmt: pct, label: "IP 质检通过率" });
+    $("reasons").innerHTML = ip.fail_reasons.length ? `<span>不通过原因</span>` + ip.fail_reasons.map(r => `<span>${esc(r.reason)} <b>${num(r.n)}</b></span>`).join("") : "";
+
+    /* 实时 */
+    $("freq").innerHTML = rt.domain_freq.length ? rt.domain_freq.map(f => `<span>${esc(f.host)} <b>${f.per_min}</b>/分</span>`).join("") : `<span>近 5 分钟无访问</span>`;
+    const lv = { info: "var(--good)", warn: "var(--warn)", warning: "var(--warn)", error: "var(--crit)", critical: "var(--crit)" };
+    const kind = { page: "页面", browser: "浏览器", log: "日志" };
+    $("feed").innerHTML = rt.events.length ? rt.events.map(e => `<div class="ev"><span class="sdot" style="background:${lv[e.level] || "var(--muted)"}"></span>
+      <span class="t">${clock(e.ts)}</span><span class="k">${kind[e.type] || esc(e.type)}</span><span class="m" title="${esc(e.inst)}：${esc(e.msg)}">${esc(e.msg)}</span></div>`).join("")
       : `<div class="empty">近 1 小时无事件</div>`;
 
-    $("instances").innerHTML = rt.instances.length ? `<tr><th>终端</th><th>批次</th><th>厂商</th><th class="num">浏览器</th>
-      <th class="num">待下载</th><th class="num">成功/失败</th><th>最近心跳</th></tr>` +
-      rt.instances.map(i => `<tr><td><span class="dot ${i.online ? "live" : ""}"></span>${esc(i.inst)}</td>
-        <td>${esc(i.batch)}</td><td>${esc(i.vendor)}</td><td class="num">${num(i.browsers_online)}/${num(i.workers)}</td>
-        <td class="num">${num(i.pending)}</td><td class="num">${num(i.success)}/${num(i.failed)}</td>
-        <td class="${i.online ? "" : "muted"}">${new Date(i.last_seen * 1000).toLocaleString([], {hour12: false})}</td></tr>`).join("")
-      : `<tr><td class="empty">还没有终端上报（检查终端 [monitor] enabled 与 amqp_url）</td></tr>`;
-
-    $("reasons").innerHTML = ip.fail_reasons.length ? `<tr><th>原因</th><th class="num">次数</th></tr>` +
-      ip.fail_reasons.map(r => `<tr><td>${esc(r.reason)}</td><td class="num">${num(r.n)}</td></tr>`).join("")
-      : `<tr><td class="empty">该时间窗内没有不通过的 IP</td></tr>`;
+    /* 浏览器与终端 */
+    $("br-hint").textContent = `启动 ${num(br.starts)} 次 · 成功率 ${pct(br.start_rate)} · 异常 ${num(br.exceptions)} · 平均过盾 ${br.avg_pass_s == null ? "–" : br.avg_pass_s + "s"}`;
+    $("insttable").innerHTML = rt.instances.length ? `<tr><th>终端</th><th>批次</th><th>厂商</th><th>模式</th><th class="r">在线浏览器</th><th class="r">待下载</th><th class="r">进行中</th><th class="r">成功 / 失败</th><th>最近心跳</th></tr>` +
+      rt.instances.map(i => `<tr><td><span class="dot ${i.online ? "on" : ""}" style="margin-right:8px"></span>${esc(i.inst)}</td><td>${esc(i.batch)}</td><td>${esc(i.vendor)}</td><td>${esc(i.mode)}</td>
+        <td class="r">${num(i.browsers_online)} / ${num(i.workers)}</td><td class="r">${num(i.pending)}</td><td class="r">${num(i.running)}</td>
+        <td class="r">${num(i.success)} / ${num(i.failed)}</td><td style="color:${i.online ? "inherit" : "var(--muted)"}">${new Date(i.last_seen * 1000).toLocaleString("zh-CN", { hour12: false })}${i.online ? "" : "（离线）"}</td></tr>`).join("")
+      : `<tr><td class="empty">还没有终端上报（检查终端 [monitor] enabled 与 amqp_url，或用 paperlite-monitor test 验证）</td></tr>`;
   }
 
-  function timeline(rows, w) {
-    const svg = $("timeline"), W = svg.clientWidth || 800, H = 160, padB = 18, padL = 36;
-    const max = Math.max(1, ...rows.map(r => r.attempts));
-    const bw = (W - padL) / Math.max(rows.length, 1);
-    const y = v => (H - padB) * (1 - v / max);
-    const fmt = t => { const d = new Date(t * 1000);
-      return w === "1d" ? d.getHours() + "时" : (d.getMonth() + 1) + "/" + d.getDate() + (w === "7d" ? " " + d.getHours() + "时" : ""); };
-    let s = `<line x1="${padL}" x2="${W}" y1="${H - padB}" y2="${H - padB}" stroke="var(--line)"/>
-      <text x="${padL - 6}" y="10" fill="var(--faint)" font-size="10" text-anchor="end">${max}</text>
-      <text x="${padL - 6}" y="${H - padB}" fill="var(--faint)" font-size="10" text-anchor="end">0</text>`;
-    const every = Math.ceil(rows.length / 12);
-    rows.forEach((r, i) => {
-      const x = padL + i * bw + 1, bwi = Math.max(1, bw - 2);
-      const segs = [[r.success, "var(--ok)"], [r.passed - r.success, "var(--warn)"], [r.attempts - r.passed, "var(--bad)"]];
-      let base = 0;
-      for (const [v, c] of segs) { if (v > 0) { s += `<rect x="${x}" width="${bwi}" y="${y(base + v)}" height="${y(base) - y(base + v)}" fill="${c}"><title>${fmt(r.t)}：尝试 ${r.attempts}，成功 ${r.success}，过盾 ${r.passed}</title></rect>`; base += v; } }
-      if (i % every === 0) s += `<text x="${x + bwi / 2}" y="${H - 4}" fill="var(--faint)" font-size="10" text-anchor="middle">${fmt(r.t)}</text>`;
-    });
-    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
-    svg.innerHTML = s;
-  }
-
-  load();
-  setInterval(load, 10000);
+  let rz; addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => last && render(last), 150); });
+  load(); setInterval(load, 10000);
 })();
 </script>
 </body>
