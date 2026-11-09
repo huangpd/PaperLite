@@ -580,7 +580,8 @@ class CliDbOptionTest(unittest.TestCase):
         self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
         with open(cfg, "rb") as f:
             raw = tomllib.load(f)
-        self.assertEqual(set(raw), {"proxy", "limits", "paths", "run", "landing"})
+        self.assertEqual(set(raw), {"proxy", "limits", "paths", "run", "landing", "monitor"})
+        self.assertFalse(raw["monitor"]["enabled"])               # 模板默认不上报
         with self.assertRaises(SystemExit):                     # 已存在不覆盖
             self.run_cli("init")
         self.run_cli("init", "--force")

@@ -167,7 +167,7 @@ def _read(path: Path) -> dict[str, Any]:
                                 f"或用 --config / 环境变量 {CONFIG_ENV} 指定）")
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "landing"})
+    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "landing", "monitor"})   # [monitor] 见 monitor/config.py
     return raw
 
 

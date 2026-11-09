@@ -122,6 +122,43 @@ headed = false        # 仅 browser：有界面（调试）
 
 完整列表见 `paperlite init` 生成的模板（`src/paperlite/config.example.toml`）。查找顺序：`--config` > 环境变量 `PAPERLITE_CONFIG` > 当前目录 `config.toml`。
 
+## 监控大屏（`[monitor]` + RabbitMQ）
+
+每个终端（一次 `paperlite run`）把运行指标发到**同一个公共 RabbitMQ**，`paperlite-monitor serve` 消费入库（SQLite，保留 30 天）并出网页大屏，可切最近 1 / 7 / 30 天。监控是旁路：没配、RabbitMQ 连不上、没装 pika，下载都照常跑。
+
+```bash
+pip install 'paperlite[monitor]'                     # 多装一个 pika（uv：uv sync --extra monitor）
+
+# 每个终端的 config.toml 加上（其余不用改）：
+#   [monitor]
+#   enabled  = true
+#   amqp_url = "amqp://user:pass@mq.example.com:5672/%2F"
+#   vendor   = "qingguo"          # 代理厂商标签，大屏按「厂商 × 域名」统计
+paperlite-monitor test                                # 终端上验证到 RabbitMQ 的连通性
+paperlite run config.toml                             # 照常跑，自动上报
+
+# 面板机器（同样的 [monitor] 段，可加 port / token / db）：
+paperlite-monitor serve                               # http://127.0.0.1:8700/
+paperlite-monitor demo                                # 不连 RabbitMQ，灌模拟数据看效果
+```
+
+| 大屏区块 | 指标 | 口径 |
+|---|---|---|
+| IP 质检 | 质检数、通过率、均延迟、不通过原因 | 每个新 IP 一条（体检通过才给浏览器），不分域名 |
+| 浏览器 | 在线数 / 目标数、启动成功率、异常数、均过盾秒数 | 在线数来自心跳（`heartbeat_s`，默认 15s）；启动 = 起浏览器 + 过热身落地页；异常 = 启动抛错（区别于过盾超时） |
+| 页面采集 | 成功、失败、成功率、过盾率 | **按尝试计**（过盾超时后稍后重试的，每次都算一次）；过盾 = 页面真加载出来；成功 = 过盾且 HTTP < 400 |
+| 页面耗时 | 平均、P95 | 只算已加载的页（超时尝试的耗时就是超时上限，算进去会把 P95 拉成常数） |
+| 域名 | 每域名成功率 / 过盾率 / 耗时 / 当前每分钟篇数 | 即「IP 过了质检后能否过该域名风控」 |
+| 代理厂商 | 厂商 × 域名成功率、厂商 IP 质检通过率 | 厂商 = 终端配置的 `vendor` |
+| WAF 过盾 | Cloudflare / AWS WAF / DataDome 的过盾率、均耗时、P95 | WAF 按主文档响应头识别（`cf-ray`/`cf-mitigated`、`x-amzn-waf-action`/`aws-waf-token`、`x-datadome`/`datadome=`），表示「站点前面是哪家」；页面 + 热身落地页都计 |
+| 实时任务 | 待下载 / 进行中、域名访问频率（近 5 分钟）、实时事件、终端列表 | 事件含页面/浏览器结果和各终端 WARNING 以上日志 |
+
+- **消息**：topic exchange `paperlite.monitor`，routing key = 事件类型（`page`/`browser`/`proxy_check`/`heartbeat`/`log`），JSON 信封格式见 `monitor/schema.py`。只发出口 IP 与统计，不发代理密码、不发页面内容。
+- **不丢、不堵**：终端本地有界缓冲（`buffer_size`，满了丢最旧的），后台线程发送、断线退避重连，绝不阻塞下载。面板用持久队列（`paperlite.monitor.dashboard`，上限 `queue_max_length` 丢最旧），面板停机期间消息排队、重启后补齐；先落盘再 ack。
+- **终端标识**：`node`（默认主机名）+ pid；批次 = 配置文件名（`sciencedirect.toml` → `sciencedirect`）。心跳超过 `max(60s, 4×heartbeat_s)` 没来即判离线。
+- **安全**：面板默认只听 127.0.0.1；要对外开放请设 `token`（访问带 `?token=…`）。
+- curl 模式只上报心跳和 IP 质检（页面级埋点只在浏览器模式）。
+
 ## Turnstile token（通用）
 
 给目标页 URL 和 sitekey 即可取 token，不依赖站点配置和 Redis：
@@ -141,6 +178,7 @@ curl localhost:8191/solve -d '{"url":"...","sitekey":"0x4AAAA...","proxy":"http:
 ```bash
 uv run pytest                                              # Redis 相关的会跳过
 PAPERLITE_TEST_REDIS=redis://127.0.0.1:6379/0 uv run pytest   # 连真实 Redis 全跑
+PAPERLITE_TEST_AMQP=amqp://guest:guest@127.0.0.1:5672/%2F uv run pytest tests/test_monitor.py   # 监控连真实 RabbitMQ
 ```
 
 ## 任务库 tasks.db
@@ -192,6 +230,7 @@ src/paperlite/     代码（src 布局；config.example.toml 是配置模板）
   classify.py      non_pdf 分类（not_found/paywall/landing_page）
   proxy.py         短效代理取 IP + 分层体检（TCP/TLS/TTFB 四段计时、核对出口 IP、延迟闸）
   config.py cli.py 配置（[proxy]/[limits]/[paths]/[run]）/ 命令行
+  monitor/         监控：reporter.py 埋点上报（未启用即 no-op）；db/consumer/dashboard/cli 为面板端（paperlite-monitor）
 tests/             pytest（unittest 风格；Redis 用例按 PAPERLITE_TEST_REDIS 门控）
 config.toml        paperlite init 生成（含代理密码，不提交）
 ```

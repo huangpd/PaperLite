@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PaperLite 监控</title>
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --panel-2: #1c2230; --line: #2a3140;
+  --text: #e6edf3; --muted: #8b95a5; --faint: #5b6577;
+  --ok: #3fb950; --warn: #d29922; --bad: #f85149; --accent: #58a6ff;
+  --cf: #f38020; --aws: #ff9900; --dd: #a371f7;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f6f8fa; --panel: #ffffff; --panel-2: #f0f3f6; --line: #d8dee4;
+    --text: #1f2328; --muted: #59636e; --faint: #8c959f;
+    --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --accent: #0969da;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; padding: 14px 20px;
+  border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-right: 6px; }
+.dot.live { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { background: transparent; color: var(--muted); border: 0; padding: 5px 14px; cursor: pointer; font: inherit; }
+.seg button.on { background: var(--accent); color: #fff; }
+.meta { color: var(--muted); font-size: 12px; margin-left: auto; }
+main { padding: 16px 20px 40px; display: grid; gap: 16px; max-width: 1680px; margin: 0 auto; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+.card h2 { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 10px; letter-spacing: .5px; }
+.big { font: 600 28px/1.1 var(--mono); }
+.big small { font-size: 14px; color: var(--muted); font-weight: 400; }
+.sub { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
+.sub b { color: var(--text); font-family: var(--mono); font-weight: 600; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
+.wafs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+@media (max-width: 700px) { .wafs { grid-template-columns: 1fr; } }
+.waf { border-left: 3px solid var(--line); padding-left: 12px; }
+.waf.cloudflare { border-color: var(--cf); } .waf.aws_waf { border-color: var(--aws); } .waf.datadome { border-color: var(--dd); }
+.waf .name { font-weight: 600; margin-bottom: 4px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 6px 8px; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); white-space: nowrap; }
+td.num, th.num { text-align: right; font-family: var(--mono); }
+td.host { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+.scroll { overflow-x: auto; }
+.bar { display: inline-block; vertical-align: middle; width: 70px; height: 6px; border-radius: 3px; background: var(--panel-2); margin-right: 8px; overflow: hidden; }
+.bar i { display: block; height: 100%; }
+.tag { font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--panel-2); color: var(--muted); }
+.tag.cloudflare { color: var(--cf); } .tag.aws_waf { color: var(--aws); } .tag.datadome { color: var(--dd); }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .muted { color: var(--muted); }
+.vendor { margin-bottom: 14px; }
+.vendor .vh { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
+.vendor .vh b { font-size: 15px; }
+#timeline { width: 100%; height: 160px; display: block; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 6px; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; background: var(--c); }
+.events { max-height: 420px; overflow-y: auto; font-size: 12px; font-family: var(--mono); }
+.ev { display: grid; grid-template-columns: 64px 64px 1fr; gap: 8px; padding: 4px 0; border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent); }
+.ev .t { color: var(--faint); } .ev .k { color: var(--muted); }
+.ev.warn .m, .ev.warning .m { color: var(--warn); } .ev.error .m, .ev.critical .m { color: var(--bad); }
+.ev .m { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.freq { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.freq span { font-size: 12px; background: var(--panel-2); padding: 3px 9px; border-radius: 12px; }
+.freq b { font-family: var(--mono); color: var(--accent); }
+.empty { color: var(--faint); padding: 12px 0; font-size: 13px; }
+.err { background: color-mix(in srgb, var(--bad) 15%, var(--panel)); border: 1px solid var(--bad); color: var(--text); padding: 10px 14px; border-radius: 8px; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="dot" id="livedot"></span>PaperLite 监控大屏</h1>
+  <div class="seg" id="win">
+    <button data-w="1d" class="on">最近 1 天</button><button data-w="7d">7 天</button><button data-w="30d">30 天</button>
+  </div>
+  <div class="meta" id="meta">加载中…</div>
+</header>
+<main>
+  <div class="err" id="err"></div>
+
+  <section class="kpis">
+    <div class="card"><h2>IP 质检</h2><div class="big" id="ip-rate">–</div>
+      <div class="sub"><span>质检 <b id="ip-n">–</b></span><span>通过 <b id="ip-ok">–</b></span><span>均延迟 <b id="ip-ms">–</b></span></div></div>
+    <div class="card"><h2>浏览器</h2><div class="big" id="br-online">–</div>
+      <div class="sub"><span>启动成功率 <b id="br-rate">–</b></span><span>启动 <b id="br-n">–</b></span><span>异常 <b id="br-exc">–</b></span><span>均过盾 <b id="br-pass">–</b></span></div></div>
+    <div class="card"><h2>页面采集</h2><div class="big" id="pg-rate">–</div>
+      <div class="sub"><span>成功 <b id="pg-ok">–</b></span><span>失败 <b id="pg-fail">–</b></span><span>过盾率 <b id="pg-pass">–</b></span></div></div>
+    <div class="card"><h2>页面耗时（已加载页）</h2><div class="big" id="pg-avg">–</div>
+      <div class="sub"><span>P95 <b id="pg-p95">–</b></span><span>尝试 <b id="pg-n">–</b></span></div></div>
+    <div class="card"><h2>实时任务</h2><div class="big" id="rt-pending">–</div>
+      <div class="sub"><span>进行中 <b id="rt-running">–</b></span><span>在线终端 <b id="rt-inst">–</b></span></div></div>
+  </section>
+
+  <section class="card">
+    <h2>采集趋势（成功 / 过盾但失败 / 未过盾）</h2>
+    <svg id="timeline" preserveAspectRatio="none"></svg>
+    <div class="legend"><span style="--c:var(--ok)">成功</span><span style="--c:var(--warn)">过盾但 HTTP 失败</span><span style="--c:var(--bad)">未过盾</span></div>
+  </section>
+
+  <section class="card">
+    <h2>WAF 过盾分析（页面 + 热身落地页；过盾 = 页面真加载出来）</h2>
+    <div class="wafs" id="wafs"></div>
+  </section>
+
+  <section class="card">
+    <h2>域名：成功率 / 过盾率 / 耗时（IP 过质检后，能否过该域名风控）</h2>
+    <div class="scroll"><table id="domains"></table></div>
+  </section>
+
+  <section class="grid2">
+    <div class="card"><h2>代理厂商 × 域名成功率</h2><div id="vendors"></div></div>
+    <div class="card"><h2>实时：域名访问频率（近 5 分钟）与事件</h2>
+      <div class="freq" id="freq"></div>
+      <div class="events" id="events"></div></div>
+  </section>
+
+  <section class="grid2">
+    <div class="card"><h2>终端</h2><div class="scroll"><table id="instances"></table></div></div>
+    <div class="card"><h2>IP 质检不通过原因</h2><div class="scroll"><table id="reasons"></table></div></div>
+  </section>
+</main>
+<script>
+(() => {
+  const qs = new URLSearchParams(location.search);
+  const token = qs.get("token") || "";
+  let win = qs.get("window") || localStorageGet("win") || "1d";
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const pct = v => v == null ? "–" : (v * 100).toFixed(v >= 0.999 || v === 0 ? 0 : 1) + "%";
+  const num = v => v == null ? "–" : Number(v).toLocaleString();
+  const ms = v => v == null ? "–" : v >= 10000 ? (v / 1000).toFixed(0) + "s" : v >= 1000 ? (v / 1000).toFixed(1) + "s" : v + "ms";
+  const cls = v => v == null ? "muted" : v >= 0.9 ? "ok" : v >= 0.6 ? "warn" : "bad";
+  const color = v => `var(--${cls(v) === "muted" ? "faint" : cls(v)})`;
+  const bar = v => `<span class="bar"><i style="width:${v == null ? 0 : Math.round(v * 100)}%;background:${color(v)}"></i></span>`;
+  const rateCell = v => `<td class="num">${bar(v)}<span class="${cls(v)}">${pct(v)}</span></td>`;
+  const wafName = {cloudflare: "Cloudflare", aws_waf: "AWS WAF", datadome: "DataDome", none: "无"};
+  const tm = t => new Date(t * 1000).toLocaleTimeString([], {hour12: false});
+  function localStorageGet(k) { try { return localStorage.getItem("pl-mon-" + k); } catch (e) { return null; } }
+  function localStorageSet(k, v) { try { localStorage.setItem("pl-mon-" + k, v); } catch (e) {} }
+
+  document.querySelectorAll("#win button").forEach(b => {
+    b.classList.toggle("on", b.dataset.w === win);
+    b.onclick = () => { win = b.dataset.w; localStorageSet("win", win);
+      document.querySelectorAll("#win button").forEach(x => x.classList.toggle("on", x === b)); load(); };
+  });
+
+  async function load() {
+    try {
+      const r = await fetch(`api/summary?window=${win}` + (token ? `&token=${encodeURIComponent(token)}` : ""));
+      if (!r.ok) throw new Error((await r.json()).error || r.status);
+      render(await r.json());
+      $("err").style.display = "none";
+    } catch (e) {
+      $("err").textContent = "加载失败：" + e.message; $("err").style.display = "block";
+      $("livedot").classList.remove("live");
+    }
+  }
+
+  function render(d) {
+    const {ip, browser: br, pages: pg, realtime: rt} = d;
+    $("livedot").classList.toggle("live", rt.online_instances > 0);
+    $("meta").textContent = `在线终端 ${rt.online_instances} · 更新于 ${tm(d.now)} · 每 10s 刷新`;
+    $("ip-rate").innerHTML = `<span class="${cls(ip.pass_rate)}">${pct(ip.pass_rate)}</span> <small>通过率</small>`;
+    $("ip-n").textContent = num(ip.checked); $("ip-ok").textContent = num(ip.passed); $("ip-ms").textContent = ms(ip.avg_ms);
+    $("br-online").innerHTML = `${num(br.online)} <small>/ ${num(br.target)} 在线</small>`;
+    $("br-rate").textContent = pct(br.start_rate); $("br-n").textContent = num(br.starts);
+    $("br-exc").textContent = num(br.exceptions); $("br-exc").className = br.exceptions ? "bad" : "";
+    $("br-pass").textContent = br.avg_pass_s == null ? "–" : br.avg_pass_s + "s";
+    $("pg-rate").innerHTML = `<span class="${cls(pg.success_rate)}">${pct(pg.success_rate)}</span> <small>成功率</small>`;
+    $("pg-ok").textContent = num(pg.success); $("pg-fail").textContent = num(pg.failed); $("pg-pass").textContent = pct(pg.pass_rate);
+    $("pg-avg").innerHTML = `${ms(pg.avg_ms)} <small>平均</small>`; $("pg-p95").textContent = ms(pg.p95_ms); $("pg-n").textContent = num(pg.attempts);
+    $("rt-pending").innerHTML = `${num(rt.pending)} <small>待下载</small>`;
+    $("rt-running").textContent = num(rt.running); $("rt-inst").textContent = num(rt.online_instances);
+
+    timeline(d.timeline, d.window);
+
+    $("wafs").innerHTML = d.waf.map(w => `<div class="waf ${w.waf}">
+      <div class="name">${wafName[w.waf]}</div>
+      <div class="big"><span class="${cls(w.pass_rate)}">${pct(w.pass_rate)}</span> <small>过盾率</small></div>
+      <div class="sub"><span>尝试 <b>${num(w.attempts)}</b></span><span>过盾 <b>${num(w.passed)}</b></span>
+      <span>均耗时 <b>${ms(w.avg_ms)}</b></span><span>P95 <b>${ms(w.p95_ms)}</b></span></div></div>`).join("");
+
+    const freq = Object.fromEntries(rt.domain_freq.map(f => [f.host, f.per_min]));
+    $("domains").innerHTML = d.domains.length ? `<tr><th>域名</th><th>WAF</th><th class="num">尝试</th><th class="num">成功</th>
+      <th class="num">成功率</th><th class="num">过盾率</th><th class="num">平均耗时</th><th class="num">P95</th><th class="num">当前 篇/分</th></tr>` +
+      d.domains.map(x => `<tr><td class="host" title="${esc(x.host)}">${esc(x.host)}</td>
+        <td><span class="tag ${x.waf}">${wafName[x.waf] || esc(x.waf)}</span></td>
+        <td class="num">${num(x.attempts)}</td><td class="num">${num(x.success)}</td>
+        ${rateCell(x.success_rate)}${rateCell(x.pass_rate)}
+        <td class="num">${ms(x.avg_ms)}</td><td class="num">${ms(x.p95_ms)}</td>
+        <td class="num">${freq[x.host] ?? "–"}</td></tr>`).join("")
+      : `<tr><td class="empty">该时间窗内没有页面采集记录</td></tr>`;
+
+    $("vendors").innerHTML = d.vendors.length ? d.vendors.map(v => `<div class="vendor">
+      <div class="vh"><b>${esc(v.vendor)}</b><span class="muted">IP 质检通过率 <span class="${cls(v.ip_pass_rate)}">${pct(v.ip_pass_rate)}</span>（${num(v.ip_checked)}）</span>
+      <span class="muted">总成功率 <span class="${cls(v.success_rate)}">${pct(v.success_rate)}</span>（${num(v.attempts)}）</span></div>
+      <div class="scroll"><table><tr><th>域名</th><th class="num">尝试</th><th class="num">成功率</th><th class="num">过盾率</th><th class="num">平均耗时</th></tr>
+      ${v.domains.map(x => `<tr><td class="host">${esc(x.host)}</td><td class="num">${num(x.attempts)}</td>${rateCell(x.success_rate)}${rateCell(x.pass_rate)}<td class="num">${ms(x.avg_ms)}</td></tr>`).join("")}
+      </table></div></div>`).join("") : `<div class="empty">暂无数据</div>`;
+
+    $("freq").innerHTML = rt.domain_freq.length ? rt.domain_freq.map(f => `<span>${esc(f.host)} <b>${f.per_min}</b>/分</span>`).join("")
+      : `<span class="muted">近 5 分钟无访问</span>`;
+    $("events").innerHTML = rt.events.length ? rt.events.map(e => `<div class="ev ${esc(e.level)}">
+      <span class="t">${tm(e.ts)}</span><span class="k">${esc(e.type)}</span><span class="m" title="${esc(e.inst)} ${esc(e.msg)}">${esc(e.msg)}</span></div>`).join("")
+      : `<div class="empty">近 1 小时无事件</div>`;
+
+    $("instances").innerHTML = rt.instances.length ? `<tr><th>终端</th><th>批次</th><th>厂商</th><th class="num">浏览器</th>
+      <th class="num">待下载</th><th class="num">成功/失败</th><th>最近心跳</th></tr>` +
+      rt.instances.map(i => `<tr><td><span class="dot ${i.online ? "live" : ""}"></span>${esc(i.inst)}</td>
+        <td>${esc(i.batch)}</td><td>${esc(i.vendor)}</td><td class="num">${num(i.browsers_online)}/${num(i.workers)}</td>
+        <td class="num">${num(i.pending)}</td><td class="num">${num(i.success)}/${num(i.failed)}</td>
+        <td class="${i.online ? "" : "muted"}">${new Date(i.last_seen * 1000).toLocaleString([], {hour12: false})}</td></tr>`).join("")
+      : `<tr><td class="empty">还没有终端上报（检查终端 [monitor] enabled 与 amqp_url）</td></tr>`;
+
+    $("reasons").innerHTML = ip.fail_reasons.length ? `<tr><th>原因</th><th class="num">次数</th></tr>` +
+      ip.fail_reasons.map(r => `<tr><td>${esc(r.reason)}</td><td class="num">${num(r.n)}</td></tr>`).join("")
+      : `<tr><td class="empty">该时间窗内没有不通过的 IP</td></tr>`;
+  }
+
+  function timeline(rows, w) {
+    const svg = $("timeline"), W = svg.clientWidth || 800, H = 160, padB = 18, padL = 36;
+    const max = Math.max(1, ...rows.map(r => r.attempts));
+    const bw = (W - padL) / Math.max(rows.length, 1);
+    const y = v => (H - padB) * (1 - v / max);
+    const fmt = t => { const d = new Date(t * 1000);
+      return w === "1d" ? d.getHours() + "时" : (d.getMonth() + 1) + "/" + d.getDate() + (w === "7d" ? " " + d.getHours() + "时" : ""); };
+    let s = `<line x1="${padL}" x2="${W}" y1="${H - padB}" y2="${H - padB}" stroke="var(--line)"/>
+      <text x="${padL - 6}" y="10" fill="var(--faint)" font-size="10" text-anchor="end">${max}</text>
+      <text x="${padL - 6}" y="${H - padB}" fill="var(--faint)" font-size="10" text-anchor="end">0</text>`;
+    const every = Math.ceil(rows.length / 12);
+    rows.forEach((r, i) => {
+      const x = padL + i * bw + 1, bwi = Math.max(1, bw - 2);
+      const segs = [[r.success, "var(--ok)"], [r.passed - r.success, "var(--warn)"], [r.attempts - r.passed, "var(--bad)"]];
+      let base = 0;
+      for (const [v, c] of segs) { if (v > 0) { s += `<rect x="${x}" width="${bwi}" y="${y(base + v)}" height="${y(base) - y(base + v)}" fill="${c}"><title>${fmt(r.t)}：尝试 ${r.attempts}，成功 ${r.success}，过盾 ${r.passed}</title></rect>`; base += v; } }
+      if (i % every === 0) s += `<text x="${x + bwi / 2}" y="${H - 4}" fill="var(--faint)" font-size="10" text-anchor="middle">${fmt(r.t)}</text>`;
+    });
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.innerHTML = s;
+  }
+
+  load();
+  setInterval(load, 10000);
+})();
+</script>
+</body>
+</html>

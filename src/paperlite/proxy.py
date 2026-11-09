@@ -26,6 +26,7 @@ from curl_cffi import Curl
 from curl_cffi.const import CurlInfo, CurlOpt
 
 from paperlite.logutil import log_event
+from paperlite.monitor import reporter as mon
 
 logger = logging.getLogger(__name__)
 
@@ -161,8 +162,10 @@ class IpSource:
                 reason = f"slow_{pr.total_ms:.0f}ms"
             if not reason:
                 self._log_probe(lease, url, pr, ok=True)
+                mon.proxy_check(True, pr.total_ms)
                 return True
             self._log_probe(lease, url, pr, ok=False, reason=reason)
+        mon.proxy_check(False, last.total_ms if last else 0.0, reason)     # 每个 IP 一条，取最后一个目标的原因
         return False
 
     def _log_probe(self, lease: Lease, url: str, pr: "ProbeResult", ok: bool, reason: str = "") -> None:

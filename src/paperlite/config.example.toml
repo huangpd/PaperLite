@@ -53,5 +53,19 @@ urls = ""                     # 可选：启动时先导入这个 URL 文件
 url_type = "html"              # pdf / html
 headed = false                # 仅 browser：有界面（调试）
 
+[monitor]                     # 可选：监控上报。各终端发到同一个 RabbitMQ，paperlite-monitor serve 出大屏（需 pip install 'paperlite[monitor]'）
+enabled = false               # true 才上报；RabbitMQ 连不上/没装 pika 都不影响下载
+amqp_url = "amqp://user:pass@mq.example.com:5672/%2F"   # 公共 RabbitMQ（含密码，别提交）
+exchange = "paperlite.monitor"
+node = ""                     # 终端名，留空用主机名
+vendor = "qingguo"            # 代理厂商标签：面板按「厂商 × 域名」统计成功率
+heartbeat_s = 15              # 心跳间隔（在线浏览器数、待下载数）
+# 以下仅面板端（paperlite-monitor serve）用
+# db = "monitor.db"           # 面板入库 SQLite（本地盘），保留 retention_days 天
+# bind = "127.0.0.1"
+# port = 8700
+# token = ""                  # 非空则访问需 ?token=…；对外暴露务必设置
+# retention_days = 30
+
 [landing]                     # 可选：各主机的过盾落地页（任意会触发挑战的普通页面）；未配置的用主机首页
 "dl.acm.org" = "https://dl.acm.org/doi/10.1145/3779295"

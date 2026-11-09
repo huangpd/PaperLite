@@ -197,6 +197,7 @@ def _download(args, cfg, proxy, store, with_producer: bool) -> None:
     producer = _ProducerThread(cfg, store, proxy, dl.host) if with_producer else None
     stop = threading.Event()
     threading.Thread(target=_report, args=(dl, store, cfg, stop), daemon=True, name="report").start()
+    monitor = _attach_monitor(args, lambda: _snapshot("curl", dl.db, dl.stats, 0, args.workers))
     t0 = time.monotonic()
     try:
         dl.run(stop)
@@ -206,11 +207,30 @@ def _download(args, cfg, proxy, store, with_producer: bool) -> None:
         stop.set()
         if producer is not None:
             producer.shutdown(cfg.pass_timeout_s + 30)
+        if monitor is not None:
+            monitor.close()
         db.close()
     s = dl.stats
     logger.info("结束: 用时 %.1f 分钟，success %d，non_pdf %d，failed %d，用身份 %d 个，丢弃身份 %d 次，"
                 "URL 被单独挑战 %d 次，停掉卷期 %d 个（%d 篇未请求）", (time.monotonic() - t0) / 60, s.success,
                 s.non_pdf, s.failed, s.identities, s.rejected, s.challenged, s.volumes_stopped, s.inferred)
+
+
+def _attach_monitor(args, snapshot):
+    """[monitor] enabled 时启用监控上报 + 心跳；未配置返回 None。批次名 = 配置文件名（不含扩展名）。"""
+    from paperlite.monitor import reporter as mon
+    path = config_mod.resolve_path(args.config)
+    try:
+        return mon.attach(path, path.stem, snapshot)
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"配置错误: {e}")
+
+
+def _snapshot(mode: str, db: TaskDB, stats, online: int, workers: int) -> dict:
+    """心跳内容：在线浏览器数 + 任务库计数（监控面板「实时任务」）。"""
+    c = db.counts()
+    return {"mode": mode, "browsers_online": online, "workers": workers, "pending": c[Status.PENDING],
+            "running": c[Status.RUNNING], "success": c[Status.SUCCESS], "failed": c[Status.FAILED]}
 
 
 def _report(dl: Downloader, store: IdentityStore, cfg: Limits, stop: threading.Event) -> None:
@@ -328,6 +348,7 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
         return
     stop = threading.Event()
     threading.Thread(target=_browse_report, args=(pool, cfg, stop), daemon=True, name="report").start()
+    monitor = _attach_monitor(args, lambda: _snapshot("browser", pool.db, pool.stats, pool.online(), pool.workers))
     t0 = time.monotonic()
     try:
         pool.run(stop)
@@ -335,6 +356,8 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
         logger.info("中断：在途任务重跑时会放回 pending，可继续")
     finally:
         stop.set()
+        if monitor is not None:
+            monitor.close()
         db.close()
     s = pool.stats
     logger.info("结束: 用时 %.1f 分钟，success %d，failed %d，启动浏览器 %d 个",

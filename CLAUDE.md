@@ -35,6 +35,8 @@ uv run paperlite <命令>                   # 运行；子命令见 README「命
 - 卷期停止（`tasks.py`）：同卷期未下到 PDF 时最多放 `volume_stop_after` 篇，都 non_pdf 就把该卷期其余 pending 记 `non_pdf`+`inferred=1`（没实际请求）；下到过一篇 PDF 的卷期永不停。
 - 巡检（`inspect.py` + `tasks.py` 的 `flag`/`skip_rules`）：浏览器模式下，任何**真加载出来**的页（成功页 + 404 等失效页，`browser_pool._observe` 在成功和 404 分支都喂、不喂 `r.ok=False` 的过盾超时页）标题重复到 `title_dup_trigger` 次就归纳规则。候选取 doi/url 最长公共前缀及其 `_coarsen`（限 `_MAX_COARSEN` 位，防退化成 `/pii/S`），选规则**偏最具体**（最长前缀）而非命中最多，用已采数据验 precision/support 达标才标 pending 跳过。只看内存滑动窗口，按 `(doi_prefix, url_prefix)` 去重——详见 POSTMORTEMS。
 
+**监控（`monitor/`）是旁路**：业务代码只调 `monitor.reporter` 的 `page`/`browser_start`/`proxy_check`（未启用时 no-op、不导入 pika），心跳由 `cli._attach_monitor` 挂上。改监控绝不能让下载阻塞或抛错；新增埋点只加一行调用，别把业务逻辑搬进 monitor。指标口径（按尝试计、耗时只算已加载页、WAF = 站点前面是哪家）见 README「监控大屏」。
+
 ## 约束
 
 - **src 布局**：测试跑的是安装好的包，不会误用源码目录。

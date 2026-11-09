@@ -26,6 +26,19 @@ logger = logging.getLogger(__name__)
 CLEARANCE = "cf_clearance"
 
 
+def classify_waf(headers: dict) -> str:
+    """按主文档响应头识别站点前面的 WAF：cloudflare / aws_waf / datadome / none（仅供监控统计，不参与过盾判断）。"""
+    h = {str(k).lower(): str(v or "").lower() for k, v in (headers or {}).items()}
+    cookie = h.get("set-cookie", "")
+    if "cf-mitigated" in h or "cf-ray" in h or "cloudflare" in h.get("server", ""):
+        return "cloudflare"
+    if "x-amzn-waf-action" in h or "aws-waf-token" in cookie or "awselb" in h.get("server", ""):
+        return "aws_waf"
+    if "x-datadome" in h or "x-datadome-cid" in h or "datadome=" in cookie or "datadome" in h.get("server", ""):
+        return "datadome"
+    return "none"
+
+
 
 class DocTracker:
     """
@@ -40,6 +53,7 @@ class DocTracker:
         self.url: str = ""
         self.status: Optional[int] = None
         self.challenged: Optional[bool] = None     # 还没收到文档响应时为 None
+        self.waf: str = ""                         # 本次导航途中见到的 WAF（监控用；跳转链上任一主文档识别到即记）
         page.on("response", self._on_response)
 
     def _on_response(self, resp) -> None:
@@ -47,12 +61,16 @@ class DocTracker:
             if resp.request.is_navigation_request() and resp.frame == self.page.main_frame:
                 self.url, self.status = resp.url, resp.status
                 self.challenged = bool(resp.headers.get("cf-mitigated"))
+                waf = classify_waf(resp.headers)
+                if waf != "none" or not self.waf:
+                    self.waf = waf
         except Exception:
             pass
 
     def reset(self) -> None:
         """下一次导航前清状态，避免用上一页的 challenged 判断新页（challenged=None 视作"跳转中"）。"""
         self.url, self.status, self.challenged = "", None, None
+        self.waf = ""
 
 
 def browser_env() -> dict[str, str]:
@@ -228,6 +246,7 @@ class RenderResult:
     html: str = ""
     clicks: int = 0
     error: str = ""
+    waf: str = ""                 # 识别到的 WAF（cloudflare/aws_waf/datadome/none），监控统计用
 
 
 class BrowserSession:
@@ -305,6 +324,7 @@ class BrowserSession:
             result.error = f"{type(e).__name__}: {first}"
         finally:
             result.seconds = round(time.monotonic() - t0, 1)
+            result.waf = doc.waf or "none"
         return result
 
     async def close(self) -> None:

@@ -21,11 +21,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 from paperlite.browser import BrowserSession
 from paperlite.config import Limits
 from paperlite.inspect import WindowInspector
 from paperlite.logutil import log_event
+from paperlite.monitor import reporter as mon
 from paperlite.proxy import IpSource, Lease, ProxySettings, ProxyUnavailable
 from paperlite.tasks import Status, Task, TaskDB, UrlType, pdf_path
 
@@ -67,9 +69,14 @@ class BrowserPool:
         self.landing = cfg.landing_for(self.host)
         self.stats = BrowserStats()
         self._drained = threading.Event()      # 所有任务领完
+        self._live: set[str] = set()           # 当前开着浏览器的 worker（监控：在线浏览器数）
         self.inspector = (WindowInspector(db, cfg.title_dup_trigger, cfg.rule_min_precision,
                                           cfg.rule_min_support, cfg.title_window_size)
                           if cfg.title_dup_trigger else None)
+
+    def online(self) -> int:
+        """当前开着（已过盾可用）的浏览器数。"""
+        return len(self._live)
 
     def run(self, stop: Optional[threading.Event] = None) -> BrowserStats:
         asyncio.run(self._run(stop or threading.Event()))
@@ -91,10 +98,12 @@ class BrowserPool:
                 # 没有浏览器，或 IP 快到期：换新 IP 重开
                 if session is None or lease is None or lease.left() < self.cfg.min_left_s:
                     if session is not None:
+                        self._live.discard(name)
                         await session.close()
                     session, lease = await self._new_session(stop)
                     if session is None:
                         continue                       # 停了或一直取不到 IP
+                    self._live.add(name)
                 task = await asyncio.to_thread(self.db.claim, name)
                 if task is None:
                     self._drained.set()                # 没任务了，通知其它 worker 收工
@@ -105,11 +114,13 @@ class BrowserPool:
                     logger.exception("%s 处理任务异常，放回 pending", name)
                     await asyncio.to_thread(self.db.retry_later, task, count=False,
                                             error_kind="challenge_failed", error_message="浏览器 worker 异常")
+                    self._live.discard(name)
                     session = await self._discard(session)      # 浏览器可能已坏，下轮重开
                     continue
                 lo, hi = self.cfg.page_interval_s
                 await asyncio.sleep(random.uniform(lo, hi))     # 同域名限速
         finally:
+            self._live.discard(name)
             if session is not None:
                 await session.close()
 
@@ -146,6 +157,7 @@ class BrowserPool:
                 await session.start()
                 r = await session.render(self.landing, self.cfg.pass_timeout_s)
             except Exception as e:
+                mon.browser_start(False, "exception", host=self.host, error=f"{type(e).__name__}: {e}")
                 logger.error("浏览器启动/过盾异常", extra={
                     "event": "browser_start_failed",
                     "exit_ip": lease.exit_ip,
@@ -155,10 +167,13 @@ class BrowserPool:
                 await session.close()
                 continue
             if not r.ok:
+                mon.browser_start(False, "challenge_failed", host=self.host, waf=r.waf, seconds=r.seconds,
+                                  error=r.error)
                 logger.info("过盾落地页失败 ip=%s %.0fs: %s", lease.exit_ip, r.seconds, r.error)
                 await session.close()
                 continue
             self.stats.add("browsers")
+            mon.browser_start(True, "ok", host=self.host, waf=r.waf, seconds=r.seconds)
             if self.no_proxy:
                 logger.info("浏览器就绪（本机直连）过盾 %.0fs（点击 %d）", r.seconds, r.clicks)
             else:
@@ -177,6 +192,10 @@ class BrowserPool:
         t0 = time.monotonic()
         r = await session.render(task.url, self.cfg.pass_timeout_s)
         elapsed = int((time.monotonic() - t0) * 1000)
+        host = urlsplit(task.url).hostname or ""
+        code = r.status or 200
+        mon.page(host, passed=r.ok, ok=r.ok and code < 400, status=code if r.ok else None, waf=r.waf,
+                 elapsed_ms=elapsed, error="" if r.ok else r.error)
         if not r.ok:
             failed = await asyncio.to_thread(
                 self.db.challenged, task, self.cfg.max_url_challenges, lease.exit_ip,
@@ -187,7 +206,6 @@ class BrowserPool:
                         "，判失败" if failed else "，稍后重试", task.url, r.error)
             return
 
-        code = r.status or 200
         dest = pdf_path(self.out, task.doi, ".html")
         if code >= 400:
             kind = "not_found" if code in (404, 410) else None

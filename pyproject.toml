@@ -26,6 +26,9 @@ dependencies = [
     "certifi>=2024.2.2",
 ]
 
+[project.optional-dependencies]
+monitor = ["pika>=1.3"]       # 监控上报 / 面板（paperlite-monitor）用；不装则监控自动关闭，不影响下载
+
 [project.urls]
 Homepage = "https://github.com/huangpd/PaperLite"
 Repository = "https://github.com/huangpd/PaperLite"
@@ -33,6 +36,7 @@ Issues = "https://github.com/huangpd/PaperLite/issues"
 
 [project.scripts]
 paperlite = "paperlite.cli:main"
+paperlite-monitor = "paperlite.monitor.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]
