@@ -29,7 +29,7 @@ def consume_forever(cfg: MonitorConfig, db: MonitorDB, stop: threading.Event) ->
     while not stop.is_set():
         conn = None
         try:
-            params = pika.URLParameters(cfg.amqp_url)
+            params = cfg.amqp_params()
             params.heartbeat = 60
             conn = pika.BlockingConnection(params)
             ch = conn.channel()

@@ -5,13 +5,16 @@
   GET /health
 鉴权（/health 除外）：配了 password → HTTP Basic（浏览器弹框）；配了 token → ?token=… 或请求头 X-Token。
 两者都配时任一通过即可。都没配则不鉴权（只应在 bind 本机时这样用，cli 会拦）。
-Basic 鉴权密码按明文传输，公网务必在前面加 HTTPS 反代（见 docs/MONITOR.md）。
+Basic 鉴权密码在 HTTP 里是明文：对外开放时要么设 tls_cert/tls_key 让面板自己走 HTTPS，
+要么放在 HTTPS 反代后面（见 docs/MONITOR.md）。
 """
 
 import base64
 import hmac
 import json
 import logging
+import socket
+import ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from urllib.parse import parse_qs, urlsplit
@@ -27,6 +30,14 @@ def make_server(cfg: MonitorConfig, db: MonitorDB) -> ThreadingHTTPServer:
     online_s = max(60.0, cfg.heartbeat_s * 4)
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = 30                                   # 慢连接/半开连接最多占一个线程 30s
+
+        def setup(self):
+            if isinstance(self.request, ssl.SSLSocket):  # TLS 握手放在本请求线程里做，不卡 accept
+                self.request.settimeout(15)
+                self.request.do_handshake()
+            super().setup()
+
         def _send(self, code: int, body: bytes, ctype: str) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -81,9 +92,36 @@ def make_server(cfg: MonitorConfig, db: MonitorDB) -> ThreadingHTTPServer:
         def log_message(self, fmt, *args):
             logger.debug("%s " + fmt, self.address_string(), *args)
 
-    srv = ThreadingHTTPServer((cfg.bind, cfg.port), Handler)
+    srv = (_TLSServer if cfg.tls_cert else ThreadingHTTPServer)((cfg.bind, cfg.port), Handler)
     srv.daemon_threads = True
+    if cfg.tls_cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(_expand(cfg.tls_cert), _expand(cfg.tls_key))
+        srv.tls_context = ctx
     return srv
+
+
+class _TLSServer(ThreadingHTTPServer):
+    """HTTPS：accept 后只包装、不握手（握手在 Handler.setup 的工作线程里），握手失败的连接静默丢弃。"""
+    tls_context: ssl.SSLContext
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        return self.tls_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
+
+    def handle_error(self, request, client_address):
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ssl.SSLError, ConnectionError, socket.timeout, TimeoutError)):
+            logger.debug("丢弃 TLS 连接 %s: %s", client_address, exc)     # 如有人用 http:// 访问 https 端口
+            return
+        super().handle_error(request, client_address)
+
+
+def _expand(path: str) -> str:
+    from pathlib import Path
+    return str(Path(path).expanduser())
 
 
 def _basic_ok(header: str, username: str, password: str) -> bool:

@@ -13,6 +13,7 @@ import dataclasses
 import math
 import logging
 import random
+import ssl
 import sys
 import threading
 import time
@@ -56,11 +57,18 @@ def _serve(cfg: MonitorConfig, consume: bool) -> None:
         _need_pika()
         from paperlite.monitor.consumer import consume_forever
         threading.Thread(target=consume_forever, args=(cfg, db, stop), name="consumer", daemon=True).start()
-    srv = make_server(cfg, db)
+    if not cfg.loopback_only and not cfg.tls_cert:
+        logger.warning("面板对外监听 %s 却没开 HTTPS：登录密码会以明文经过网络。建议设 tls_cert / tls_key"
+                       "（见 docs/MONITOR.md），或改 bind = \"127.0.0.1\" 放到 HTTPS 反代后面", cfg.bind)
+    try:
+        srv = make_server(cfg, db)
+    except (OSError, ssl.SSLError) as e:
+        db.close()
+        raise SystemExit(f"面板启动失败（端口被占用？证书/私钥不对？）: {e}")
     host = "127.0.0.1" if cfg.bind in ("0.0.0.0", "") else cfg.bind
     auth = (f"登录用户 {cfg.username}" if cfg.password else "") + \
            ("，另可用 token" if cfg.token else "") or "未设密码（仅本机可访问）"
-    logger.info("监控大屏 http://%s:%d/  %s  数据库 %s（保留 %d 天）", host, cfg.port, auth,
+    logger.info("监控大屏 %s://%s:%d/  %s  数据库 %s（保留 %d 天）", "https" if cfg.tls_cert else "http", host, cfg.port, auth,
                 cfg.db_path.resolve(), cfg.retention_days)
     try:
         srv.serve_forever()
@@ -80,7 +88,7 @@ def _test(cfg: MonitorConfig) -> None:
                           cfg.vendor_name, {"mode": "test", "browsers_online": 0, "workers": 0,
                                             "pending": 0, "running": 0, "success": 0, "failed": 0})
     try:
-        conn = pika.BlockingConnection(pika.URLParameters(cfg.amqp_url))
+        conn = pika.BlockingConnection(cfg.amqp_params())
         ch = conn.channel()
         ch.exchange_declare(cfg.exchange, exchange_type="topic", durable=True)
         ch.confirm_delivery()

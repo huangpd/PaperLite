@@ -126,7 +126,7 @@ headed = false        # 仅 browser：有界面（调试）
 
 每个终端（一次 `paperlite run`）把运行指标发到**同一个公共 RabbitMQ**，`paperlite-monitor serve` 消费入库（SQLite，保留 30 天）并出网页大屏，可切最近 24 小时 / 7 天 / 30 天。监控是旁路：没配、RabbitMQ 连不上、没装 pika，下载都照常跑。
 
-**公网部署（RabbitMQ TLS、最小权限账号、面板登录密码、HTTPS 反代、数据库与容量）见 [`docs/MONITOR.md`](docs/MONITOR.md)。**
+**公网部署（只需公网 IP，无需域名：自建 CA 按 IP 签证书、RabbitMQ TLS、最小权限账号、面板自带 HTTPS + 登录密码、数据库与容量）见 [`docs/MONITOR.md`](docs/MONITOR.md)。**
 
 ```bash
 pip install 'paperlite[monitor]'                     # 多装一个 pika（uv：uv sync --extra monitor）
@@ -134,13 +134,14 @@ pip install 'paperlite[monitor]'                     # 多装一个 pika（uv：
 # 每个终端的 config.toml 加上（其余不用改）：
 #   [monitor]
 #   enabled  = true
-#   amqp_url = "amqps://pl_terminal:密码@mq.example.com:5671/paperlite"
+#   amqp_url = "amqps://pl_terminal:密码@服务器IP:5671/paperlite"
+#   amqp_ca_file = "ca.pem"       # 服务器上 deploy/monitor/gen-certs.sh 生成的 CA
 #   vendor   = "qingguo"          # 代理厂商标签，大屏按「厂商 × 域名」统计
 paperlite-monitor test                                # 终端上验证到 RabbitMQ 的连通性
 paperlite run config.toml                             # 照常跑，自动上报
 
 # 面板机器（[monitor] 段写 amqp_url / db / password 等）：
-paperlite-monitor serve                               # http://127.0.0.1:8700/，设了 password 则需登录
+paperlite-monitor serve                               # 设了 tls_cert 即 https://IP:8700/，设了 password 则需登录
 paperlite-monitor demo                                # 不连 RabbitMQ，灌模拟数据看效果
 ```
 
@@ -159,7 +160,7 @@ paperlite-monitor demo                                # 不连 RabbitMQ，灌模
 - **不丢、不堵**：终端本地有界缓冲（`buffer_size`，满了丢最旧的），后台线程发送、断线退避重连，绝不阻塞下载。面板用持久队列（`paperlite.monitor.dashboard`，上限 `queue_max_length` 丢最旧），面板停机期间消息排队、重启后补齐；先落盘再 ack。
 - **终端标识**：`node`（默认主机名）+ pid；批次 = 配置文件名（`sciencedirect.toml` → `sciencedirect`）。心跳超过 `max(60s, 4×heartbeat_s)` 没来即判离线。
 - **存储**：入库时按小时汇总，大屏查询代价与事件量无关（30 天约 1 秒内）；原始事件只留 `raw_retention_hours`（默认 48h）给实时事件流。
-- **安全**：面板默认只听 127.0.0.1；设了 `password` 即需登录（HTTP Basic，务必放在 HTTPS 反代后面）。监听非本机地址却没设密码会拒绝启动。
+- **安全**：面板默认只听 127.0.0.1；设了 `password` 即需登录（HTTP Basic）。对外开放时用 `tls_cert`/`tls_key` 让面板自带 HTTPS（或放在 HTTPS 反代后面）；监听非本机地址却没设密码会拒绝启动。
 - curl 模式只上报心跳和 IP 质检（页面级埋点只在浏览器模式）。
 
 ## Turnstile token（通用）

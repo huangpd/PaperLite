@@ -50,7 +50,7 @@ packages = ["src/paperlite"]
 
 # sdist 只放这些：项目目录里的 config.toml（含代理密码）、data/、db/、pdfs/ 绝不能进包
 [tool.hatch.build.targets.sdist]
-only-include = ["src/paperlite", "tests", "README.md", "LICENSE", "pyproject.toml"]
+only-include = ["src/paperlite", "tests", "deploy", "docs", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

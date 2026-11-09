@@ -1,0 +1,22 @@
+# RabbitMQ（监控消息总线）。用法见 docs/MONITOR.md：
+#   echo "MQ_ADMIN_PASS=$(openssl rand -hex 24)" > .env && chmod 600 .env && docker compose up -d
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: paperlite-mq
+    hostname: paperlite-mq            # 固定主机名：RabbitMQ 数据目录按节点名存，换名会"丢"数据
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: ${MQ_ADMIN_PASS:?请先在 .env 里设 MQ_ADMIN_PASS}
+      RABBITMQ_DEFAULT_VHOST: paperlite
+    ports:
+      - "5671:5671"                   # AMQPS：对公网开放，终端用
+      - "127.0.0.1:5672:5672"         # 明文 AMQP：只给本机面板用
+      - "127.0.0.1:15672:15672"       # 管理后台：只在本机，远程用 SSH 隧道看
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/90-paperlite.conf:ro
+      - ./mq-certs:/etc/rabbitmq/certs:ro
+      - mq-data:/var/lib/rabbitmq
+volumes:
+  mq-data:

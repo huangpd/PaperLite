@@ -95,7 +95,7 @@ class Reporter:
         while not self._stop.is_set():
             conn = None
             try:
-                params = pika.URLParameters(self.cfg.amqp_url)
+                params = self.cfg.amqp_params()
                 params.heartbeat = 60
                 params.blocked_connection_timeout = 30
                 params.socket_timeout = 10

@@ -23,3 +23,9 @@ log/
 .vscode/
 .DS_Store
 dist/
+
+# 监控部署：证书（含 CA 私钥）与密码绝不能提交/打包
+deploy/monitor/certs/
+deploy/monitor/mq-certs/
+deploy/monitor/.env
+*.key
