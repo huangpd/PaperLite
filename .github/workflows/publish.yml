@@ -18,7 +18,7 @@ jobs:
         run: |
           v=$(uv version --short)
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "标签 $GITHUB_REF_NAME 与版本 $v 不一致"; exit 1; }
-      - run: uv run --python 3.12 pytest -q
+      - run: uv run --python 3.12 --extra monitor pytest -q   # monitor 用例要 pika
       - run: uv build
       - uses: actions/upload-artifact@v4
         with:
