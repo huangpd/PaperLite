@@ -1,238 +1,339 @@
-# PaperLite：批量下载 PDF / 网页
+# PaperLite
 
-**一份 config = 一个批次**：各种主机的 URL 混着导进**一个任务库**，默认用**浏览器模式**统一跑——每个浏览器 + IP 过一次盾后连续下，不同主机的页面各自过盾、能自己跟跳转、整页存 `.html`。不区分站点，不用关心主机。
+[![PyPI](https://img.shields.io/pypi/v/paperlite.svg)](https://pypi.org/project/paperlite/)
+[![Python](https://img.shields.io/pypi/pyversions/paperlite.svg)](https://pypi.org/project/paperlite/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-位置在 `[paths]` 里定义、两者相互独立：
+**English** | [简体中文](README.zh-CN.md)
 
-- **`db`** —— 任务库（SQLite），**必须本地盘**（要随机写/文件锁/mmap，goofys/s3fs 等 FUSE 挂载不支持）；
-- **`storage`** —— 输出（PDF/HTML），可放对象存储挂载（顺序写）。
+PaperLite is a high-volume downloader for PDFs and web pages served behind bot-protection layers such as Cloudflare. It drives real browsers through rotating short-lived proxies, persists every task in a local SQLite database, and resumes cleanly after interruption.
 
-另有 **curl 模式**（`run --curl`）：单主机 cookie 池（浏览器过盾存 cookie、curl 批量领用下载，省资源、吞吐最高），用 Redis，适合一个站点的海量 URL，混多主机会直接报错提示改用浏览器模式。
+- **One config file, one batch.** URLs from any number of hosts go into a single task database and are processed together.
+- **Browser mode by default.** Each worker owns one browser and one IP, solves the challenge once, then downloads continuously, following redirects and saving PDFs or full HTML pages.
+- **Resumable and inspectable.** Task state, error classes and per-attempt metrics live in SQLite; `Ctrl+C` returns in-flight tasks to the queue.
+- **Self-protecting.** Proxy health checks, IP rotation on mid-lease failure, a circuit breaker for exhausted proxy quotas, and heuristics that skip dead or duplicate content.
+- **Optional fleet monitoring.** Terminals publish metrics to RabbitMQ; a bundled dashboard aggregates them across machines.
 
-## 快速开始
+## Contents
 
-需要 Python ≥ 3.11、一个短效代理提取接口（每次返回一个新 IP，青果格式）。浏览器模式**不用 Redis**（只有 curl 模式需要）。
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Command reference](#command-reference)
+- [Operations](#operations)
+- [Monitoring](#monitoring)
+- [Turnstile tokens](#turnstile-tokens)
+- [Task database](#task-database)
+- [Design notes](#design-notes)
+- [Development](#development)
+- [License](#license)
+
+## How it works
+
+PaperLite has two execution modes. Both share the same task database, storage layout and command set.
+
+| | Browser mode (default) | curl mode (`--curl`) |
+|---|---|---|
+| Model | N workers, each with its own browser and IP | Browsers solve challenges and pool the cookies; `curl_cffi` threads download with them |
+| Hosts per batch | Any mix | Exactly one |
+| Redirects / HTML pages | Followed; pages saved as `.html` | PDF-oriented |
+| External services | None | Redis (identity pool) |
+| Best for | Heterogeneous URL lists | Very large single-site jobs where throughput per IP matters |
+
+Two storage locations are configured independently under `[paths]`:
+
+- **`db`**: the SQLite task database. It **must be on a local disk**, because SQLite needs random writes, file locks and mmap, which FUSE mounts such as goofys or s3fs do not provide.
+- **`storage`**: the output directory for PDF and HTML files. Writes are sequential, so an object-storage mount is fine.
+
+## Requirements
+
+- Python 3.11 or later; Linux or macOS.
+- A short-lived proxy extraction API that returns a fresh `ip:port` per call (JSON or plain text), plus proxy credentials. `--no-proxy` runs without one for local testing.
+- Redis, only for curl mode.
+- RabbitMQ, only if you enable monitoring.
+
+## Installation
 
 ```bash
-pip install paperlite                     # 或 uv tool install paperlite；国内加 -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install paperlite
+# or
+uv tool install paperlite
+```
+
+Mirrors such as `-i https://pypi.tuna.tsinghua.edu.cn/simple` work as usual.
+
+From source:
+
+```bash
+git clone https://github.com/huangpd/PaperLite.git
+cd PaperLite
+uv sync
+uv run paperlite --version
+```
+
+## Quick start
+
+```bash
 mkdir work && cd work
-paperlite init                            # 生成 ./config.toml（权限 600）
+paperlite init                 # writes ./config.toml with mode 600
 ```
 
-然后编辑 `config.toml`：填 `[proxy]` 的提取接口和代理账号密码、`[paths]` 的 `db`/`storage`，再在 `[run]` 里写好这次要跑的（模式、URL 文件……见下「配置文件启动」）。之后每次就一行：
+Edit `config.toml`:
+
+1. `[proxy]`: extraction API URL and proxy credentials.
+2. `[paths]`: `db` and `storage`.
+3. `[run]`: the job itself (mode, worker count, URL file).
+
+Then start the batch:
 
 ```bash
-paperlite run config.toml                # 按该文件的 [run] 导入 + 下载（默认浏览器模式），下载完自动退出
+paperlite run config.toml
 ```
 
-**推荐把每次运行都落到配置文件里**：命令行参数跑完就忘，配置文件一直留在本地——哪个库、什么模式、存哪，打开文件就知道，换机器、重跑、交接都照着它来。
+The command imports the URL file, downloads everything, and exits when the queue is empty. It logs one progress line every 30 seconds. `Ctrl+C` or `SIGTERM` shuts down gracefully: in-flight tasks return to `pending`, and running the same command again resumes where it stopped.
 
-从源码装（开发）：
+> **Tip:** keep every run in a config file rather than on the command line. The file records which database, mode and output location a batch uses, which makes reruns, migrations and hand-overs reproducible.
 
-```bash
-git clone https://github.com/huangpd/PaperLite.git && cd PaperLite
-uv sync                                    # 国内：uv venv && uv pip install -e . --index-url https://pypi.tuna.tsinghua.edu.cn/simple
-uv run paperlite init
+## Configuration
+
+PaperLite looks for its config in this order: `--config`, then the `PAPERLITE_CONFIG` environment variable, then `./config.toml`. The template generated by `paperlite init` ([`src/paperlite/config.example.toml`](src/paperlite/config.example.toml)) documents every option.
+
+### `[run]`: launch parameters
+
+```toml
+[run]
+command  = "run"        # makes a bare `paperlite` start this run; leave empty to print help instead
+mode     = "browser"    # browser | curl
+proxy    = true         # false = --no-proxy (browser mode only)
+workers  = 20           # browser: concurrent browsers; curl: download threads
+urls     = "mixed.csv"  # optional; imported on start-up
+url_type = "pdf"        # pdf | html
+headed   = false        # browser mode only; show browser windows for debugging
 ```
 
-运行中每 30 秒打印一行进度。随时 Ctrl+C（或 SIGTERM）优雅退出：在途任务放回 pending、身份还池、释放生产者锁，再跑同一条命令从断点继续。
+When a config file is passed to `run`, the `[run]` section is authoritative and other `run` flags on the command line are ignored. Other subcommands (`import`, `status`, `retry`, `export`, …) keep their own flags.
 
-> `paperlite` 是安装生成的命令，下文统一写 `uv run paperlite ...`（源码目录内）。用清华源手动装的环境请改用 `.venv/bin/paperlite`——`uv run` 会按 `uv.lock` 去官方源重新同步，国内服务器会卡住。
+### Key options
 
-## 命令
+| Option | Default | Description |
+|---|---|---|
+| `[proxy] api_url`, `username`, `password` | (required) | Extraction API and proxy authentication |
+| `[proxy] check_url`, `check_url2` | Cloudflare, httpbin | Health-check targets for each new IP; passing either is sufficient. Keep them as IP-echo endpoints, not the target site: the check verifies connectivity, latency and exit IP, while passing the site's protection is handled by the challenge step |
+| `[proxy] check_max_latency_ms` | 3000 | Latency ceiling for the health check |
+| `[proxy] verify_exit_ip` | true | Require the echoed exit IP to match the proxy IP |
+| `[paths] db` | `tasks.db` | Task database (local disk only) |
+| `[paths] storage` | `output` | Output directory (mountable) |
+| `[paths] log_dir` | `log` | Log directory; empty logs to the terminal only |
+| `[limits] max_browsers` | 20 | Upper bound on concurrent browsers |
+| `[limits] pass_timeout_s` | 90 | Hard limit for one challenge attempt |
+| `[limits] hedge_after_s` | 45 | Start a backup browser if a challenge is still unsolved after this long |
+| `[limits] request_gap_s` | [3, 5] | Delay between requests on the same IP |
+| `[limits] page_interval_s` | [10, 30] | Delay between pages in one browser |
+| `[limits] max_file_size_mb` | 200 | Per-file size limit |
+| `[limits] max_tries` | 3 | Retries for network errors |
+| `[limits] volume_stop_after` | 3 | curl mode: stop a journal volume after this many consecutive non-PDF results; 0 disables |
+| `[limits] title_dup_trigger` | 10 | Duplicate-title count that triggers rule induction; 0 disables |
+| `[limits] max_identities` | 20 | curl mode: healthy identity cap |
+| `[limits] max_fresh_rejects` | 5 | curl mode: circuit-breaker threshold |
 
-| 命令 | 作用 |
+Command-line overrides: `--db` takes precedence over `[paths].db`, and `--storage` (on `run` and `download`) over `[paths].storage`.
+
+## Command reference
+
+| Command | Description |
 |---|---|
-| `init [--force]` | 生成配置模板 `config.toml` |
-| `import --urls <文件> [--type pdf\|html]` | 导入任务。txt 一行一链接，或带 `url` 列的 CSV（可选 `doi`/`source`/`batch_no`/`url_type`）。重复导入不重置已有任务 |
-| `run [config.toml] [--urls <文件>] [--workers 20]` | 下载，完成即退出。**默认浏览器模式**（各种主机混着跑、跟跳转）；`--curl` 走单主机 cookie 池；`--no-proxy` 本地直连 |
-| `produce [--keep N]` | 只生产身份（curl 模式），常驻 |
-| `download [--workers 20]` | 只下载（curl 模式），需另有生产者在跑 |
-| `status` | 各状态数量、失败按 `error_kind` 分组、停卷期（curl 下含身份池） |
-| `retry --status failed [--kind network]` | 把失败（或 `non_pdf`）重置为 pending |
-| `retry --stopped-volumes` | 让被停卷期重新抽样核实 |
-| `export [--status non_pdf] [--file x.csv]` | 导出任务表为 CSV |
-| `inspect` | 巡检：同标题重复到阈值就归纳 doi/url 规则，标记疑似失效/封面的未采任务 |
-| `turnstile --url <页> --sitekey <key>` | 取 Cloudflare Turnstile token（见下） |
+| `init [--force]` | Generate a `config.toml` template |
+| `import --urls FILE [--type pdf\|html]` | Import tasks from a text file (one URL per line) or a CSV with a `url` column and optional `doi`, `source`, `batch_no` and `url_type` columns. Re-importing never resets existing tasks |
+| `run [CONFIG] [--urls FILE] [--workers N]` | Download until the queue is empty. Browser mode by default; `--curl` switches modes; `--no-proxy` uses the local IP |
+| `produce [--keep N]` | curl mode: run only the identity producer (long-running) |
+| `download [--workers N]` | curl mode: run only the downloaders; needs a producer running |
+| `status` | Counts by status, failures by `error_kind`, stopped volumes and, in curl mode, the identity pool |
+| `retry --status failed [--kind KIND]` | Reset failed (or `non_pdf`) tasks to `pending` |
+| `retry --stopped-volumes` | Re-sample volumes stopped by the volume heuristic |
+| `export [--status S] [--file out.csv]` | Export the task table as CSV |
+| `inspect [--list] [--reset]` | Show, rebuild or clear the duplicate-title skip rules |
+| `turnstile --url URL --sitekey KEY` | Obtain a Cloudflare Turnstile token (see [below](#turnstile-tokens)) |
 
-**位置**：任务库 = `--db` > `[paths].db`；输出目录 = `--storage`（仅 `run`/`download`）> `[paths].storage`。日常把这些写进配置，命令行不用堆。全局参数：`--config` / `--log-level` / `--log-format` / `--version`。
+Global flags: `--config`, `--log-level`, `--log-format auto|text|json`, `--version`.
 
-**日志**：一份事件流，终端和文件各自渲染。日志文件（`[paths] log_dir`）始终是 JSON Lines，字段齐全、好检索。终端默认 `--log-format auto`——交互式窗口给人类可读文本（`时间 级别 消息  key=val`，按级别着色，认 `NO_COLOR`），被重定向 / 管道 / docker 采集（非 TTY）时自动转 JSON。所以交互盯着跑是文本、`nohup paperlite run config.toml > run.log` 落盘的 `run.log` 是 JSON，都不用加参数。要手动固定就用 `--log-format text` / `json`。
+**Logging.** Log files under `[paths].log_dir` are always JSON Lines. Terminal output defaults to `auto`: human-readable, colourised text on an interactive TTY (respects `NO_COLOR`), and JSON when stdout is redirected, piped or collected by a container runtime.
 
-> curl 模式（`run --curl` / `download` / `produce`）要求任务库里只有一个主机，混了会报错并提示改用浏览器模式；浏览器模式不限。
+## Operations
 
-## 常用操作
+**Run in the background:**
 
 ```bash
-# 后台跑 + 停止
-setsid nohup .venv/bin/paperlite run config.toml > run.log 2>&1 < /dev/null &
-kill <pid>                                 # 或 pkill -f "paperlite run"（注意别连执行它的 shell 一起杀）
+setsid nohup paperlite run config.toml > run.log 2>&1 < /dev/null &
+pkill -f "paperlite run"        # graceful stop (SIGTERM)
 ```
 
+**Local database, mounted output:**
+
 ```toml
-# 输出在对象存储挂载、任务库在本地盘：两者各写各的，互不推导
 [paths]
-db      = "/data/db/tasks.db"              # 本地盘
-storage = "/mnt/obs/papers"                # 对象存储挂载
+db      = "/data/db/tasks.db"   # local disk
+storage = "/mnt/obs/papers"     # object-storage mount
 ```
 
-- **省冷启动**（curl 模式）：第一个身份要等一次过盾（约 20 秒）。下载前先 `produce --keep 20` 养身份，代价是没人下载时也耗 IP。
-- **换/加站点**：浏览器模式随便混主机、无需配置。可选在 `[landing]` 给某主机配过盾落地页（任意会触发挑战的普通页）；curl 模式还要把 `[proxy] check_url` 换成该站可达地址，`classify.py` 的 non_pdf 判断按 ACM 写的，换站要看一下。
+**Adding sites.** No per-site configuration is needed; hosts are taken from the URLs in the task database.
 
-## 配置文件启动（`[run]`）
+- Before taking tasks, each new browser warms up by solving the challenge on the first imported host, at `https://{host}/` by default.
+- Pages on other hosts solve their own challenge the first time they are rendered.
+- If that host's home page is unsuitable (for example, it does not trigger the challenge or redirects elsewhere), override the warm-up URL in `[landing]`, e.g. `"www.example.org" = "https://www.example.org/journal/abc"`.
+- curl mode uses the same host and warm-up URL for identity production. Also review the non-PDF heuristics in `classify.py`, which were written for ACM.
 
-把一次运行的参数写进配置的 `[run]` 段，然后 `paperlite run config.toml` 就按这个文件启动，等价于一条展开的 `paperlite run ...`。参数都在文件里，命令行不用堆 `--out`/`--host`/`--db`——不怕忘、换机器重跑和交接都照着文件来。给了配置文件时，命令行其余 `run` 参数被忽略，一切以 `[run]` 为准。
+**Cold start in curl mode.** The first identity takes about 20 seconds to solve. `produce --keep 20` pre-warms the pool, at the cost of consuming IPs while no downloader is running.
+
+> When running from a source checkout installed through a mirror, call `.venv/bin/paperlite` directly. `uv run` re-syncs against `uv.lock` and the default index, which can stall on restricted networks.
+
+## Monitoring
+
+Each `paperlite run` can publish metrics to a shared RabbitMQ broker. `paperlite-monitor serve` consumes them into its own SQLite database (30-day retention) and serves a web dashboard with 24-hour, 7-day and 30-day views. Monitoring is strictly out-of-band: if it is disabled, the broker is unreachable, or the client library is missing, downloads continue unaffected.
+
+Enable it on each terminal:
 
 ```toml
-[run]                 # 配置后一行启动：paperlite run config.toml
-command = "run"       # 填 "run"：裸 paperlite（不带子命令）也按此启动；留空则裸 paperlite 只打印帮助（run config.toml 仍可用）
-mode = "browser"      # browser（各种主机混着跑，默认）/ curl（单主机 cookie 池）；省略按 browser
-proxy = true          # false 等价于 --no-proxy（仅 browser）
-workers = 20          # browser=同时打开的浏览器数；curl=下载线程数
-urls = "mixed.csv"    # 可选：启动时先导入这个 URL 文件
-url_type = "pdf"      # pdf / html
-headed = false        # 仅 browser：有界面（调试）
+[monitor]
+enabled  = true
+amqp_url = "amqp://pl_terminal:PASSWORD@BROKER_IP:5672/paperlite"
+vendor   = "qingguo"            # proxy vendor label, used for vendor × domain breakdowns
 ```
 
-库和输出位置不在 `[run]` 里，而在 `[paths]`（`db` / `storage`）——与模式无关、所有命令共用。`import` / `status` / `retry` / `export` 等仍走子命令（各有专属参数，没有配置等价物）。
-
-## 主要配置（config.toml）
-
-| 配置 | 默认 | 说明 |
-|---|---|---|
-分三段：`[proxy]`（代理）、`[paths]`（位置）、`[limits]`（并发与行为）。
-
-| 段.项 | 默认 | 说明 |
-|---|---|---|
-| `[proxy] api_url` / `username` / `password` | | 提取接口与代理鉴权（必填） |
-| `[proxy] check_url` / `check_url2` | cloudflare / httpbin | 新 IP 体检的两个判定目标，任一通过即合格 |
-| `[proxy] check_max_latency_ms` / `verify_exit_ip` | 3000 / true | 体检延迟闸 / 核对回显出口 IP == proxy_ip |
-| `[paths] db` | `tasks.db` | 任务库文件（**必须本地盘**） |
-| `[paths] storage` | `output` | 输出目录 PDF/HTML（可放对象存储挂载） |
-| `[paths] log_dir` | `log` | 日志目录；空则只打终端 |
-| `[limits] max_browsers` | 20 | 同时运行的浏览器上限 |
-| `[limits] pass_timeout_s` / `hedge_after_s` | 90 / 45 | 单次过盾上限 / 超过这么久就另开一个补位 |
-| `[limits] request_gap_s` / `page_interval_s` | [3,5] / [10,30] | 同 IP 请求间隔 / 浏览器两篇间隔 |
-| `[limits] max_file_size_mb` / `max_tries` | 200 / 3 | 单个 PDF 上限 / 网络错误重试次数 |
-| `[limits] volume_stop_after` | 3 | curl：同卷期接连这么多篇无 PDF 就停该卷期其余；0 关闭 |
-| `[limits] title_dup_trigger` | 10 | 巡检：同标题重复这么多篇就归纳规则跳过未采任务；0 关闭 |
-| `[limits] max_identities` / `max_fresh_rejects` | 20 / 5 | curl：健康身份上限 / 熔断阈值 |
-
-完整列表见 `paperlite init` 生成的模板（`src/paperlite/config.example.toml`）。查找顺序：`--config` > 环境变量 `PAPERLITE_CONFIG` > 当前目录 `config.toml`。
-
-## 监控大屏（`[monitor]` + RabbitMQ）
-
-每个终端（一次 `paperlite run`）把运行指标发到**同一个公共 RabbitMQ**，`paperlite-monitor serve` 消费入库（SQLite，保留 30 天）并出网页大屏，可切最近 24 小时 / 7 天 / 30 天。监控是旁路：没配、RabbitMQ 连不上、没装 pika，下载都照常跑。
-
-**公网部署（只需公网 IP，无需域名：RabbitMQ、最小权限账号、面板登录密码、数据库与容量）见 [`docs/MONITOR.md`](docs/MONITOR.md)。**
-
 ```bash
-# pika 已是默认依赖，pip install paperlite 即可（0.2.1 及更早要写 'paperlite[monitor]'）
-
-# 每个终端的 config.toml 加上（其余不用改）：
-#   [monitor]
-#   enabled  = true
-#   amqp_url = "amqp://pl_terminal:密码@服务器IP:5672/paperlite"
-#   vendor   = "qingguo"          # 代理厂商标签，大屏按「厂商 × 域名」统计
-paperlite-monitor test                                # 终端上验证到 RabbitMQ 的连通性
-paperlite run config.toml                             # 照常跑，自动上报
-
-# 面板机器（[monitor] 段写 amqp_url / db / password 等）：
-paperlite-monitor serve                               # http://IP:8700/，设了 password 则需登录
-paperlite-monitor demo                                # 不连 RabbitMQ，灌模拟数据看效果
+paperlite-monitor test          # verify broker connectivity from a terminal
+paperlite-monitor serve         # dashboard on http://HOST:8700/
+paperlite-monitor demo          # dashboard with synthetic data, no broker required
 ```
 
-| 大屏区块 | 指标 | 口径 |
-|---|---|---|
-| IP 质检 | 质检数、通过率、均延迟、不通过原因 | 每个新 IP 一条（体检通过才给浏览器），不分域名 |
-| 浏览器 | 在线数 / 目标数、启动成功率、异常数、均过盾秒数 | 在线数来自心跳（`heartbeat_s`，默认 15s）；启动 = 起浏览器 + 过热身落地页；异常 = 启动抛错（区别于过盾超时） |
-| 页面采集 | 成功、失败、成功率、过盾率 | **按尝试计**（过盾超时后稍后重试的，每次都算一次）；过盾 = 页面真加载出来；成功 = 过盾且 HTTP < 400 |
-| 页面耗时 | 平均、P95 | 只算已加载的页（超时尝试的耗时就是超时上限，算进去会把 P95 拉成常数）；P95 由每小时直方图合并，误差约 ±6% |
-| 域名 | 每域名成功率 / 过盾率 / 耗时 / 当前每分钟篇数 | 即「IP 过了质检后能否过该域名风控」。几百个域名也不截断：服务端搜索 / 排序 / 分页（`/api/domains`，每页 20，P95 只给当前页算）；**异常** = 样本 ≥ 20 次且成功率或过盾率 < 70%；样本不足 20 次的灰显，按比例/耗时排序时排在最后；可「按主域名合并」子域（近似 eTLD+1，不查公共后缀表） |
-| 代理厂商 | 厂商 × 域名成功率、厂商 IP 质检通过率 | 厂商 = 终端配置的 `vendor` |
-| WAF 过盾 | Cloudflare / AWS WAF / DataDome 的过盾率、均耗时、P95 | WAF 按主文档响应头识别（`cf-ray`/`cf-mitigated`、`x-amzn-waf-action`/`aws-waf-token`、`x-datadome`/`datadome=`），表示「站点前面是哪家」；页面 + 热身落地页都计 |
-| 实时任务 | 待下载 / 进行中、域名访问频率（近 5 分钟）、实时事件、终端列表 | 事件含页面/浏览器结果和各终端 WARNING 以上日志 |
+The dashboard covers:
 
-- **消息**：topic exchange `paperlite.monitor`，routing key = 事件类型（`page`/`browser`/`proxy_check`/`heartbeat`/`log`），JSON 信封格式见 `monitor/schema.py`。只发出口 IP 与统计，不发代理密码、不发页面内容。
-- **不丢、不堵**：终端本地有界缓冲（`buffer_size`，满了丢最旧的），后台线程发送、断线退避重连，绝不阻塞下载。面板用持久队列（`paperlite.monitor.dashboard`，上限 `queue_max_length` 丢最旧），面板停机期间消息排队、重启后补齐；先落盘再 ack。
-- **终端标识**：`node`（默认主机名）+ pid；批次 = 配置文件名（`sciencedirect.toml` → `sciencedirect`）。心跳超过 `max(60s, 4×heartbeat_s)` 没来即判离线。
-- **存储**：入库时按小时汇总，大屏查询代价与事件量无关（30 天约 1 秒内）；原始事件只留 `raw_retention_hours`（默认 48h）给实时事件流。
-- **安全**：面板默认只听 127.0.0.1；设了 `password` 即需登录（HTTP Basic）；监听非本机地址却没设密码会拒绝启动。传输不加密，对外开放时用安全组限制来源 IP。
-- curl 模式只上报心跳和 IP 质检（页面级埋点只在浏览器模式）。
+| Panel | Metrics |
+|---|---|
+| Proxy health | Checks, pass rate, mean latency, rejection reasons |
+| Browsers | Online vs. target, start-up success rate, exceptions, mean challenge time |
+| Page fetches | Successes, failures, success rate, challenge pass rate, mean and P95 latency |
+| Domains | Per-domain success, pass rate, latency and throughput; server-side search, sort and paging; optional merge by registrable domain |
+| Proxy vendors | Success by vendor × domain; IP health by vendor |
+| WAF | Pass rate and latency for Cloudflare, AWS WAF and DataDome, identified from response headers |
+| Live | Pending and running tasks, request rate by domain, event stream, terminal list |
 
-## Turnstile token（通用）
+Metric semantics:
 
-给目标页 URL 和 sitekey 即可取 token，不依赖站点配置和 Redis：
+- Page metrics count **attempts**. A task retried after a challenge timeout counts once per attempt.
+- *Passed* means the page actually loaded. *Success* means it passed and returned HTTP < 400.
+- Latency includes loaded pages only.
+- Domains with fewer than 20 samples are dimmed.
+- A domain is flagged when its success or pass rate falls below 70%.
+
+Messages carry statistics and exit IPs only, never proxy credentials or page content. Each terminal buffers events in a bounded local queue and publishes them from a background thread. The dashboard persists events to disk before acknowledging them.
+
+Deployment, broker accounts, security and capacity planning are covered in [`docs/MONITOR.md`](docs/MONITOR.md).
+
+## Turnstile tokens
+
+PaperLite can solve a Cloudflare Turnstile widget for any page, independent of the task database and Redis:
 
 ```bash
-uv run paperlite turnstile --url https://example.com/login --sitekey 0x4AAAA... --json
+paperlite turnstile --url https://example.com/login --sitekey 0x4AAAA... --json
 # {"ok": true, "token": "1.xxxx…", "user_agent": "...", "seconds": 15.3, ...}
 
-uv run paperlite turnstile --serve 8191 --concurrency 4        # HTTP 服务
+paperlite turnstile --serve 8191 --concurrency 4
 curl localhost:8191/solve -d '{"url":"...","sitekey":"0x4AAAA...","proxy":"http://u:p@1.2.3.4:8000"}'
 ```
 
-原理：CloakBrowser 打开目标 URL 但拦截该文档、换成只渲染此 sitekey 的最小页（origin 仍是目标站，能过 hostname 校验），在 Turnstile iframe 上按坐标点复选框，从 callback 拿 token；卡 "Verifying…" 时每 8 秒补点一次。token 一次性、约 300 秒有效，有的站校验提交 IP/UA，须用同一代理和返回的 `user_agent`。过盾（`produce`/`run`）遇交互式 Turnstile 也自动点，见 `turnstile.py`。
+How the solver works:
 
-## 测试
+1. It opens the target URL in CloakBrowser but intercepts the document and substitutes a minimal page that renders only the requested sitekey. The origin stays the target site, so hostname validation passes.
+2. It clicks the checkbox inside the Turnstile iframe and reads the token from the callback.
+
+Tokens are single-use and valid for about 300 seconds. Some sites bind them to the submitting IP and user agent, so submit through the same proxy and with the returned `user_agent`.
+
+## Task database
+
+Tasks live in the table `paper_pdf_resources`, whose schema mirrors the upstream PostgreSQL table of the same name.
+
+| Column | Description |
+|---|---|
+| `id` | Auto-increment key; tasks are claimed in this order |
+| `url_key` | SHA-256 of the normalised URL; unique |
+| `doi` | Imported value (lower-cased) or derived from the URL; determines the file name |
+| `url`, `source`, `batch_no` | Imported values |
+| `url_type` | `pdf` (expects a PDF) or `html` (saves the page itself) |
+| `volume` | DOI volume key (`10.1145/1012326.1012328` → `1012326`), used by volume stopping |
+| `status` | `pending` → `running` → `success` / `non_pdf` / `failed` |
+| `error_kind` | `not_found`, `paywall`, `landing_page` (non-PDF); `network`, `server_error`, `extract_failed`, `challenge_failed` |
+| `title`, `final_url` | Page title and the final URL after redirects |
+| `http_status`, `file_size`, `elapsed_ms`, `exit_ip` | Metrics from the latest attempt |
+| `retry_count`, `challenge_count` | Network/5xx retries; challenges despite a valid cookie |
+| `inferred` | 1 if the outcome was inferred by volume stopping rather than requested |
+| `file_path` | `<storage>/<h[0:2]>/<h[2:4]>/<doi>.pdf` (or `.html`), where `h = sha256(doi)` |
+
+Auxiliary tables: `meta`, `volume_stops` and `skip_rules`.
 
 ```bash
-uv run pytest                                              # Redis 相关的会跳过
-PAPERLITE_TEST_REDIS=redis://127.0.0.1:6379/0 uv run pytest   # 连真实 Redis 全跑
-PAPERLITE_TEST_AMQP=amqp://guest:guest@127.0.0.1:5672/%2F uv run pytest tests/test_monitor.py   # 监控连真实 RabbitMQ
+sqlite3 tasks.db "SELECT status, error_kind, count(*) FROM paper_pdf_resources GROUP BY 1, 2"
 ```
 
-## 任务库 tasks.db
+## Design notes
 
-表 `paper_pdf_resources`（结构对齐 paper_downloader 的 PG 同名表）。关键列：
+These behaviours are deliberate. See [`POSTMORTEMS.md`](POSTMORTEMS.md) for the incidents behind them.
 
-| 列 | 说明 |
-|---|---|
-| `id` | 自增主键，按它的顺序领取 |
-| `url_key` | sha256(规范化 url)，唯一 |
-| `doi` | 导入值（小写）或从链接回退推导；决定文件名 |
-| `url` / `source` / `batch_no` | 导入原值 |
-| `url_type` | `pdf`（默认，应返回 PDF）/ `html`（要网页本身，整页存 `.html`） |
-| `volume` | DOI 卷期号（`10.1145/1012326.1012328` → `1012326`），用于卷期停止 |
-| `status` | `pending` → `running` → `success` / `non_pdf` / `failed` |
-| `error_kind` | `not_found`/`paywall`/`landing_page`（non_pdf）；`network`/`server_error`/`extract_failed`；`challenge_failed` |
-| `title` / `final_url` | 页面标题；网页任务跟完跳转的最终地址 |
-| `http_status` / `file_size` / `elapsed_ms` / `exit_ip` | 最近一次尝试的指标 |
-| `retry_count` / `challenge_count` | 网络错误/5xx 计数；带有效 cookie 仍被挑战的次数 |
-| `inferred` | 1 = 按卷期推断、未实际请求 |
-| `file_path` | 成功后绝对路径 `<storage>/<h[0:2]>/<h[2:4]>/<doi>.pdf`（网页为 `.html`），`h=sha256(doi)` |
+- **An identity is IP + cookie + user agent.** `cf_clearance` is bound to both the IP and the user agent, so all three are stored and used together; changing any one yields 403. An identity expires with whichever comes first, the IP lease or the cookie, so identities are produced continuously.
+- **Challenges either pass quickly or hang.** Successful solves typically take 12–30 s, while failures stall on "Verifying…" until timeout. A backup browser is launched after `hedge_after_s` (45 s), and the original runs until `pass_timeout_s` (90 s). Datacenter IPs are often given an interactive challenge, so a proxy is effectively required.
+- **A challenged URL does not imply a bad identity.** Sites flag individual URLs, often in contiguous runs. On a challenge, PaperLite re-tests the identity against the landing page:
+  - If the landing page loads, only that URL is deprioritised (`challenge_count + 1`).
+  - If the landing page is also challenged, the identity is discarded.
 
-查库：`sqlite3 tasks.db "SELECT status,error_kind,count(*) FROM paper_pdf_resources GROUP BY 1,2"`。另有 `meta`（本库主机）、`volume_stops`（被停卷期）、`skip_rules`（巡检规则）表。
+  Judging the identity by whether the next URL is challenged would discard healthy identities in bulk.
+- **Mid-lease IP failure.** Short-lived IPs often die before their lease ends. The symptoms are `ERR_TUNNEL_CONNECTION_FAILED`, `ERR_PROXY_*`, `ERR_CONNECTION_CLOSED/RESET` and `ERR_EMPTY_RESPONSE`. These are treated as IP faults, not task faults:
+  - The task returns to `pending` with `error_kind=network`, without incrementing its retry or challenge counters.
+  - After two consecutive failures, the browser rotates to a new IP.
+- **Circuit breaker.** If `max_fresh_rejects` new identities in a row are rejected on first use, the producer pauses for `breaker_pause_s`, raises an alert, then admits a single probe. This keeps an exhausted proxy quota from burning hundreds of IPs a minute. Network errors do not count toward the threshold.
+- **Volume stopping** (curl mode). Missing PDFs tend to come in whole journal volumes. For a volume with no PDF yet, at most `volume_stop_after` tasks are in flight. If all of them come back non-PDF, the rest of the volume is marked `non_pdf` with `inferred=1`. A volume that has ever produced a PDF is never stopped.
+- **Streaming downloads.** Timeouts measure stalls, not total duration, so large files on slow proxies complete. A valid PDF must contain `%PDF-` within its first 1024 bytes.
+- **Duplicate-title inspection** (browser mode). DOIs are unique, so identical titles across many pages usually mean an error page or a cover page.
+  1. When any loaded page's title (success or 404, excluding challenge timeouts) repeats `title_dup_trigger` times, PaperLite induces the most specific DOI/URL prefix that explains the repeats.
+  2. It validates the rule against data already collected, requiring precision ≥ 0.98.
+  3. Only then does it mark matching pending tasks as skipped.
 
-## 设计要点
+  The heuristic deliberately prefers missing a skip over skipping a live task.
 
-- **身份 = IP + cookie + UA**：cf_clearance 绑 IP + UA，三者一起存一起用，换任意一个都 403。青果短效 IP 约 10 分钟，身份过期取 IP 与 cookie 较早者，约 9 分钟换新，故须持续生产。
-- **过盾要么快要么卡死**：成功多在 12–30 秒，失败停在 "Verifying…" 转到超时。默认 `pass_timeout_s=90` 并对冲：超 `hedge_after_s=45` 秒没过就另开浏览器补位，旧的继续跑到超时。机房直连出口会要求手动勾选，必须走代理。
-- **被挑战 ≠ 身份坏**：站点会单独盯上某些 URL（往往成批相邻）。遇挑战先用落地页验身份——落地页正常只是这条 URL 被盯上（`challenge_count+1` 排后面），落地页也被挑战才丢身份。不能用"下一条也被挑战"判身份，否则会把好身份接连误杀。
-- **IP 中途失效**（浏览器模式）：短效 IP 常在寿命内就断，页面报 `ERR_TUNNEL_CONNECTION_FAILED` / `ERR_PROXY_*` / `ERR_CONNECTION_CLOSED|RESET` / `ERR_EMPTY_RESPONSE`。这是 IP 的问题不是这篇的问题：任务放回 pending（`error_kind=network`，不计 `challenge_count`/重试次数）；同一浏览器连续 2 次就提前换 IP，不再拿死 IP 撞到寿命结束。
-- **熔断**：连续 `max_fresh_rejects` 个新身份一用就被拒 → 生产者暂停 `breaker_pause_s` 并告警，之后放一个试探；网络错误不计入。防代理配额耗尽时 1 分钟烧光 IP。
-- **卷期停止**：ACM 的 404 / 无 PDF 基本按卷期整组出现。未下到 PDF 的卷期同时最多放 `volume_stop_after` 篇，都 non_pdf 就停该卷期其余 pending（记 `inferred=1`，未请求）；下到过一篇 PDF 的卷期永不停。`retry --stopped-volumes` 重新核实。
-- **流式下载**：卡顿超时而非总时长，慢代理上大文件不被掐断；`%PDF-` 须在前 1024 字节内。网络错误 `(56)` 先用同一身份重试一次再丢。
-- **巡检**（浏览器模式）：DOI 唯一却得到相同标题≈整批失效或整批封面。任何**真加载出来**的页（成功页 + 404 等失效页，不含过盾超时页）标题重复到 `title_dup_trigger` 次，就从 doi/url 两维归纳**最具体**的前缀规则、用已采数据验精确率（≥0.98），达标才把命中的 pending 标记跳过——宁可少跳、分批触发，也不误标未采的活任务。只看本次运行的内存滑动窗口。
+**Reference throughput** (ACM Digital Library, 20 workers): 120–160 tasks per minute. One identity lasts about 9 minutes and downloads 60–70 papers. Expect 180–300 short-lived IPs per 10,000 papers; 30-minute IPs need about a third as many.
 
-性能（ACM 实测）：20 线程每分钟处理 120–160 条（PDF 约 140）；每身份用约 9 分钟下 60–70 篇，含过盾失败，**每 1 万篇约需 180–300 个 IP**（换 30 分钟时效 IP 约 1/3）。踩坑细节见 `POSTMORTEMS.md`。
+## Development
 
-## 目录
+```bash
+uv sync
+uv run pytest                                                   # Redis-backed tests are skipped
+PAPERLITE_TEST_REDIS=redis://127.0.0.1:6379/0 uv run pytest     # include Redis tests
+PAPERLITE_TEST_AMQP=amqp://guest:guest@127.0.0.1:5672/%2F uv run pytest tests/test_monitor.py
+```
+
+Project layout:
 
 ```
-src/paperlite/     代码（src 布局；config.example.toml 是配置模板）
-  store.py         Redis 身份池（Lua 原子领用、租约、生产者锁）
-  producer.py      按需生产身份、控制并发过盾
-  browser.py       一次过盾（独立 CloakBrowser 进程经代理打开落地页）
-  turnstile.py     Turnstile 定位点击、按 sitekey 取 token、HTTP 服务
-  browser_pool.py  浏览器模式的浏览器复用
-  consumer.py      下载线程（领任务+身份、流式下载、身份健康判定）
-  tasks.py         SQLite 任务库、卷期停止
-  inspect.py       巡检归纳规则
-  classify.py      non_pdf 分类（not_found/paywall/landing_page）
-  proxy.py         短效代理取 IP + 分层体检（TCP/TLS/TTFB 四段计时、核对出口 IP、延迟闸）
-  config.py cli.py 配置（[proxy]/[limits]/[paths]/[run]）/ 命令行
-  monitor/         监控：reporter.py 埋点上报（未启用即 no-op）；db/consumer/dashboard/cli 为面板端（paperlite-monitor）
-tests/             pytest（unittest 风格；Redis 用例按 PAPERLITE_TEST_REDIS 门控）
-config.toml        paperlite init 生成（含代理密码，不提交）
+src/paperlite/
+  cli.py, config.py   command line; configuration ([proxy], [limits], [paths], [run])
+  browser_pool.py     browser mode: per-worker browser + IP reuse
+  browser.py          one challenge solve (isolated CloakBrowser process via proxy)
+  turnstile.py        Turnstile detection, clicking, token service
+  producer.py         curl mode: on-demand identity production, solve concurrency
+  store.py            curl mode: Redis identity pool (atomic Lua claims, leases, producer lock)
+  consumer.py         curl mode: download threads, streaming, identity health
+  tasks.py            SQLite task store, volume stopping
+  inspect.py          duplicate-title rule induction
+  classify.py         non-PDF classification (not_found, paywall, landing_page)
+  proxy.py            proxy extraction and layered health checks (TCP/TLS/TTFB/total)
+  monitor/            metrics reporter (no-op when disabled) and the paperlite-monitor dashboard
+  config.example.toml configuration template
+tests/                pytest suite (unittest style)
+docs/MONITOR.md       monitoring deployment guide
 ```
+
+`config.toml` contains proxy credentials. It is excluded from version control and from the sdist through an explicit allow-list in `pyproject.toml`.
+
+## License
+
+[MIT](LICENSE)
