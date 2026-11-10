@@ -1,6 +1,6 @@
 [project]
 name = "paperlite"
-version = "0.2.2"
+version = "0.2.3"
 description = "High-volume PDF and web page downloader for bot-protected sites: real browsers, rotating proxies, resumable SQLite task queue."
 readme = "README.md"
 requires-python = ">=3.11"
