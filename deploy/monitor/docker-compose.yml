@@ -11,12 +11,10 @@ services:
       RABBITMQ_DEFAULT_PASS: ${MQ_ADMIN_PASS:?请先在 .env 里设 MQ_ADMIN_PASS}
       RABBITMQ_DEFAULT_VHOST: paperlite
     ports:
-      - "5671:5671"                   # AMQPS：对公网开放，终端用
-      - "127.0.0.1:5672:5672"         # 明文 AMQP：只给本机面板用
+      - "5672:5672"                   # AMQP：对公网开放，终端与面板都用
       - "127.0.0.1:15672:15672"       # 管理后台：只在本机，远程用 SSH 隧道看
     volumes:
       - ./rabbitmq.conf:/etc/rabbitmq/conf.d/90-paperlite.conf:ro
-      - ./mq-certs:/etc/rabbitmq/certs:ro
       - mq-data:/var/lib/rabbitmq
 volumes:
   mq-data:

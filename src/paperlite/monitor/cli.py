@@ -13,7 +13,6 @@ import dataclasses
 import math
 import logging
 import random
-import ssl
 import sys
 import threading
 import time
@@ -40,7 +39,7 @@ def _need_pika() -> None:
     try:
         import pika  # noqa: F401
     except ImportError:
-        raise SystemExit("需要 pika：pip install 'paperlite[monitor]'（或 uv pip install pika）")
+        raise SystemExit("需要 pika：pip install pika（或升级 paperlite）")
 
 
 def _serve(cfg: MonitorConfig, consume: bool) -> None:
@@ -49,7 +48,7 @@ def _serve(cfg: MonitorConfig, consume: bool) -> None:
 
     if not cfg.loopback_only and not cfg.auth_enabled:
         raise SystemExit(f"面板监听 {cfg.bind}（非本机）却没设密码：任何人都能看。请在 [monitor] 设 password"
-                         f"（或 token），或改回 bind = \"127.0.0.1\" 再由 HTTPS 反代对外。见 docs/MONITOR.md")
+                         f"（或 token），或改回 bind = \"127.0.0.1\"。见 docs/MONITOR.md")
     db = MonitorDB(cfg.db_path, cfg.retention_days, cfg.raw_retention_hours)
     db.prune(force=True)
     stop = threading.Event()
@@ -57,18 +56,15 @@ def _serve(cfg: MonitorConfig, consume: bool) -> None:
         _need_pika()
         from paperlite.monitor.consumer import consume_forever
         threading.Thread(target=consume_forever, args=(cfg, db, stop), name="consumer", daemon=True).start()
-    if not cfg.loopback_only and not cfg.tls_cert:
-        logger.warning("面板对外监听 %s 却没开 HTTPS：登录密码会以明文经过网络。建议设 tls_cert / tls_key"
-                       "（见 docs/MONITOR.md），或改 bind = \"127.0.0.1\" 放到 HTTPS 反代后面", cfg.bind)
     try:
         srv = make_server(cfg, db)
-    except (OSError, ssl.SSLError) as e:
+    except OSError as e:
         db.close()
-        raise SystemExit(f"面板启动失败（端口被占用？证书/私钥不对？）: {e}")
+        raise SystemExit(f"面板启动失败（端口被占用？）: {e}")
     host = "127.0.0.1" if cfg.bind in ("0.0.0.0", "") else cfg.bind
     auth = (f"登录用户 {cfg.username}" if cfg.password else "") + \
            ("，另可用 token" if cfg.token else "") or "未设密码（仅本机可访问）"
-    logger.info("监控大屏 %s://%s:%d/  %s  数据库 %s（保留 %d 天）", "https" if cfg.tls_cert else "http", host, cfg.port, auth,
+    logger.info("监控大屏 http://%s:%d/  %s  数据库 %s（保留 %d 天）", host, cfg.port, auth,
                 cfg.db_path.resolve(), cfg.retention_days)
     try:
         srv.serve_forever()

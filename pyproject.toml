@@ -24,10 +24,11 @@ dependencies = [
     "curl-cffi>=0.15.0",
     "redis>=5.0",
     "certifi>=2024.2.2",
+    "pika>=1.3",                  # 监控上报 / 面板（paperlite-monitor）；未启用 [monitor] 时不会被导入
 ]
 
 [project.optional-dependencies]
-monitor = ["pika>=1.3"]       # 监控上报 / 面板（paperlite-monitor）用；不装则监控自动关闭，不影响下载
+monitor = []                  # 兼容旧安装命令 paperlite[monitor]；pika 已是默认依赖
 
 [project.urls]
 Homepage = "https://github.com/huangpd/PaperLite"

@@ -44,7 +44,7 @@ class Reporter:
         try:
             import pika  # noqa: F401
         except ImportError:
-            logger.warning("[monitor] enabled = true 但未安装 pika，监控上报已关闭（pip install 'paperlite[monitor]'）")
+            logger.warning("[monitor] enabled = true 但未安装 pika，监控上报已关闭（pip install pika，或升级 paperlite）")
             return False
         logging.getLogger("pika").setLevel(logging.WARNING)    # pika 的 INFO 连接细节会刷屏下载日志
         self.enabled = True
@@ -55,8 +55,6 @@ class Reporter:
             logging.getLogger().addHandler(self._log_handler)
         logger.info("监控上报已启用 → %s exchange=%s 终端 %s", _redact(self.cfg.amqp_url), self.cfg.exchange,
                     self.cfg.instance)
-        if not self.cfg.amqp_verify:
-            logger.warning("[monitor] amqp_verify = false：上报照样加密，但不校验服务器证书（不防中间人冒充）")
         return True
 
     def close(self, timeout_s: float = 3.0) -> None:

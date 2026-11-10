@@ -1056,6 +1056,32 @@ class BrowserPoolTest(unittest.TestCase):
         r = self.row(url)
         self.assertEqual((r["status"], r["error_kind"], r["challenge_count"]), ("failed", "challenge_failed", 2))
 
+    def test_proxy_net_error_switches_ip_without_counting(self):
+        """IP 中途失效（ERR_TUNNEL_CONNECTION_FAILED）：不计挑战次数、任务放回；连续 2 次就换 IP。"""
+        from paperlite.browser import RenderResult
+        landing = self.cfg.landing_for("www.sciencedirect.com")
+        url = "https://www.sciencedirect.com/science/article/abs/pii/net"
+        dead = {"n": 2}                                          # 第一个 IP 上的前两次文章渲染都是隧道错误
+        def resp(u):
+            if u != landing and dead["n"] > 0:
+                dead["n"] -= 1
+                return RenderResult(ok=False, seconds=0.1,
+                                    error=f"Error: Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at {u}")
+            return self._ok(u)
+        pool = self.run_pool(resp, [url])                        # max_url_challenges=2：若计数早就判死了
+        self.assertEqual((pool.stats.success, pool.stats.failed), (1, 0))
+        self.assertEqual(pool.stats.browsers, 2)                 # 换过一次 IP
+        r = self.row(url)
+        self.assertEqual((r["status"], r["challenge_count"], r["retry_count"]), ("success", 0, 0))
+
+    def test_is_proxy_net_error(self):
+        from paperlite.browser_pool import is_proxy_net_error
+        for e in ("Error: Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://x", "net::ERR_PROXY_CONNECTION_FAILED",
+                  "net::ERR_CONNECTION_CLOSED", "net::ERR_CONNECTION_RESET", "net::ERR_EMPTY_RESPONSE"):
+            self.assertTrue(is_proxy_net_error(e), e)
+        for e in ("TimeoutError: 90s 内页面未稳定", "net::ERR_NAME_NOT_RESOLVED", "", None):
+            self.assertFalse(is_proxy_net_error(e), e)
+
 
 @unittest.skipUnless(os.environ.get("PAPERLITE_TEST_REDIS"), "设置 PAPERLITE_TEST_REDIS=redis://... 才跑")
 class RedisStoreTest(unittest.TestCase):

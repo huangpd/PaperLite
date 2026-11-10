@@ -12,8 +12,6 @@ class MonitorConfig:
     # ── 上报端 ──
     enabled: bool = False                 # true 才上报；false / 没有 [monitor] 段时埋点全部 no-op
     amqp_url: str = "amqp://guest:guest@127.0.0.1:5672/%2F"   # 公共 RabbitMQ（含密码，只在本地配置里）
-    amqp_ca_file: str = ""                # amqps 时信任的 CA 证书（自建 CA / 按 IP 签发的证书）；空则用系统 CA
-    amqp_verify: bool = True              # false：amqps 仍加密但不校验服务器证书（免拷 ca.pem；不防中间人冒充）
     exchange: str = "paperlite.monitor"   # topic exchange，routing key = 事件类型
     node: str = ""                        # 终端名；空则用主机名。同机多进程靠 pid 区分（见 instance）
     vendor: str = ""                      # 代理厂商标签（如 qingguo），面板按厂商×域名聚合；空则记 unknown
@@ -29,8 +27,6 @@ class MonitorConfig:
     username: str = "admin"               # 面板登录用户名（HTTP Basic，浏览器弹框输入）
     password: str = ""                    # 面板登录密码；非空即开启登录。监听非本机地址时必须设（或设 token）
     token: str = ""                       # 可选：给脚本/监控系统用的只读令牌（?token=… 或请求头 X-Token）
-    tls_cert: str = ""                    # 面板自己提供 HTTPS：证书（可含中间证书）。与 tls_key 同时设置
-    tls_key: str = ""                     # 面板 HTTPS 私钥
     retention_days: int = 30              # 小时汇总（大屏 1/7/30 天）保留天数
     raw_retention_hours: int = 48         # 原始事件（实时事件流、明细）保留小时数；量大时调小
 
@@ -49,32 +45,12 @@ class MonitorConfig:
             raise ValueError("[monitor] raw_retention_hours 至少 2（实时事件流看最近 1 小时）")
         if cfg.enabled and not cfg.amqp_url:
             raise ValueError("[monitor] enabled = true 时 amqp_url 必填")
-        if bool(cfg.tls_cert) != bool(cfg.tls_key):
-            raise ValueError("[monitor] tls_cert 与 tls_key 要同时设置")
-        if cfg.amqp_ca_file and not cfg.amqp_url.lower().startswith("amqps://"):
-            raise ValueError("[monitor] 设了 amqp_ca_file 时 amqp_url 应为 amqps://（TLS）")
-        if not cfg.amqp_verify and cfg.amqp_ca_file:
-            raise ValueError("[monitor] amqp_verify = false 时不校验证书，amqp_ca_file 不起作用，二选一")
         return cfg
 
     def amqp_params(self):
-        """pika 连接参数。amqps + amqp_ca_file：只信任该 CA，并校验证书里的主机名/IP；
-        amqps + amqp_verify=false：照样 TLS 加密，但不校验服务器证书。"""
-        import ssl
-
+        """pika 连接参数。"""
         import pika
-        params = pika.URLParameters(self.amqp_url)
-        if params.ssl_options is None:
-            return params
-        if not self.amqp_verify:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            params.ssl_options = pika.SSLOptions(ctx)
-        elif self.amqp_ca_file:
-            ctx = ssl.create_default_context(cafile=str(Path(self.amqp_ca_file).expanduser()))
-            params.ssl_options = pika.SSLOptions(ctx)
-        return params
+        return pika.URLParameters(self.amqp_url)
 
     @property
     def auth_enabled(self) -> bool:

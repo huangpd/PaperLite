@@ -53,11 +53,9 @@ urls = ""                     # 可选：启动时先导入这个 URL 文件
 url_type = "html"              # pdf / html
 headed = false                # 仅 browser：有界面（调试）
 
-[monitor]                     # 可选：监控上报。各终端发到同一个 RabbitMQ，paperlite-monitor serve 出大屏（需 pip install 'paperlite[monitor]'）
+[monitor]                     # 可选：监控上报。各终端发到同一个 RabbitMQ，paperlite-monitor serve 出大屏
 enabled = false               # true 才上报；RabbitMQ 连不上/没装 pika 都不影响下载
-amqp_url = "amqps://pl_terminal:密码@服务器IP:5671/paperlite"   # 公共 RabbitMQ（TLS；含密码，别提交）。部署见 docs/MONITOR.md
-# amqp_ca_file = "ca.pem"     # 服务器用 deploy/monitor/gen-certs.sh 按 IP 自签时，拷来的 CA 证书
-# amqp_verify = false        # 或者不拷 ca.pem：仍加密，但不校验服务器证书（不防冒充）；与 amqp_ca_file 二选一
+amqp_url = "amqp://pl_terminal:密码@服务器IP:5672/paperlite"    # 公共 RabbitMQ（含密码，别提交）。部署见 docs/MONITOR.md
 exchange = "paperlite.monitor"
 node = ""                     # 终端名，留空用主机名
 vendor = "qingguo"            # 代理厂商标签：面板按「厂商 × 域名」统计成功率
@@ -68,8 +66,6 @@ heartbeat_s = 15              # 心跳间隔（在线浏览器数、待下载数
 # port = 8700
 # username = "admin"          # 面板网页登录用户名
 # password = ""               # 面板网页登录密码；非空即需登录。对外开放必须设
-# tls_cert = ""               # 面板自带 HTTPS：证书（gen-certs.sh 生成的 cert.pem）
-# tls_key = ""                # 面板 HTTPS 私钥（privkey.pem）
 # token = ""                  # 可选：给脚本调 /api/summary 用（?token=…）
 # retention_days = 30         # 大屏数据（小时汇总）保留天数
 # raw_retention_hours = 48    # 原始事件（实时事件流）保留小时数

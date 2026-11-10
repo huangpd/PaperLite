@@ -16,6 +16,7 @@ paperlite/browser_pool.py
 import asyncio
 import logging
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -32,6 +33,15 @@ from paperlite.proxy import IpSource, Lease, ProxySettings, ProxyUnavailable
 from paperlite.tasks import Status, Task, TaskDB, UrlType, pdf_path
 
 logger = logging.getLogger(__name__)
+
+# 代理链路断了（IP 中途失效）：不是页面/站点的问题。这类错误不计挑战次数，连续 _NET_DISCARD_AFTER 次就换 IP，
+# 不再拿死 IP 一直撞到寿命结束。
+_PROXY_NET_ERR = re.compile(r"net::ERR_(TUNNEL_CONNECTION_FAILED|PROXY_[A-Z_]+|CONNECTION_(CLOSED|RESET|REFUSED)|EMPTY_RESPONSE)")
+_NET_DISCARD_AFTER = 2
+
+
+def is_proxy_net_error(error: str) -> bool:
+    return bool(_PROXY_NET_ERR.search(error or ""))
 
 _NO_IP_WAIT_S = 5.0
 
@@ -93,10 +103,16 @@ class BrowserPool:
         name = f"browser-{n}"
         session: Optional[BrowserSession] = None
         lease: Optional[Lease] = None
+        net_errors = 0                                      # 当前 IP 连续代理网络错误次数
         try:
             while not stop.is_set() and not self._drained.is_set():
                 # 没有浏览器，或 IP 快到期：换新 IP 重开
-                if session is None or lease is None or lease.left() < self.cfg.min_left_s:
+                if (session is None or lease is None or lease.left() < self.cfg.min_left_s
+                        or net_errors >= _NET_DISCARD_AFTER):
+                    if net_errors >= _NET_DISCARD_AFTER and lease is not None:
+                        logger.warning("%s IP %s 连续 %d 次代理网络错误，提前换 IP（剩余寿命 %.0fs）",
+                                       name, lease.exit_ip or lease.server, net_errors, lease.left())
+                    net_errors = 0
                     if session is not None:
                         self._live.discard(name)
                         await session.close()
@@ -109,7 +125,8 @@ class BrowserPool:
                     self._drained.set()                # 没任务了，通知其它 worker 收工
                     break
                 try:
-                    await self._do_task(task, session, lease, name)
+                    net_err = await self._do_task(task, session, lease, name)
+                    net_errors = net_errors + 1 if net_err else 0
                 except Exception:
                     logger.exception("%s 处理任务异常，放回 pending", name)
                     await asyncio.to_thread(self.db.retry_later, task, count=False,
@@ -188,7 +205,8 @@ class BrowserPool:
         if self.inspector is not None and r.title:
             await asyncio.to_thread(self.inspector.observe, task.doi, task.url, r.title)
 
-    async def _do_task(self, task: Task, session: BrowserSession, lease: Lease, name: str) -> None:
+    async def _do_task(self, task: Task, session: BrowserSession, lease: Lease, name: str) -> bool:
+        """下载一篇；返回 True 表示失败原因是代理网络错误（IP 可能已失效），由 worker 决定是否换 IP。"""
         t0 = time.monotonic()
         r = await session.render(task.url, self.cfg.pass_timeout_s)
         elapsed = int((time.monotonic() - t0) * 1000)
@@ -196,6 +214,12 @@ class BrowserPool:
         code = r.status or 200
         mon.page(host, passed=r.ok, ok=r.ok and code < 400, status=code if r.ok else None, waf=r.waf,
                  elapsed_ms=elapsed, error="" if r.ok else r.error)
+        if not r.ok and is_proxy_net_error(r.error):
+            # IP 的问题不是这篇的问题：放回 pending，不计挑战/重试次数
+            await asyncio.to_thread(self.db.retry_later, task, count=False, error_kind="network",
+                                    error_message=f"代理网络错误: {r.error}"[:500], exit_ip=lease.exit_ip or None)
+            logger.info("%s 代理网络错误，任务放回 %s: %s", name, task.url, r.error)
+            return True
         if not r.ok:
             failed = await asyncio.to_thread(
                 self.db.challenged, task, self.cfg.max_url_challenges, lease.exit_ip,

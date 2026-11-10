@@ -1,4 +1,4 @@
-# PaperLite：大批量下载 PDF / 网页（过 Cloudflare）
+# PaperLite：批量下载 PDF / 网页
 
 **一份 config = 一个批次**：各种主机的 URL 混着导进**一个任务库**，默认用**浏览器模式**统一跑——每个浏览器 + IP 过一次盾后连续下，不同主机的页面各自过盾、能自己跟跳转、整页存 `.html`。不区分站点，不用关心主机。
 
@@ -7,9 +7,7 @@
 - **`db`** —— 任务库（SQLite），**必须本地盘**（要随机写/文件锁/mmap，goofys/s3fs 等 FUSE 挂载不支持）；
 - **`storage`** —— 输出（PDF/HTML），可放对象存储挂载（顺序写）。
 
-另有 **curl 模式**（`run --curl`）：单主机 cookie 池（浏览器过盾存 cookie、curl 批量领用下载，省资源、吞吐最高），用 Redis，适合一个站点的海量 URL；日常大概率用不到，混多主机会直接报错提示改用浏览器模式。
-
-独立项目（原 `paper_downloader/cookie_pool/`，2026-10-25 拆出）：自带依赖和 venv，配置是运行目录的 `config.toml`，不依赖 `paper_downloader`，不用 PostgreSQL。
+另有 **curl 模式**（`run --curl`）：单主机 cookie 池（浏览器过盾存 cookie、curl 批量领用下载，省资源、吞吐最高），用 Redis，适合一个站点的海量 URL，混多主机会直接报错提示改用浏览器模式。
 
 ## 快速开始
 
@@ -27,7 +25,7 @@ paperlite init                            # 生成 ./config.toml（权限 600）
 paperlite run config.toml                # 按该文件的 [run] 导入 + 下载（默认浏览器模式），下载完自动退出
 ```
 
-**推荐把每次运行都落到配置文件里**：命令行参数跑完就忘，配置文件一直留在本地——哪个库、什么模式、存哪，打开文件就知道，换机器、重跑、交接都照着它来。想临时试一把也可以直接敲子命令（`paperlite import --urls mixed.csv` 然后 `paperlite run`），参数见下「命令」。
+**推荐把每次运行都落到配置文件里**：命令行参数跑完就忘，配置文件一直留在本地——哪个库、什么模式、存哪，打开文件就知道，换机器、重跑、交接都照着它来。
 
 从源码装（开发）：
 
@@ -126,22 +124,21 @@ headed = false        # 仅 browser：有界面（调试）
 
 每个终端（一次 `paperlite run`）把运行指标发到**同一个公共 RabbitMQ**，`paperlite-monitor serve` 消费入库（SQLite，保留 30 天）并出网页大屏，可切最近 24 小时 / 7 天 / 30 天。监控是旁路：没配、RabbitMQ 连不上、没装 pika，下载都照常跑。
 
-**公网部署（只需公网 IP，无需域名：自建 CA 按 IP 签证书、RabbitMQ TLS、最小权限账号、面板自带 HTTPS + 登录密码、数据库与容量）见 [`docs/MONITOR.md`](docs/MONITOR.md)。**
+**公网部署（只需公网 IP，无需域名：RabbitMQ、最小权限账号、面板登录密码、数据库与容量）见 [`docs/MONITOR.md`](docs/MONITOR.md)。**
 
 ```bash
-pip install 'paperlite[monitor]'                     # 多装一个 pika（uv：uv sync --extra monitor）
+# pika 已是默认依赖，pip install paperlite 即可（0.2.1 及更早要写 'paperlite[monitor]'）
 
 # 每个终端的 config.toml 加上（其余不用改）：
 #   [monitor]
 #   enabled  = true
-#   amqp_url = "amqps://pl_terminal:密码@服务器IP:5671/paperlite"
-#   amqp_ca_file = "ca.pem"       # 服务器上 deploy/monitor/gen-certs.sh 生成的 CA（或改写 amqp_verify = false 免拷，不校验证书）
+#   amqp_url = "amqp://pl_terminal:密码@服务器IP:5672/paperlite"
 #   vendor   = "qingguo"          # 代理厂商标签，大屏按「厂商 × 域名」统计
 paperlite-monitor test                                # 终端上验证到 RabbitMQ 的连通性
 paperlite run config.toml                             # 照常跑，自动上报
 
 # 面板机器（[monitor] 段写 amqp_url / db / password 等）：
-paperlite-monitor serve                               # 设了 tls_cert 即 https://IP:8700/，设了 password 则需登录
+paperlite-monitor serve                               # http://IP:8700/，设了 password 则需登录
 paperlite-monitor demo                                # 不连 RabbitMQ，灌模拟数据看效果
 ```
 
@@ -160,7 +157,7 @@ paperlite-monitor demo                                # 不连 RabbitMQ，灌模
 - **不丢、不堵**：终端本地有界缓冲（`buffer_size`，满了丢最旧的），后台线程发送、断线退避重连，绝不阻塞下载。面板用持久队列（`paperlite.monitor.dashboard`，上限 `queue_max_length` 丢最旧），面板停机期间消息排队、重启后补齐；先落盘再 ack。
 - **终端标识**：`node`（默认主机名）+ pid；批次 = 配置文件名（`sciencedirect.toml` → `sciencedirect`）。心跳超过 `max(60s, 4×heartbeat_s)` 没来即判离线。
 - **存储**：入库时按小时汇总，大屏查询代价与事件量无关（30 天约 1 秒内）；原始事件只留 `raw_retention_hours`（默认 48h）给实时事件流。
-- **安全**：面板默认只听 127.0.0.1；设了 `password` 即需登录（HTTP Basic）。对外开放时用 `tls_cert`/`tls_key` 让面板自带 HTTPS（或放在 HTTPS 反代后面）；监听非本机地址却没设密码会拒绝启动。
+- **安全**：面板默认只听 127.0.0.1；设了 `password` 即需登录（HTTP Basic）；监听非本机地址却没设密码会拒绝启动。传输不加密，对外开放时用安全组限制来源 IP。
 - curl 模式只上报心跳和 IP 质检（页面级埋点只在浏览器模式）。
 
 ## Turnstile token（通用）
@@ -212,6 +209,7 @@ PAPERLITE_TEST_AMQP=amqp://guest:guest@127.0.0.1:5672/%2F uv run pytest tests/te
 - **身份 = IP + cookie + UA**：cf_clearance 绑 IP + UA，三者一起存一起用，换任意一个都 403。青果短效 IP 约 10 分钟，身份过期取 IP 与 cookie 较早者，约 9 分钟换新，故须持续生产。
 - **过盾要么快要么卡死**：成功多在 12–30 秒，失败停在 "Verifying…" 转到超时。默认 `pass_timeout_s=90` 并对冲：超 `hedge_after_s=45` 秒没过就另开浏览器补位，旧的继续跑到超时。机房直连出口会要求手动勾选，必须走代理。
 - **被挑战 ≠ 身份坏**：站点会单独盯上某些 URL（往往成批相邻）。遇挑战先用落地页验身份——落地页正常只是这条 URL 被盯上（`challenge_count+1` 排后面），落地页也被挑战才丢身份。不能用"下一条也被挑战"判身份，否则会把好身份接连误杀。
+- **IP 中途失效**（浏览器模式）：短效 IP 常在寿命内就断，页面报 `ERR_TUNNEL_CONNECTION_FAILED` / `ERR_PROXY_*` / `ERR_CONNECTION_CLOSED|RESET` / `ERR_EMPTY_RESPONSE`。这是 IP 的问题不是这篇的问题：任务放回 pending（`error_kind=network`，不计 `challenge_count`/重试次数）；同一浏览器连续 2 次就提前换 IP，不再拿死 IP 撞到寿命结束。
 - **熔断**：连续 `max_fresh_rejects` 个新身份一用就被拒 → 生产者暂停 `breaker_pause_s` 并告警，之后放一个试探；网络错误不计入。防代理配额耗尽时 1 分钟烧光 IP。
 - **卷期停止**：ACM 的 404 / 无 PDF 基本按卷期整组出现。未下到 PDF 的卷期同时最多放 `volume_stop_after` 篇，都 non_pdf 就停该卷期其余 pending（记 `inferred=1`，未请求）；下到过一篇 PDF 的卷期永不停。`retry --stopped-volumes` 重新核实。
 - **流式下载**：卡顿超时而非总时长，慢代理上大文件不被掐断；`%PDF-` 须在前 1024 字节内。网络错误 `(56)` 先用同一身份重试一次再丢。
