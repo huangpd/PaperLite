@@ -135,7 +135,7 @@ pip install 'paperlite[monitor]'                     # 多装一个 pika（uv：
 #   [monitor]
 #   enabled  = true
 #   amqp_url = "amqps://pl_terminal:密码@服务器IP:5671/paperlite"
-#   amqp_ca_file = "ca.pem"       # 服务器上 deploy/monitor/gen-certs.sh 生成的 CA
+#   amqp_ca_file = "ca.pem"       # 服务器上 deploy/monitor/gen-certs.sh 生成的 CA（或改写 amqp_verify = false 免拷，不校验证书）
 #   vendor   = "qingguo"          # 代理厂商标签，大屏按「厂商 × 域名」统计
 paperlite-monitor test                                # 终端上验证到 RabbitMQ 的连通性
 paperlite run config.toml                             # 照常跑，自动上报
@@ -151,7 +151,7 @@ paperlite-monitor demo                                # 不连 RabbitMQ，灌模
 | 浏览器 | 在线数 / 目标数、启动成功率、异常数、均过盾秒数 | 在线数来自心跳（`heartbeat_s`，默认 15s）；启动 = 起浏览器 + 过热身落地页；异常 = 启动抛错（区别于过盾超时） |
 | 页面采集 | 成功、失败、成功率、过盾率 | **按尝试计**（过盾超时后稍后重试的，每次都算一次）；过盾 = 页面真加载出来；成功 = 过盾且 HTTP < 400 |
 | 页面耗时 | 平均、P95 | 只算已加载的页（超时尝试的耗时就是超时上限，算进去会把 P95 拉成常数）；P95 由每小时直方图合并，误差约 ±6% |
-| 域名 | 每域名成功率 / 过盾率 / 耗时 / 当前每分钟篇数 | 即「IP 过了质检后能否过该域名风控」 |
+| 域名 | 每域名成功率 / 过盾率 / 耗时 / 当前每分钟篇数 | 即「IP 过了质检后能否过该域名风控」。几百个域名也不截断：服务端搜索 / 排序 / 分页（`/api/domains`，每页 20，P95 只给当前页算）；**异常** = 样本 ≥ 20 次且成功率或过盾率 < 70%；样本不足 20 次的灰显，按比例/耗时排序时排在最后；可「按主域名合并」子域（近似 eTLD+1，不查公共后缀表） |
 | 代理厂商 | 厂商 × 域名成功率、厂商 IP 质检通过率 | 厂商 = 终端配置的 `vendor` |
 | WAF 过盾 | Cloudflare / AWS WAF / DataDome 的过盾率、均耗时、P95 | WAF 按主文档响应头识别（`cf-ray`/`cf-mitigated`、`x-amzn-waf-action`/`aws-waf-token`、`x-datadome`/`datadome=`），表示「站点前面是哪家」；页面 + 热身落地页都计 |
 | 实时任务 | 待下载 / 进行中、域名访问频率（近 5 分钟）、实时事件、终端列表 | 事件含页面/浏览器结果和各终端 WARNING 以上日志 |

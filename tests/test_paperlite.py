@@ -148,6 +148,16 @@ class ConfigTest(unittest.TestCase):
         self.assertIsNone(parse_deadline(""))
         self.assertTrue(impersonate_for("Mozilla/5.0 Chrome/146.0.0.0").startswith("chrome"))
 
+    def test_parse_extract_json_and_text(self):
+        from paperlite.proxy import parse_extract
+        j = parse_extract('{"code": "SUCCESS", "data": [{"server": "1.2.3.4:8000", "proxy_ip": "1.2.3.4"}]}')
+        self.assertEqual((j["server"], j["proxy_ip"]), ("1.2.3.4:8000", "1.2.3.4"))
+        self.assertEqual(parse_extract("140.224.134.247:48747"), {"server": "140.224.134.247:48747"})
+        self.assertEqual(parse_extract("1.2.3.4:80\r\n5.6.7.8:81\r\n")["server"], "1.2.3.4:80")   # 多行取第一个
+        for bad in ('{"code": 1, "msg": "余额不足"}', "请求过于频繁", "", '{"code": "SUCCESS", "data": []}'):
+            with self.assertRaises(RuntimeError):
+                parse_extract(bad)
+
 
 class ClassifyTest(unittest.TestCase):
     NAV = '<a href="/premium" title="Basic Edition, Upgrade">'

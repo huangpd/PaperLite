@@ -244,7 +244,7 @@ RabbitMQ 晚于面板启动也没关系：面板会退避重连。
 pip install 'paperlite[monitor]'        # 多装 pika；源码环境：uv sync --extra monitor
 ```
 
-1. 把服务器上的 `certs/ca.pem` 拷到终端（只拷 `ca.pem`，**不要拷 `ca.key`**），比如放在配置文件旁边。
+1. 把服务器上的 `certs/ca.pem` 拷到终端（只拷 `ca.pem`，**不要拷 `ca.key`**），比如放在配置文件旁边。（嫌麻烦可跳过这步，改用下面的 `amqp_verify = false`，见本节末尾。）
 2. 在该批次的 `config.toml` 里加一段（其余不动）：
 
 ```toml
@@ -269,6 +269,7 @@ paperlite run config.toml
 
 - 终端网络断了 / RabbitMQ 挂了：下载照常，事件在本地缓冲（默认 1 万条，满了丢最旧的），恢复后自动补发。
 - `amqp_ca_file` 指定后**只信任这个 CA**，并校验证书里的 IP 与 `amqp_url` 里的一致。
+- **不想拷 `ca.pem`**：去掉 `amqp_ca_file`，改写 `amqp_verify = false`。连接照样 TLS 加密（防被动窃听），但**不校验服务器证书**：有人在网络中间冒充服务器就能截到终端密码。`pl_terminal` 只能往 `paperlite.monitor` 写、什么都读不到，最坏是被灌假数据（第 13 节），能接受就用。启动时日志会有一条 WARNING 提醒。两项二选一，同时设会报错。
 
 ## 8. 防火墙与安全组
 
@@ -356,6 +357,7 @@ sqlite3 -readonly /opt/paperlite-monitor/monitor.db \
 | `enabled` | `false` | 终端 | `true` 才上报 |
 | `amqp_url` | `amqp://guest:guest@127.0.0.1:5672/%2F` | 两端 | 终端用 `amqps://…@公网IP:5671/paperlite`，同机面板用 `amqp://…@127.0.0.1:5672/paperlite`。最后一段是 vhost |
 | `amqp_ca_file` | 空 | 终端 | `amqps` 时信任的 CA（即 `ca.pem`）；空则用系统 CA（自建 CA 会连不上） |
+| `amqp_verify` | `true` | 终端 | `false`：`amqps` 仍加密但不校验服务器证书，免拷 `ca.pem`；不防冒充。与 `amqp_ca_file` 二选一 |
 | `exchange` | `paperlite.monitor` | 两端 | 改了要同步改 RabbitMQ 权限正则 |
 | `node` | 主机名 | 终端 | 终端名；面板按 `node:pid` 区分进程 |
 | `vendor` | `unknown` | 终端 | 代理厂商标签 |
@@ -402,7 +404,7 @@ sudo docker restart paperlite-mq && sudo systemctl restart paperlite-monitor
 | 现象 | 原因 / 处理 |
 |---|---|
 | `paperlite-monitor test` 报 `已连上 RabbitMQ，但还没有面板队列绑定` | 面板还没启动过（队列是面板建的）。先起面板 |
-| 报 `CERTIFICATE_VERIFY_FAILED … self-signed certificate` | 终端没配 `amqp_ca_file`，或路径不对（相对路径以启动目录为准） |
+| 报 `CERTIFICATE_VERIFY_FAILED … self-signed certificate` | 终端没配 `amqp_ca_file`，或路径不对（相对路径以启动目录为准）；或改用 `amqp_verify = false` |
 | 报 `CERTIFICATE_VERIFY_FAILED … IP address mismatch` | `amqp_url` 里的 IP 不在证书里：用了内网 IP、或服务器 IP 变了。用正确的 IP 重签（第 11 节） |
 | 报 `ACCESS_REFUSED - Login was refused` | 用户名/密码错，或密码里有特殊字符没 URL 编码 |
 | 报 `NOT_ALLOWED - vhost / not found` | `amqp_url` 末尾漏了 `/paperlite`（默认 vhost 是 `/`，本部署没有它） |

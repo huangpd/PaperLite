@@ -26,6 +26,9 @@ from paperlite.monitor import schema
 WINDOWS = {"1d": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 TREND_BUCKET = {"1d": 3600, "7d": 6 * 3600, "30d": 86400}
 HOUR = 3600
+DOMAIN_SORTS = ("attempts", "success_rate", "pass_rate", "avg_ms", "p95_ms", "per_min", "host")
+DOMAIN_MIN_N = 20             # 样本少于这么多次的域名，比例不可信：不算异常、按比例排序时排最后
+ABNORMAL_RATE = 0.7           # 成功率或过盾率低于它算异常（与页面上的黄/红分界一致）
 
 # 耗时直方图分桶：50ms 起每档 ×1.12，到 10 分钟，约 84 档；取桶的几何中点作分位值（误差约 ±6%）
 _EDGES = [50.0 * 1.12 ** i for i in range(int(math.log(600_000 / 50) / math.log(1.12)) + 2)]
@@ -182,7 +185,8 @@ class MonitorDB:
                 "ip": self._ip(q, h0, h1),
                 "browser": self._browser(q, h0, h1, now - online_s),
                 "pages": self._pages(rows),
-                "domains": self._domains(q, rows, now),
+                "domains": self._domains(q, rows, now, limit=12),     # 只给厂商矩阵；完整域名表走 domains()
+                "domain_count": len({x["host"] for x in rows}),
                 "vendors": self._vendors(q, h0, h1),
                 "waf": self._waf(q, rows, h0, h1),
                 "realtime": self._realtime(q, now, online_s),
@@ -254,6 +258,92 @@ class MonitorDB:
                         "avg_ms": _div(d["ms"], d["passed"]), "p95_ms": _pct(_merge(d["hists"]), 0.95),
                         "waf": max(known, key=known.get) if known else schema.WAF_NONE,
                         "per_min": round(freq.get(d["host"], 0) / 5, 1)})
+        return out
+
+    def domains(self, window: str = "1d", sort: str = "attempts", order: str = "desc", q: str = "",
+                offset: int = 0, limit: int = 20, abnormal: bool = False, group: bool = False,
+                min_n: int = DOMAIN_MIN_N, now: Optional[float] = None, cache_s: float = 5.0) -> dict[str, Any]:
+        """域名表（几百个域名也只画一页）：服务端搜索 / 排序 / 分页，P95 只给当前页算。
+
+        - 样本数 < min_n 的域名标 few：按比例/耗时排序时一律排到最后（两三次访问的 0% / 100% 没意义），
+          也不计入「异常」。
+        - 异常 = 样本足够且 成功率 或 过盾率 < ABNORMAL_RATE。
+        - group=True 按主域名合并子域（site_of 的近似规则，不查公共后缀表）。
+        """
+        if window not in WINDOWS:
+            raise ValueError(f"window 只支持 {', '.join(WINDOWS)}")
+        if sort not in DOMAIN_SORTS:
+            raise ValueError(f"sort 只支持 {', '.join(DOMAIN_SORTS)}")
+        if order not in ("asc", "desc"):
+            raise ValueError("order 只支持 asc / desc")
+        offset, limit, min_n = max(0, int(offset)), min(max(1, int(limit)), 200), max(1, int(min_n))
+        needle = (q or "").strip().lower()
+        key = ("domains", window, sort, order, needle, offset, limit, bool(abnormal), bool(group), min_n)
+        real_now = time.time()
+        if now is None and key in self._cache and real_now - self._cache[key][0] < cache_s:
+            return self._cache[key][1]
+        now = now or real_now
+        h1 = int(now // HOUR) + 1
+        h0 = h1 - WINDOWS[window] // HOUR
+        name = site_of if group else (lambda h: h)
+
+        with self._lock:
+            ex = self.conn.execute
+            rows = ex("SELECT host, waf, SUM(n) n, SUM(passed) passed, SUM(ok) ok, SUM(ms_sum) ms FROM page_h "
+                      "WHERE hour >= ? AND hour < ? GROUP BY host, waf", (h0, h1)).fetchall()
+            freq = ex("SELECT host, COUNT(*) n FROM page WHERE ts >= ? GROUP BY host", (now - 300,)).fetchall()
+
+            by: dict[str, dict] = {}
+            for x in rows:
+                d = by.setdefault(name(x["host"]), {"attempts": 0, "success": 0, "passed": 0, "ms": 0.0,
+                                                    "wafs": defaultdict(int), "hosts": set(), "recent": 0})
+                d["attempts"] += x["n"]; d["success"] += x["ok"]; d["passed"] += x["passed"]
+                d["ms"] += x["ms"] or 0
+                d["wafs"][x["waf"]] += x["n"]
+                d["hosts"].add(x["host"])
+            for x in freq:
+                if name(x["host"]) in by:
+                    by[name(x["host"])]["recent"] += x["n"]
+
+            items = []
+            for k, d in by.items():
+                known = {w: c for w, c in d["wafs"].items() if w in schema.WAFS}
+                sr, pr = _rate(d["success"], d["attempts"]), _rate(d["passed"], d["attempts"])
+                few = d["attempts"] < min_n
+                items.append({"host": k, "hosts": sorted(d["hosts"]), "attempts": d["attempts"],
+                              "success": d["success"], "success_rate": sr, "pass_rate": pr,
+                              "avg_ms": _div(d["ms"], d["passed"]), "p95_ms": None,
+                              "waf": max(known, key=known.get) if known else schema.WAF_NONE,
+                              "per_min": round(d["recent"] / 5, 1), "few": few,
+                              "abnormal": not few and ((sr or 0) < ABNORMAL_RATE or (pr or 0) < ABNORMAL_RATE)})
+            total, n_abnormal = len(items), sum(x["abnormal"] for x in items)     # 整个时间窗的，不受搜索影响
+            if needle:
+                items = [x for x in items if needle in x["host"].lower() or any(needle in h.lower() for h in x["hosts"])]
+            if abnormal:
+                items = [x for x in items if x["abnormal"]]
+
+            def fill_p95(sel: list[dict]) -> None:
+                want = {h for x in sel for h in x["hosts"]}
+                if not want:
+                    return
+                hists: dict[str, list] = defaultdict(list)
+                for x in ex(f"SELECT host, hist FROM page_h WHERE hour >= ? AND hour < ? AND host IN "
+                            f"({','.join('?' * len(want))})", (h0, h1, *want)):
+                    hists[name(x["host"])].append(x["hist"])
+                for x in sel:
+                    x["p95_ms"] = _pct(_merge(hists[x["host"]]), 0.95)
+
+            if sort == "p95_ms":
+                fill_p95(items)                         # 按 P95 排才需要全部算
+            page = _sort_domains(items, sort, order == "desc")[offset:offset + limit]
+            if sort != "p95_ms":
+                fill_p95(page)
+
+        out = {"window": window, "total": total, "abnormal": n_abnormal, "matched": len(items),
+               "offset": offset, "limit": limit, "sort": sort, "order": order, "group": bool(group),
+               "min_n": min_n, "rows": page}
+        if now == real_now:
+            self._cache[key] = (real_now, out)
         return out
 
     def _vendors(self, q, h0, h1) -> list[dict]:
@@ -456,6 +546,36 @@ def _div(total, n, nd: int = 0):
         return None
     v = total / n
     return round(v, nd) if nd else int(round(v))
+
+
+def _sort_domains(items: list[dict], sort: str, desc: bool) -> list[dict]:
+    """有值且样本足够的按 sort 排；样本不足的接在后面（同样排序）；没有该值的（如没加载成功过、无耗时）最后。
+    同值按访问次数多的在前。按 host / attempts 排时不降级样本不足的。"""
+    items = sorted(items, key=lambda x: -x["attempts"])
+    if sort == "host":
+        return sorted(items, key=lambda x: x["host"], reverse=desc)
+    demote = sort not in ("attempts", "per_min")
+    tiers: list[list[dict]] = [[], [], []]
+    for x in items:
+        tiers[2 if x[sort] is None else 1 if demote and x["few"] else 0].append(x)
+    for t in tiers[:2]:
+        t.sort(key=lambda x: x[sort], reverse=desc)
+    return tiers[0] + tiers[1] + tiers[2]
+
+
+_SECOND_LEVEL = {"ac", "co", "com", "edu", "gov", "net", "org", "or", "ne", "go", "res", "nhs", "sch", "mil"}
+
+
+def site_of(host: str) -> str:
+    """主域名（近似 eTLD+1，不依赖公共后缀表）：onlinelibrary.wiley.com → wiley.com，
+    www.cambridge.org.uk 之类两字母国家后缀前面是 ac/co/com/edu… 时取三段：pubs.rsc.ac.uk → rsc.ac.uk。IP 原样返回。"""
+    h = (host or "").lower().rstrip(".").rsplit(":", 1)[0] if host and host.count(":") <= 1 else (host or "").lower()
+    p = h.split(".")
+    if len(p) <= 2 or all(s.isdigit() for s in p):
+        return h
+    if len(p[-1]) == 2 and p[-2] in _SECOND_LEVEL:
+        return ".".join(p[-3:])
+    return ".".join(p[-2:])
 
 
 def reason_bucket(reason: Optional[str]) -> str:

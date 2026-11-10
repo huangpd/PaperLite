@@ -2,6 +2,8 @@
 面板 HTTP 服务（标准库，无额外依赖）：
   GET /                      大屏页面（每 10s 自动刷新）
   GET /api/summary?window=1d|7d|30d   全部聚合数字（JSON）
+  GET /api/domains?window=&sort=&order=asc|desc&q=&offset=&limit=&abnormal=1&group=1
+                             域名表：服务端搜索/排序/分页（见 MonitorDB.domains）
   GET /health
 鉴权（/health 除外）：配了 password → HTTP Basic（浏览器弹框）；配了 token → ?token=… 或请求头 X-Token。
 两者都配时任一通过即可。都没配则不鉴权（只应在 bind 本机时这样用，cli 会拦）。
@@ -86,6 +88,18 @@ def make_server(cfg: MonitorConfig, db: MonitorDB) -> ThreadingHTTPServer:
                     return self._json(200, db.summary(window, online_s=online_s))
                 except Exception as e:
                     logger.exception("聚合查询失败")
+                    return self._json(500, {"error": str(e)})
+            if u.path == "/api/domains":
+                a = {k: v[0] for k, v in qs.items() if k != "token"}
+                try:
+                    return self._json(200, db.domains(
+                        a.get("window", "1d"), sort=a.get("sort", "attempts"), order=a.get("order", "desc"),
+                        q=a.get("q", "")[:100], offset=int(a.get("offset", 0)), limit=int(a.get("limit", 20)),
+                        abnormal=a.get("abnormal") == "1", group=a.get("group") == "1"))
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                except Exception as e:
+                    logger.exception("域名查询失败")
                     return self._json(500, {"error": str(e)})
             return self._json(404, {"error": "not found"})
 

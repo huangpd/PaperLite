@@ -7,9 +7,10 @@ paperlite/proxy.py
 每个身份一个 IP、用完即弃，所以这里没有槽位、续租和缓存。
 
 提取接口返回 JSON：{"code": "SUCCESS", "data": [{"server": "ip:port", "proxy_ip": "...",
-"area": "...", "deadline": "YYYY-MM-DD HH:MM:SS"（北京时间）}]}（青果格式）。
+"area": "...", "deadline": "YYYY-MM-DD HH:MM:SS"（北京时间）}]}（青果格式），或纯文本 ip:port（见 parse_extract）。
 """
 
+import json
 import logging
 import re
 import threading
@@ -126,10 +127,7 @@ class IpSource:
                 with curl_requests.Session(trust_env=False, verify=certifi.where()) as c:
                     resp = c.get(self.s.api_url, timeout=15)      # 接口本身直连
                 resp.raise_for_status()
-                body = resp.json()
-                item = (body.get("data") or [{}])[0]
-                if body.get("code") != "SUCCESS" or not item.get("server"):
-                    raise RuntimeError(f"接口返回异常: {str(body)[:200]}")
+                item = parse_extract(resp.text)
             except Exception as e:
                 self._last_error_at = time.time()
                 raise ProxyUnavailable(f"代理提取失败: {e}") from e
@@ -202,6 +200,24 @@ class IpSource:
             return ProbeResult(ok=False, error=f"{type(e).__name__}: {str(e).splitlines()[0][:120]}")
         finally:
             c.close()
+
+
+def parse_extract(text: str) -> dict:
+    """提取接口响应 → {"server": "ip:port", "proxy_ip", "area", "deadline"}。
+    支持青果格式 JSON，以及纯文本 ``ip:port``（如巨量 result_type=text，取第一行）。纯文本没有出口 IP 与
+    到期时间：不核对出口 IP，寿命只按 lease_s 算——所以短效 IP 要把 lease_s 设成实际有效期。"""
+    t = (text or "").strip()
+    if t.startswith("{"):
+        body = json.loads(t)
+        data = body.get("data")
+        item = data[0] if isinstance(data, list) and data else {}
+        if body.get("code") != "SUCCESS" or not item.get("server"):
+            raise RuntimeError(f"接口返回异常: {t[:200]}")
+        return item
+    m = re.match(r"(\d{1,3}(?:\.\d{1,3}){3}:\d{2,5})(?:\s|$)", t)
+    if not m:
+        raise RuntimeError(f"接口返回异常: {t[:200]}")
+    return {"server": m.group(1)}
 
 
 def parse_deadline(text: str) -> Optional[float]:

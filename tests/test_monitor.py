@@ -199,6 +199,49 @@ class MonitorDBTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.db.summary("2d")
 
+    def test_domain_table_paging_sort_filter(self):
+        now, evs = self.now, []
+        for i in range(45):                                            # 45 个域名，访问次数 i+1 递增
+            evs += [page(now - 60, host=f"d{i:02d}.org") for _ in range(i + 1)]
+        evs += [page(now - 60, host="bad.org", ok=False, passed=False) for _ in range(30)]   # 样本够、全失败 → 异常
+        evs += [page(now - 60, host="tiny.org", ok=False, passed=False) for _ in range(2)]   # 样本不足：不算异常
+        self.db.ingest(evs)
+        d = self.db.domains("1d", now=now, limit=20)
+        self.assertEqual((d["total"], d["matched"], len(d["rows"])), (47, 47, 20))
+        self.assertEqual(d["rows"][0]["host"], "d44.org")                # 默认按访问次数降序
+        self.assertIsNotNone(d["rows"][0]["p95_ms"])                     # P95 只给当前页算，但当前页有
+        self.assertEqual(len(self.db.domains("1d", now=now, offset=40, limit=20)["rows"]), 7)
+        self.assertEqual(d["abnormal"], 1)
+        worst = self.db.domains("1d", sort="success_rate", order="asc", now=now)["rows"]
+        self.assertEqual(worst[0]["host"], "bad.org")
+        full = [x["host"] for x in self.db.domains("1d", sort="success_rate", order="asc", now=now, limit=200)["rows"]]
+        self.assertGreater(full.index("tiny.org"), full.index("d19.org"))   # 样本不足的 0% 排在所有样本足够的后面
+        self.assertEqual([x["host"] for x in self.db.domains("1d", abnormal=True, now=now)["rows"]], ["bad.org"])
+        s = self.db.domains("1d", q="D0", now=now)
+        self.assertEqual((s["matched"], s["total"], s["abnormal"]), (10, 47, 1))     # 搜索不分大小写；总数不受搜索影响
+        p95 = self.db.domains("1d", sort="p95_ms", now=now)["rows"]
+        self.assertTrue(all(x["p95_ms"] is not None for x in p95[:5]))
+        for bad in ({"sort": "evil"}, {"order": "up"}):
+            with self.assertRaises(ValueError):
+                self.db.domains("1d", now=now, **bad)
+
+    def test_domain_group_by_site(self):
+        from paperlite.monitor.db import site_of
+        self.assertEqual(site_of("onlinelibrary.wiley.com"), "wiley.com")
+        self.assertEqual(site_of("pubs.rsc.ac.uk"), "rsc.ac.uk")
+        self.assertEqual(site_of("www.cnki.com.cn"), "cnki.com.cn")
+        self.assertEqual(site_of("a.org"), "a.org")
+        self.assertEqual(site_of("10.0.0.1"), "10.0.0.1")
+        now = self.now
+        self.db.ingest([page(now, host="onlinelibrary.wiley.com"), page(now, host="www.wiley.com"),
+                        page(now, host="link.springer.com")])
+        g = self.db.domains("1d", group=True, now=now)
+        rows = {x["host"]: x for x in g["rows"]}
+        self.assertEqual((g["total"], rows["wiley.com"]["attempts"]), (2, 2))
+        self.assertEqual(rows["wiley.com"]["hosts"], ["onlinelibrary.wiley.com", "www.wiley.com"])
+        self.assertIsNotNone(rows["wiley.com"]["p95_ms"])
+        self.assertEqual(self.db.domains("1d", group=True, q="onlinelibrary", now=now)["matched"], 1)   # 搜子域也能命中
+
     def test_demo_data_renders_all_sections(self):
         from paperlite.monitor.cli import demo_messages
         self.db.ingest(demo_messages(self.now, days=3))
@@ -228,6 +271,15 @@ class DashboardHttpTest(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as e:
                     get("/api/summary?window=9d&token=s3")
                 self.assertEqual(e.exception.code, 400)
+                dm = json.load(get("/api/domains?window=1d&sort=success_rate&order=asc&q=a.&group=1&token=s3"))
+                self.assertEqual((dm["total"], dm["rows"][0]["host"]), (1, "a.org"))
+                for bad in ("sort=evil", "offset=x", "order=up"):
+                    with self.assertRaises(urllib.error.HTTPError) as e:
+                        get(f"/api/domains?{bad}&token=s3")
+                    self.assertEqual(e.exception.code, 400)
+                with self.assertRaises(urllib.error.HTTPError) as e:
+                    get("/api/domains")
+                self.assertEqual(e.exception.code, 401)
             finally:
                 srv.shutdown()
                 srv.server_close()
@@ -315,6 +367,15 @@ class IpTlsTest(unittest.TestCase):
         self.assertTrue(ctx.check_hostname)
         self.assertEqual((p.host, p.port, p.virtual_host), ("127.0.0.1", 5671, "paperlite"))
         self.assertIsNone(MonitorConfig(amqp_url="amqp://u:p@h/").amqp_params().ssl_options)
+
+    def test_amqp_verify_off(self):
+        import ssl
+        ctx = MonitorConfig.from_dict({"amqp_url": "amqps://u:p@1.2.3.4:5671/paperlite",
+                                       "amqp_verify": False}).amqp_params().ssl_options.context
+        self.assertFalse(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)                          # 仍走 TLS，只是不校验
+        with self.assertRaises(ValueError):                                       # 与 amqp_ca_file 互斥
+            MonitorConfig.from_dict({"amqp_url": "amqps://h/", "amqp_verify": False, "amqp_ca_file": "ca.pem"})
 
     def test_cert_has_ip_san_and_ca_is_reused(self):
         import subprocess

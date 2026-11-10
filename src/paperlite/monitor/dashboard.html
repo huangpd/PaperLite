@@ -4,209 +4,282 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PaperLite 监控</title>
+<link rel="icon" href="data:,">
 <style>
+/*
+  设计规范（改样式先看这里）
+  - 栅格：内容区统一 12 列、列间距 = 行间距 = var(--gap) 16px。所有双栏行都是 8 | 4，
+    6 张 KPI 各占 2 列、3 张 WAF 各占 4 列——每一行的竖向边线都落在同一组列线上。
+  - 间距：只用 4 的倍数（4/8/12/16/20/24）。卡片内边距 20，卡片标题区固定 24px 高 + 16px 下间距。
+  - 同一行卡片等高；表格/列表类卡片在 ≥1200px 时固定行高、内容区内部滚动，不把整行撑高。
+  - 字号阶梯：12（注释/轴）· 13（表格/次要）· 14（正文）· 15（卡片标题）· 22（次级数字）· 28（KPI 数字）。
+  - 侧栏顶部品牌区与右侧顶栏同为 64px 高，侧栏 5 个导航项与右侧 5 个区块一一对应、顺序一致。
+*/
 :root {
   color-scheme: light;
   --page: #f3f5f9; --card: #ffffff; --card-2: #f6f8fb; --line: #e4e8ef; --grid: #edf0f4; --axis: #c9cfd9;
-  --ink: #111827; --ink-2: #4b5563; --muted: #8a93a3;
+  --ink: #111827; --ink-2: #4b5563; --muted: #6b7484;
   --side: #1b2540; --side-2: #243052; --side-ink: #c7cee0; --side-active: #2a78d6;
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
   --good: #0ca30c; --warn: #fab219; --serious: #ec835a; --crit: #d03b3b; --good-ink: #006300;
   --cf: #eb6834; --aws: #eda100; --dd: #6250d6;
-  --tile-blue: #e8f1fd; --tile-green: #e5f6ef; --tile-violet: #efecfc; --tile-orange: #fdefe8; --tile-aqua: #e3f5f4;
+  --tile-blue: #e8f1fd; --tile-green: #e5f6ef; --tile-violet: #efecfc; --tile-orange: #fdefe8; --tile-aqua: #e3f5f4; --tile-amber: #fdf3dc;
   --shadow: 0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.06);
+  --gap: 16px; --pad: 20px; --radius: 12px; --bar-h: 64px; --band-h: 420px;
 }
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) {
     color-scheme: dark;
     --page: #0f1420; --card: #171d2b; --card-2: #1d2434; --line: #283044; --grid: #222a3b; --axis: #39425a;
-    --ink: #eef1f6; --ink-2: #c3c9d6; --muted: #8a93a8;
+    --ink: #eef1f6; --ink-2: #c3c9d6; --muted: #8f98ad;
     --side: #0b1020; --side-2: #161d33;
-    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --good-ink: #0ca30c;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --good-ink: #2fbf2f;
     --cf: #d95926; --aws: #c98500; --dd: #9085e9;
-    --tile-blue: #1b2b45; --tile-green: #16332a; --tile-violet: #262445; --tile-orange: #3a2419; --tile-aqua: #153232;
+    --tile-blue: #1b2b45; --tile-green: #16332a; --tile-violet: #262445; --tile-orange: #3a2419; --tile-aqua: #153232; --tile-amber: #3a2f14;
     --shadow: none;
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
   --page: #0f1420; --card: #171d2b; --card-2: #1d2434; --line: #283044; --grid: #222a3b; --axis: #39425a;
-  --ink: #eef1f6; --ink-2: #c3c9d6; --muted: #8a93a8;
+  --ink: #eef1f6; --ink-2: #c3c9d6; --muted: #8f98ad;
   --side: #0b1020; --side-2: #161d33;
-  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --good-ink: #0ca30c;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --good-ink: #2fbf2f;
   --cf: #d95926; --aws: #c98500; --dd: #9085e9;
-  --tile-blue: #1b2b45; --tile-green: #16332a; --tile-violet: #262445; --tile-orange: #3a2419; --tile-aqua: #153232;
+  --tile-blue: #1b2b45; --tile-green: #16332a; --tile-violet: #262445; --tile-orange: #3a2419; --tile-aqua: #153232; --tile-amber: #3a2f14;
   --shadow: none;
 }
 * { box-sizing: border-box; }
-html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+html { scroll-behavior: smooth; scroll-padding-top: calc(var(--bar-h) + 8px); }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
 body { margin: 0; background: var(--page); color: var(--ink);
-  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
 svg { display: block; }
+:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; border-radius: 6px; }
 .ico { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex: none; }
 .num, .tab { font-variant-numeric: tabular-nums; }
 
-/* 布局 */
-.shell { display: grid; grid-template-columns: 216px 1fr; min-height: 100vh; background: linear-gradient(to right, var(--side) 216px, transparent 216px); }
-aside { background: var(--side); color: var(--side-ink); position: sticky; top: 0; height: 100vh; padding: 18px 12px; display: flex; flex-direction: column; gap: 4px; }
-.brand { display: flex; gap: 10px; align-items: center; color: #fff; font-weight: 600; font-size: 15px; line-height: 1.2; padding: 4px 10px 22px; }
+/* ── 外框：侧栏 + 主区 ── */
+.shell { display: grid; grid-template-columns: 216px minmax(0, 1fr); min-height: 100vh;
+  background: linear-gradient(to right, var(--side) 216px, transparent 216px); }
+aside { background: var(--side); color: var(--side-ink); position: sticky; top: 0; height: 100vh; padding: 0 12px 16px;
+  display: flex; flex-direction: column; gap: 4px; }
+.brand { height: var(--bar-h); display: flex; gap: 12px; align-items: center; color: #fff; font-weight: 600; font-size: 14px;
+  line-height: 1.25; padding: 0 12px; margin-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,.07); }
 .brand .logo { display: flex; gap: 3px; align-items: flex-end; height: 22px; }
 .brand .logo i { width: 5px; border-radius: 2px; background: var(--side-active); }
-nav a { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border-radius: 8px; color: var(--side-ink); text-decoration: none; font-size: 14px; }
+.brand small { display: block; font-weight: 400; font-size: 12px; color: #8d97b3; }
+nav { display: grid; gap: 4px; }
+nav a { display: flex; gap: 12px; align-items: center; height: 40px; padding: 0 12px; border-radius: 8px; color: var(--side-ink);
+  text-decoration: none; font-size: 14px; transition: background .15s, color .15s; }
 nav a:hover { background: var(--side-2); color: #fff; }
 nav a.on { background: var(--side-active); color: #fff; }
-aside .foot { margin-top: auto; padding: 10px 12px; font-size: 12px; color: #7f8aa5; }
+aside .foot { margin-top: auto; padding: 8px 12px; font-size: 12px; color: #8d97b3; }
 main { min-width: 0; }
-header { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
-  padding: 14px 24px; background: color-mix(in srgb, var(--page) 88%, transparent); backdrop-filter: blur(8px); }
+header { position: sticky; top: 0; z-index: 5; height: var(--bar-h); display: flex; align-items: center; gap: 16px;
+  padding: 0 24px; background: color-mix(in srgb, var(--page) 88%, transparent); backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--line); }
 .state { display: flex; align-items: center; gap: 8px; font-weight: 500; }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; flex: none; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; flex: none; }
 .dot.on { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); }
 .sep { width: 1px; height: 16px; background: var(--line); }
 .updated { color: var(--ink-2); font-size: 13px; }
-.tools { margin-left: auto; display: flex; gap: 10px; align-items: center; }
-.seg { display: inline-flex; background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 3px; box-shadow: var(--shadow); }
-.seg button { border: 0; background: transparent; color: var(--ink-2); font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 6px; cursor: pointer; }
+.tools { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.seg { display: inline-flex; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 3px; box-shadow: var(--shadow); }
+.seg button { border: 0; background: transparent; color: var(--ink-2); font: inherit; font-size: 13px; height: 30px; padding: 0 14px;
+  border-radius: 6px; cursor: pointer; transition: background .15s, color .15s; }
+.seg button:hover:not(.on) { background: var(--card-2); color: var(--ink); }
 .seg button.on { background: var(--s1); color: #fff; }
-.iconbtn { border: 1px solid var(--line); background: var(--card); color: var(--ink-2); border-radius: 9px; width: 36px; height: 36px; display: grid; place-items: center; cursor: pointer; box-shadow: var(--shadow); }
-.content { padding: 4px 24px 40px; display: grid; gap: 16px; max-width: 1640px; }
-.row { display: grid; gap: 16px; }
-.r-kpi { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-.r-2a { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); align-items: start; }
-.r-2b { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
-@media (max-width: 1380px) { .r-kpi { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 1100px) { .r-2a, .r-2b { grid-template-columns: minmax(0, 1fr); } }
-@media (max-width: 860px) {
-  .shell { grid-template-columns: 1fr; background: none; }
-  aside { position: sticky; top: 0; z-index: 6; height: auto; flex-direction: row; align-items: center; padding: 8px 12px; overflow-x: auto; }
-  .brand { padding: 0 8px 0 0; font-size: 13px; } .brand span { display: none; }
-  nav { display: flex; gap: 2px; } nav a { padding: 7px 10px; white-space: nowrap; font-size: 13px; } nav a .ico { display: none; }
-  aside .foot { display: none; }
-  header { position: static; padding: 12px 16px; } .tools { margin-left: 0; width: 100%; justify-content: space-between; }
-  .content { padding: 4px 16px 32px; }
-  .card > h2 .hint { margin-left: 0; flex-basis: 100%; white-space: normal; }
-  .r-kpi { grid-template-columns: minmax(0, 1fr); }
-  html { scroll-padding-top: 60px; }
-}
+.iconbtn { border: 1px solid var(--line); background: var(--card); color: var(--ink-2); border-radius: 8px; width: 38px; height: 38px;
+  display: grid; place-items: center; cursor: pointer; box-shadow: var(--shadow); }
+.iconbtn:hover { color: var(--ink); }
 
-/* 卡片 */
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; box-shadow: var(--shadow); min-width: 0; }
-.card > h2 { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; white-space: nowrap; margin: 0 0 14px; font-size: 16px; font-weight: 600; }
-.card > h2 .ico { color: var(--s1); width: 20px; height: 20px; }
-.card > h2 .hint { margin-left: auto; font-size: 12px; font-weight: 400; color: var(--muted); }
-.kpi { display: flex; gap: 16px; align-items: flex-start; }
-.tile { width: 52px; height: 52px; border-radius: 12px; display: grid; place-items: center; flex: none; }
-.tile .ico { width: 26px; height: 26px; }
+/* ── 12 列栅格 ── */
+.content { padding: 24px; display: grid; gap: calc(var(--gap) * 1.5); max-width: 1680px; }
+.band { display: grid; gap: var(--gap); }
+.grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: var(--gap); align-items: stretch; }
+.c2 { grid-column: span 2; } .c4 { grid-column: span 4; } .c8 { grid-column: span 8; } .c12 { grid-column: span 12; }
+.fixed { height: var(--band-h); }
+@media (max-width: 1440px) { .grid > .c2 { grid-column: span 4; } }
+@media (max-width: 1200px) { .grid > .c8, .grid > .c4.wide { grid-column: span 12; } .fixed { height: auto; }
+  .fixed .card-b.scroll { max-height: 420px; } }
+@media (max-width: 900px) { .grid > .c4 { grid-column: span 12; } .grid > .c2 { grid-column: span 6; } }
+@media (max-width: 860px) {
+  :root { --bar-h: 56px; }
+  .shell { grid-template-columns: minmax(0, 1fr); background: none; }
+  aside { position: sticky; top: 0; z-index: 6; height: auto; flex-direction: row; align-items: center; padding: 8px 12px; overflow-x: auto; }
+  .brand { height: auto; padding: 0 8px 0 0; margin: 0; border: 0; } .brand span { display: none; }
+  nav { display: flex; gap: 4px; } nav a { height: 34px; padding: 0 10px; white-space: nowrap; font-size: 13px; } nav a .ico { display: none; }
+  aside .foot { display: none; }
+  header { position: static; height: auto; flex-wrap: wrap; padding: 12px 16px; gap: 8px 12px; }
+  .tools { margin-left: 0; width: 100%; justify-content: space-between; }
+  .content { padding: 16px; }
+  .card-h .hint { margin-left: 0; flex-basis: 100%; white-space: normal; }
+}
+@media (max-width: 520px) { .grid > .c2 { grid-column: span 12; } }
+
+/* ── 卡片：统一头部 / 主体 ── */
+.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: var(--pad);
+  box-shadow: var(--shadow); min-width: 0; display: flex; flex-direction: column; }
+.card-h { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-height: 24px; margin: 0 0 16px; }
+.card-h h2 { margin: 0; font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.card-h h2 .ico { color: var(--s1); }
+.card-h .hint { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.card-b { flex: 1; min-height: 0; min-width: 0; }
+.card-b.scroll { overflow: auto; margin: 0 calc(var(--pad) * -1) calc(var(--pad) * -1); padding: 0 var(--pad) var(--pad); }
+.card-b.center { display: flex; flex-direction: column; justify-content: center; }
+
+/* KPI：6 张同构卡片（图标+标签 / 数值 / 附注） */
+.kpi { gap: 12px; padding: 16px var(--pad); }
+.kpi .top { display: flex; align-items: center; gap: 12px; }
+.tile { width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; flex: none; }
 .t-green { background: var(--tile-green); color: var(--good-ink); } .t-blue { background: var(--tile-blue); color: var(--s1); }
 .t-violet { background: var(--tile-violet); color: var(--dd); } .t-orange { background: var(--tile-orange); color: var(--s2); }
-.t-aqua { background: var(--tile-aqua); color: var(--s3); }
-.kpi .label { color: var(--ink-2); font-size: 13px; }
-.kpi .value { font-size: 30px; font-weight: 650; letter-spacing: -.5px; line-height: 1.15; margin: 4px 0 6px; }
+.t-aqua { background: var(--tile-aqua); color: var(--s3); } .t-amber { background: var(--tile-amber); color: var(--aws); }
+.kpi .label { color: var(--ink-2); font-size: 13px; line-height: 1.3; }
+.kpi .value { font-size: 28px; font-weight: 650; letter-spacing: -.5px; line-height: 1.1; white-space: nowrap; }
 .kpi .value small { font-size: 14px; font-weight: 500; color: var(--muted); letter-spacing: 0; }
-.kpi .meta { font-size: 13px; color: var(--ink-2); display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.kpi .meta { font-size: 12px; color: var(--ink-2); display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: auto; min-height: 18px; }
 .kpi .meta b { color: var(--ink); font-weight: 600; }
 .delta { font-size: 12px; font-weight: 600; white-space: nowrap; }
 .delta.up { color: var(--good-ink); } .delta.down { color: var(--crit); } .delta.flat { color: var(--muted); }
 
 /* 趋势小图 */
-.multiples { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.multiples { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; }
 @media (max-width: 700px) { .multiples { grid-template-columns: minmax(0, 1fr); } }
-.mini h3 { margin: 0 0 2px; font-size: 13px; font-weight: 500; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
-.mini h3 i { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
-.mini .now { font-size: 20px; font-weight: 650; margin-bottom: 4px; }
+.mini h3 { margin: 0; font-size: 13px; font-weight: 500; color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
+.mini h3 i { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+.mini .now { font-size: 22px; font-weight: 650; line-height: 1.3; margin: 4px 0 8px; }
 .chart { position: relative; width: 100%; }
 .chart svg { width: 100%; overflow: visible; }
 
 /* 表格 */
-.scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { text-align: left; font-weight: 500; color: var(--ink-2); background: var(--card-2); padding: 9px 10px; white-space: nowrap; }
+th { text-align: left; font-weight: 500; color: var(--ink-2); background: var(--card-2); height: 36px; padding: 0 12px; white-space: nowrap;
+  position: sticky; top: 0; z-index: 1; }
 th:first-child { border-radius: 8px 0 0 8px; } th:last-child { border-radius: 0 8px 8px 0; }
-td { padding: 9px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+td { height: 40px; padding: 0 12px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+tbody tr:hover td { background: color-mix(in srgb, var(--card-2) 70%, transparent); }
 tr:last-child td { border-bottom: 0; }
 td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; }
+@media (max-width: 1440px) { th, td { padding: 0 8px; } .rate .meter { display: none; } td.host { max-width: 180px; } }
 td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
 .rate { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
-.meter { width: 52px; height: 6px; border-radius: 3px; background: var(--grid); overflow: hidden; }
+.meter { width: 48px; height: 6px; border-radius: 3px; background: var(--grid); overflow: hidden; }
 .meter i { display: block; height: 100%; border-radius: 3px; }
-.sdot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
-.waf-tag { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); }
+.sdot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.waf-tag { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-2); }
 .waf-tag i { width: 8px; height: 8px; border-radius: 2px; }
+
+/* 域名表工具条 / 排序 / 分页 */
+.card-b.scroll.mid { margin-bottom: 0; padding-bottom: 0; }
+.dtools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 12px; }
+.search { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px; flex: 0 1 240px; min-width: 140px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--muted); }
+.search .ico { width: 16px; height: 16px; }
+.search:focus-within { border-color: var(--s1); }
+.search input { border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 13px; width: 100%; min-width: 0; }
+.chip { height: 32px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--ink-2);
+  font: inherit; font-size: 13px; cursor: pointer; display: inline-flex; gap: 6px; align-items: center; transition: background .15s, color .15s, border-color .15s; }
+.chip:hover { color: var(--ink); }
+.chip b { font-variant-numeric: tabular-nums; }
+.chip[aria-pressed="true"] { background: var(--tile-blue); border-color: var(--s1); color: var(--s1); }
+.chip.crit[aria-pressed="true"] { background: color-mix(in srgb, var(--crit) 12%, var(--card)); border-color: var(--crit); color: var(--crit); }
+.pager { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.pager span { margin-right: auto; font-variant-numeric: tabular-nums; }
+.pager button { height: 28px; padding: 0 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--ink-2);
+  font: inherit; font-size: 12px; cursor: pointer; }
+.pager button:disabled { opacity: .45; cursor: default; }
+.th-btn { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
+.th-btn:hover { color: var(--ink); }
+.th-btn .arr { font-size: 10px; color: var(--s1); min-width: 8px; }
+th[aria-sort="none"] .arr { color: transparent; }
+tr.few td { color: var(--muted); } tr.few td.host { font-weight: 400; }
+td.host .sdot { margin-right: 6px; vertical-align: 1px; }
 
 /* 厂商矩阵 */
 .matrix td, .matrix th { text-align: center; }
-.matrix td:first-child, .matrix th:first-child { text-align: left; font-weight: 500; }
-.matrix td.cell { padding: 7px 10px; }
+.matrix td:first-child, .matrix th:first-child { text-align: left; font-weight: 500; position: sticky; left: 0; background: var(--card); }
+.matrix th:first-child { background: var(--card-2); z-index: 2; }
+.matrix td.cell { height: 56px; padding: 0 12px; }
 .matrix .cell b { display: block; font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .matrix .cell span { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.matrix .cell .bar { height: 3px; border-radius: 2px; margin: 5px auto 0; width: 48px; background: var(--grid); overflow: hidden; }
+.matrix .cell .bar { height: 3px; border-radius: 2px; margin: 4px auto 0; width: 48px; background: var(--grid); overflow: hidden; }
 .matrix .cell .bar i { display: block; height: 100%; }
-.vsub { font-size: 12px; color: var(--muted); font-weight: 400; display: block; }
+.matrix tr.total td { border-top: 1px solid var(--line); }
+.vsub { font-size: 12px; color: var(--muted); font-weight: 400; }
 
-/* WAF */
-.wafs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-@media (max-width: 760px) { .wafs { grid-template-columns: minmax(0, 1fr); } }
-.waf { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; position: relative; overflow: hidden; }
+/* 横向排行条（域名访问频率） */
+.rank { display: grid; gap: 12px; }
+.rank .it { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; font-size: 13px; }
+.rank .it .h { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rank .it .v { font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.rank .it .v b { color: var(--ink); }
+.rank .it .track { grid-column: 1 / -1; height: 6px; border-radius: 3px; background: var(--grid); overflow: hidden; }
+.rank .it .track i { display: block; height: 100%; border-radius: 3px; background: var(--s1); }
+
+/* WAF 卡（每张占 4 列，与上面 8|4 的列线对齐） */
+.waf { position: relative; overflow: hidden; }
 .waf::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--c); }
-.waf .name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
-.waf .big { font-size: 26px; font-weight: 650; margin: 6px 0 4px; }
-.waf .big small { font-size: 13px; font-weight: 400; color: var(--muted); }
-.waf .facts { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); }
-.waf .facts b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.waf .big { font-size: 28px; font-weight: 650; line-height: 1.1; }
+.waf .big small { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+.waf .track { height: 6px; border-radius: 3px; background: var(--grid); overflow: hidden; margin: 12px 0 16px; }
+.waf .track i { display: block; height: 100%; border-radius: 3px; }
+.facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.facts div { background: var(--card-2); border-radius: 8px; padding: 8px 12px; min-width: 0; }
+.facts span { display: block; font-size: 12px; color: var(--muted); }
+.facts b { display: block; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+@media (max-width: 1440px) and (min-width: 901px) { .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
 /* 环形图 */
-.donut-wrap { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
 .donut { position: relative; flex: none; }
 .donut .center { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; pointer-events: none; }
-.donut .center b { font-size: 24px; font-weight: 650; }
+.donut .center b { font-size: 22px; font-weight: 650; line-height: 1.2; }
 .donut .center span { font-size: 12px; color: var(--muted); }
-.legend { display: grid; gap: 12px; min-width: 180px; flex: 1; }
-.legend div { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.legend { display: grid; gap: 8px; width: 100%; }
+.legend div { display: flex; align-items: center; gap: 8px; font-size: 13px; height: 28px; }
 .legend div i { width: 10px; height: 10px; border-radius: 50%; flex: none; }
-.legend div b { margin-left: auto; font-variant-numeric: tabular-nums; }
-.legend div span.n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 56px; text-align: right; }
+.legend div b { margin-left: auto; font-variant-numeric: tabular-nums; min-width: 48px; text-align: right; }
+.legend div span.n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.outbox { display: flex; flex-direction: column; align-items: center; gap: 16px; }
 
-/* IP */
-.ipgrid { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 20px 28px; align-items: center; }
-@media (max-width: 640px) { .ipgrid { grid-template-columns: minmax(0, 1fr); } }
-.ipfacts { display: grid; grid-template-columns: auto auto; gap: 8px 22px; font-size: 14px; color: var(--ink-2); }
-.ipfacts b { color: var(--ink); font-size: 18px; font-variant-numeric: tabular-nums; }
-.subhead { font-size: 13px; color: var(--ink-2); margin: 0 0 6px; }
-.reasons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
-.reasons span { font-size: 12px; background: var(--card-2); border: 1px solid var(--line); padding: 3px 9px; border-radius: 12px; color: var(--ink-2); }
-.reasons b { color: var(--ink); font-variant-numeric: tabular-nums; }
+/* IP 卡 */
+.iphead { display: flex; align-items: center; gap: 20px; }
+.ipfacts { display: grid; grid-template-columns: auto auto; gap: 8px 16px; font-size: 13px; color: var(--ink-2); align-items: baseline; }
+.ipfacts b { color: var(--ink); font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.subhead { font-size: 12px; color: var(--muted); margin: 16px 0 8px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.chips span { font-size: 12px; background: var(--card-2); border: 1px solid var(--line); height: 24px; display: inline-flex; align-items: center;
+  padding: 0 8px; border-radius: 12px; color: var(--ink-2); }
+.chips b { color: var(--ink); font-variant-numeric: tabular-nums; margin-left: 4px; }
 
-/* 实时 */
-.freq { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
-.freq span { font-size: 12px; background: var(--card-2); border: 1px solid var(--line); padding: 3px 10px; border-radius: 12px; }
-.freq b { font-variant-numeric: tabular-nums; }
-.feed { max-height: 360px; overflow-y: auto; }
-.ev { display: grid; grid-template-columns: 10px 64px 54px minmax(0, 1fr); gap: 10px; align-items: center; padding: 6px 0; font-size: 13px; border-bottom: 1px solid var(--grid); }
+/* 实时事件 */
+.ev { display: grid; grid-template-columns: 8px 64px 48px minmax(0, 1fr); gap: 8px; align-items: center; height: 36px; font-size: 13px;
+  border-bottom: 1px solid var(--grid); }
 .ev:last-child { border-bottom: 0; }
 .ev .t { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
 .ev .k { color: var(--muted); font-size: 12px; }
 .ev .m { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.empty { color: var(--muted); padding: 18px 0; text-align: center; font-size: 13px; }
-.err { background: color-mix(in srgb, var(--crit) 10%, var(--card)); border: 1px solid var(--crit); padding: 10px 14px; border-radius: 10px; display: none; }
+.empty { color: var(--muted); padding: 24px 0; text-align: center; font-size: 13px; }
+td.empty { white-space: normal; }
+.err { background: color-mix(in srgb, var(--crit) 10%, var(--card)); border: 1px solid var(--crit); padding: 12px 16px; border-radius: var(--radius); display: none; }
 
 /* 悬浮提示 */
 #tip { position: fixed; z-index: 50; pointer-events: none; background: var(--ink); color: var(--card); font-size: 12px; line-height: 1.5;
-  padding: 7px 10px; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); opacity: 0; transition: opacity .08s; max-width: 280px; }
+  padding: 8px 10px; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); opacity: 0; transition: opacity .08s; max-width: 280px; }
 #tip b { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
 <div class="shell">
   <aside>
-    <div class="brand"><div class="logo"><i style="height:10px"></i><i style="height:22px"></i><i style="height:15px"></i></div><span>PaperLite<br>Crawler Monitor</span></div>
-    <nav id="nav">
+    <div class="brand"><div class="logo"><i style="height:10px"></i><i style="height:22px"></i><i style="height:15px"></i></div><span>PaperLite<small>Crawler Monitor</small></span></div>
+    <nav id="nav" aria-label="区块导航">
       <a href="#overview" class="on"><svg class="ico" viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>总览</a>
-      <a href="#ip"><svg class="ico" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>IP 质检</a>
-      <a href="#browsers"><svg class="ico" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg>浏览器监控</a>
       <a href="#domains"><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>域名分析</a>
-      <a href="#vendors"><svg class="ico" viewBox="0 0 24 24"><circle cx="7" cy="8" r="3"/><circle cx="17" cy="8" r="3"/><path d="M2 20c0-3 2.2-5 5-5s5 2 5 5M12 20c0-3 2.2-5 5-5s5 2 5 5"/></svg>厂商分析</a>
+      <a href="#proxy"><svg class="ico" viewBox="0 0 24 24"><circle cx="7" cy="8" r="3"/><circle cx="17" cy="8" r="3"/><path d="M2 20c0-3 2.2-5 5-5s5 2 5 5M12 20c0-3 2.2-5 5-5s5 2 5 5"/></svg>代理与 IP</a>
       <a href="#waf"><svg class="ico" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8 8 9 4.6-1 8-4.5 8-9V6z"/><path d="M12 8v5M12 16h.01"/></svg>WAF 过盾</a>
-      <a href="#live"><svg class="ico" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>实时日志</a>
+      <a href="#live"><svg class="ico" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>终端与事件</a>
     </nav>
     <div class="foot" id="foot">PaperLite monitor</div>
   </aside>
@@ -217,62 +290,79 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
       <span class="sep"></span>
       <span class="updated" id="updated">更新时间：–</span>
       <div class="tools">
-        <div class="seg" id="win"><button data-w="1d">24 小时</button><button data-w="7d">7 天</button><button data-w="30d">30 天</button></div>
-        <button class="iconbtn" id="theme" title="切换深色 / 浅色"><svg class="ico" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg></button>
+        <div class="seg" id="win" role="group" aria-label="时间窗"><button data-w="1d">24 小时</button><button data-w="7d">7 天</button><button data-w="30d">30 天</button></div>
+        <button class="iconbtn" id="theme" title="切换深色 / 浅色" aria-label="切换深色 / 浅色"><svg class="ico" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg></button>
       </div>
     </header>
 
     <div class="content">
-      <div class="err" id="err"></div>
+      <div class="err" id="err" role="alert"></div>
 
-      <section class="row r-kpi" id="overview">
-        <div class="card kpi"><div class="tile t-green"><svg class="ico" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></div>
-          <div><div class="label" id="k-ip-label">IP 质检数</div><div class="value num" id="k-ip">–</div><div class="meta"><span>通过率 <b id="k-ip-rate">–</b></span><span id="k-ip-d"></span></div></div></div>
-        <div class="card kpi"><div class="tile t-blue"><svg class="ico" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01M8 14h3M8 17h6"/></svg></div>
-          <div><div class="label">当前在线浏览器</div><div class="value num" id="k-br">–</div><div class="meta"><span>启动成功率 <b id="k-br-rate">–</b></span><span>异常 <b id="k-br-exc">–</b></span></div></div></div>
-        <div class="card kpi"><div class="tile t-violet"><svg class="ico" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></svg></div>
-          <div><div class="label" id="k-pg-label">HTML 成功数</div><div class="value num" id="k-pg">–</div><div class="meta"><span>成功率 <b id="k-pg-rate">–</b></span><span id="k-pg-d"></span></div></div></div>
-        <div class="card kpi"><div class="tile t-orange"><svg class="ico" viewBox="0 0 24 24"><path d="M4 14a1 1 0 0 1-.8-1.6l9.9-10.2a.5.5 0 0 1 .9.5l-1.9 6A1 1 0 0 0 13 10h7a1 1 0 0 1 .8 1.6l-9.9 10.2a.5.5 0 0 1-.9-.5l1.9-6A1 1 0 0 0 11 14z"/></svg></div>
-          <div><div class="label">页面平均耗时</div><div class="value num" id="k-ms">–</div><div class="meta"><span>P95 <b id="k-p95">–</b></span><span id="k-ms-d"></span></div></div></div>
-        <div class="card kpi"><div class="tile t-aqua"><svg class="ico" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg></div>
-          <div><div class="label">实时任务（待下载）</div><div class="value num" id="k-pend">–</div><div class="meta"><span>进行中 <b id="k-run">–</b></span><span>在线终端 <b id="k-inst">–</b></span></div></div></div>
+      <!-- 1 总览：6 张 KPI（各 2 列） + 趋势 8 | 结果分布 4 -->
+      <section class="band" id="overview">
+        <div class="grid">
+          <div class="card kpi c2"><div class="top"><div class="tile t-green"><svg class="ico" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></div><div class="label">IP 质检数</div></div>
+            <div class="value num" id="k-ip">–</div><div class="meta"><span>通过率 <b id="k-ip-rate">–</b></span><span id="k-ip-d"></span></div></div>
+          <div class="card kpi c2"><div class="top"><div class="tile t-blue"><svg class="ico" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01M8 14h3M8 17h6"/></svg></div><div class="label">在线浏览器</div></div>
+            <div class="value num" id="k-br">–</div><div class="meta"><span>启动成功 <b id="k-br-rate">–</b></span><span>异常 <b id="k-br-exc">–</b></span></div></div>
+          <div class="card kpi c2"><div class="top"><div class="tile t-violet"><svg class="ico" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></svg></div><div class="label">HTML 成功数</div></div>
+            <div class="value num" id="k-pg">–</div><div class="meta"><span>成功率 <b id="k-pg-rate">–</b></span><span id="k-pg-d"></span></div></div>
+          <div class="card kpi c2"><div class="top"><div class="tile t-amber"><svg class="ico" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8 8 9 4.6-1 8-4.5 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg></div><div class="label">过盾率</div></div>
+            <div class="value num" id="k-pass">–</div><div class="meta"><span>未过盾 <b id="k-np">–</b></span><span id="k-pass-d"></span></div></div>
+          <div class="card kpi c2"><div class="top"><div class="tile t-orange"><svg class="ico" viewBox="0 0 24 24"><path d="M4 14a1 1 0 0 1-.8-1.6l9.9-10.2a.5.5 0 0 1 .9.5l-1.9 6A1 1 0 0 0 13 10h7a1 1 0 0 1 .8 1.6l-9.9 10.2a.5.5 0 0 1-.9-.5l1.9-6A1 1 0 0 0 11 14z"/></svg></div><div class="label">页面平均耗时</div></div>
+            <div class="value num" id="k-ms">–</div><div class="meta"><span>P95 <b id="k-p95">–</b></span><span id="k-ms-d"></span></div></div>
+          <div class="card kpi c2"><div class="top"><div class="tile t-aqua"><svg class="ico" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg></div><div class="label">待下载任务</div></div>
+            <div class="value num" id="k-pend">–</div><div class="meta"><span>进行中 <b id="k-run">–</b></span><span>终端 <b id="k-inst">–</b></span></div></div>
+        </div>
+        <div class="grid">
+          <div class="card c8"><div class="card-h"><h2><svg class="ico" viewBox="0 0 24 24"><path d="m3 17 6-6 4 4 8-8M14 7h7v7"/></svg>核心指标趋势</h2><span class="hint" id="trend-hint"></span></div>
+            <div class="card-b multiples">
+              <div class="mini"><h3><i style="background:var(--s1)"></i>HTML 成功率</h3><div class="now num" id="m1-now">–</div><div class="chart" id="m1"></div></div>
+              <div class="mini"><h3><i style="background:var(--s3)"></i>在线浏览器数</h3><div class="now num" id="m2-now">–</div><div class="chart" id="m2"></div></div>
+              <div class="mini"><h3><i style="background:var(--s2)"></i>平均耗时</h3><div class="now num" id="m3-now">–</div><div class="chart" id="m3"></div></div>
+            </div></div>
+          <div class="card c4"><div class="card-h"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M21 12A9 9 0 1 1 12 3v9z"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/></svg>采集结果分布</h2><span class="hint">按尝试计</span></div>
+            <div class="card-b center"><div class="outbox"><div class="donut" id="outdonut"></div><div class="legend" id="outlegend"></div></div></div></div>
+        </div>
       </section>
 
-      <section class="row r-2a">
-        <div class="card"><h2><svg class="ico" viewBox="0 0 24 24"><path d="m3 17 6-6 4 4 8-8M14 7h7v7"/></svg>核心指标趋势<span class="hint" id="trend-hint"></span></h2>
-          <div class="multiples">
-            <div class="mini"><h3><i style="background:var(--s1)"></i>HTML 成功率</h3><div class="now num" id="m1-now">–</div><div class="chart" id="m1"></div></div>
-            <div class="mini"><h3><i style="background:var(--s3)"></i>在线浏览器数</h3><div class="now num" id="m2-now">–</div><div class="chart" id="m2"></div></div>
-            <div class="mini"><h3><i style="background:var(--s2)"></i>平均耗时</h3><div class="now num" id="m3-now">–</div><div class="chart" id="m3"></div></div>
-          </div></div>
-        <div class="card" id="vendors"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M5 21V10M12 21V4M19 21v-7"/></svg>代理厂商 × 域名成功率<span class="hint">成功 / 失败 次数</span></h2>
-          <div class="scroll" id="matrix"></div></div>
-      </section>
-
-      <section class="card" id="waf"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8 8 9 4.6-1 8-4.5 8-9V6z"/></svg>WAF 过盾分析<span class="hint">页面 + 热身落地页；过盾 = 页面真加载出来</span></h2>
-        <div class="wafs" id="wafs"></div></section>
-
-      <section class="row r-2b">
-        <div class="card" id="domains"><h2><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>域名整体表现<span class="hint">IP 过质检后，能否过该域名风控</span></h2>
-          <div class="scroll"><table id="domtable"></table></div></div>
-        <div class="card"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M21 12A9 9 0 1 1 12 3v9z"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/></svg>采集结果分布</h2>
-          <div class="donut-wrap"><div class="donut" id="outdonut"></div><div class="legend" id="outlegend"></div></div></div>
-      </section>
-
-      <section class="row r-2a">
-        <div class="card" id="ip"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>IP 质检情况</h2>
-          <div class="ipgrid">
-            <div class="donut-wrap"><div class="donut" id="ipdonut"></div>
-              <div class="ipfacts"><span>通过</span><b id="ip-ok">–</b><span>失败</span><b id="ip-fail">–</b><span>均延迟</span><b id="ip-ms">–</b></div></div>
-            <div><p class="subhead" id="ipbars-title">通过率</p><div class="chart" id="ipbars"></div></div>
+      <!-- 2 域名分析：域名表 8 | 当前访问频率 4 -->
+      <section class="grid" id="domains">
+        <div class="card c8 fixed"><div class="card-h"><h2><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>域名整体表现</h2><span class="hint" id="dom-hint" title="IP 过质检后，能否过该域名风控"></span></div>
+          <div class="dtools">
+            <label class="search"><svg class="ico" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><input id="dq" type="search" placeholder="搜索域名" aria-label="搜索域名" autocomplete="off"></label>
+            <button class="chip crit" id="dabn" aria-pressed="false" title="样本 ≥ 20 次且成功率或过盾率 &lt; 70%">只看异常 <b id="dabn-n">–</b></button>
+            <button class="chip" id="dgrp" aria-pressed="false" title="把 onlinelibrary.wiley.com 等子域合并到 wiley.com">按主域名合并</button>
           </div>
-          <div class="reasons" id="reasons"></div></div>
-        <div class="card" id="live"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>实时动态<span class="hint">近 1 小时 · 域名频率为近 5 分钟</span></h2>
-          <div class="freq" id="freq"></div><div class="feed" id="feed"></div></div>
+          <div class="card-b scroll mid"><table id="domtable"></table></div>
+          <div class="pager"><span id="dpage-info"></span><button id="dprev" aria-label="上一页">上一页</button><button id="dnext" aria-label="下一页">下一页</button></div></div>
+        <div class="card c4 fixed"><div class="card-h"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 15h4M7 11h9M7 7h6"/></svg>当前访问频率</h2><span class="hint">近 5 分钟 · 篇/分</span></div>
+          <div class="card-b scroll"><div class="rank" id="freq"></div></div></div>
       </section>
 
-      <section class="card" id="browsers"><h2><svg class="ico" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg>浏览器与终端<span class="hint" id="br-hint"></span></h2>
-        <div class="scroll"><table id="insttable"></table></div></section>
+      <!-- 3 代理与 IP：厂商×域名 8 | IP 质检 4 -->
+      <section class="grid" id="proxy">
+        <div class="card c8 fixed"><div class="card-h"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M5 21V10M12 21V4M19 21v-7"/></svg>代理厂商 × 域名成功率</h2><span class="hint">格内：成功率 · 成功 / 失败次数</span></div>
+          <div class="card-b scroll" id="matrix"></div></div>
+        <div class="card c4 fixed"><div class="card-h"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>IP 质检情况</h2></div>
+          <div class="card-b scroll">
+            <div class="iphead"><div class="donut" id="ipdonut"></div>
+              <div class="ipfacts"><span>通过</span><b id="ip-ok">–</b><span>失败</span><b id="ip-fail">–</b><span>均延迟</span><b id="ip-ms">–</b></div></div>
+            <p class="subhead" id="ipbars-title">通过率</p><div class="chart" id="ipbars"></div>
+            <div class="chips" id="reasons"></div>
+          </div></div>
+      </section>
+
+      <!-- 4 WAF：3 张各 4 列 -->
+      <section class="grid" id="waf"></section>
+
+      <!-- 5 终端与事件：终端表 8 | 实时事件 4 -->
+      <section class="grid" id="live">
+        <div class="card c8 fixed"><div class="card-h"><h2><svg class="ico" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg>浏览器与终端</h2><span class="hint" id="br-hint"></span></div>
+          <div class="card-b scroll"><table id="insttable"></table></div></div>
+        <div class="card c4 fixed"><div class="card-h"><h2><svg class="ico" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>实时事件</h2><span class="hint">近 1 小时</span></div>
+          <div class="card-b scroll" id="feed"></div></div>
+      </section>
     </div>
   </main>
 </div>
@@ -291,11 +381,12 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
   const kfmt = v => v == null ? "–" : v >= 1e4 ? (v / 1e3).toFixed(1) + "k" : String(v);
   const pct = v => v == null ? "–" : (v * 100).toFixed(v === 1 || v === 0 ? 0 : 1) + "%";
   const dur = v => v == null ? "–" : v >= 60000 ? (v / 60000).toFixed(1) + "min" : v >= 1000 ? (v / 1000).toFixed(1) + "s" : Math.round(v) + "ms";
-  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const rate = (a, b) => b ? a / b : null;
   const status = v => v == null ? "var(--muted)" : v >= 0.9 ? "var(--good)" : v >= 0.7 ? "var(--warn)" : "var(--crit)";
   const statusWord = v => v == null ? "" : v >= 0.9 ? "良好" : v >= 0.7 ? "一般" : "偏低";
   const WAF = { cloudflare: ["Cloudflare", "var(--cf)"], aws_waf: ["AWS WAF", "var(--aws)"], datadome: ["DataDome", "var(--dd)"], none: ["无 WAF", "var(--axis)"] };
   const winName = { "1d": "24 小时", "7d": "7 天", "30d": "30 天" };
+  const grain = { "1d": "按小时", "7d": "每 6 小时", "30d": "按天" };
   const tm = (t, w) => { const d = new Date(t * 1000), p = n => String(n).padStart(2, "0");
     return w === "1d" ? `${p(d.getHours())}:00` : w === "7d" ? `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}时` : `${d.getMonth() + 1}/${d.getDate()}`; };
   const clock = t => new Date(t * 1000).toLocaleTimeString("zh-CN", { hour12: false });
@@ -308,9 +399,10 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
     document.documentElement.dataset.theme = dark ? "light" : "dark"; store.set("theme", dark ? "light" : "dark");
     if (last) render(last);
   };
-  const setWin = w => { win = w; store.set("win", w); document.querySelectorAll("#win button").forEach(b => b.classList.toggle("on", b.dataset.w === w)); };
+  const setWin = w => { win = w; store.set("win", w); document.querySelectorAll("#win button").forEach(b => {
+    b.classList.toggle("on", b.dataset.w === w); b.setAttribute("aria-pressed", b.dataset.w === w); }); };
   setWin(win);
-  document.querySelectorAll("#win button").forEach(b => b.onclick = () => { setWin(b.dataset.w); load(); });
+  document.querySelectorAll("#win button").forEach(b => b.onclick = () => { setWin(b.dataset.w); dom.offset = 0; load(); });
   const links = [...document.querySelectorAll("#nav a")];
   const spy = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting)
     links.forEach(a => a.classList.toggle("on", a.getAttribute("href") === "#" + e.target.id)); }), { rootMargin: "-30% 0px -60% 0px" });
@@ -325,9 +417,9 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
 
   /* ── 图表：单轴折线（带十字线），柱状，环形 ── */
   function line(el, pts, { color, fmt, yMin, yMax, label }) {
-    const W = el.clientWidth || 300, H = 190, L = 40, R = 6, T = 8, B = 20;
+    const W = el.clientWidth || 300, H = 200, L = 40, R = 6, T = 8, B = 20;
     const vals = pts.map(p => p.v).filter(v => v != null);
-    if (!vals.length) { el.innerHTML = `<div class="empty">该时间窗无数据</div>`; return; }
+    if (!vals.length) { el.innerHTML = `<div class="empty" style="height:${H}px;display:grid;place-items:center">该时间窗无数据</div>`; return; }
     let lo = yMin ?? Math.min(...vals), hi = yMax ?? Math.max(...vals);
     if (hi - lo < Math.abs(hi) * 1e-3 + 1e-9) {          // 只有一个值 / 全相同：上下各留 10%，否则刻度全是同一个数
       lo = yMin ?? Math.max(0, hi * 0.9); hi = hi * 1.1 || 1;
@@ -337,10 +429,10 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
     let s = "";
     [0, 0.5, 1].forEach(f => { const v = lo + (hi - lo) * f, yy = y(v);
       s += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" stroke="var(--grid)"/>`;
-      s += `<text x="${L - 6}" y="${yy + 3.5}" font-size="10.5" fill="var(--muted)" text-anchor="end" class="tab">${fmt(v, true)}</text>`; });
+      s += `<text x="${L - 6}" y="${yy + 3.5}" font-size="11" fill="var(--muted)" text-anchor="end" class="tab">${fmt(v, true)}</text>`; });
     s += `<line x1="${L}" x2="${W - R}" y1="${H - B}" y2="${H - B}" stroke="var(--axis)"/>`;
     const step = Math.max(1, Math.ceil(pts.length / Math.max(2, Math.floor((W - L) / 70))));
-    pts.forEach((p, i) => { if (i % step === 0) s += `<text x="${x(i)}" y="${H - 5}" font-size="10.5" fill="var(--muted)" text-anchor="middle">${tm(p.t, win)}</text>`; });
+    pts.forEach((p, i) => { if (i % step === 0) s += `<text x="${x(i)}" y="${H - 5}" font-size="11" fill="var(--muted)" text-anchor="middle">${tm(p.t, win)}</text>`; });
     let d = "", pen = false;
     pts.forEach((p, i) => { if (p.v == null) { pen = false; return; } d += (pen ? "L" : "M") + x(i).toFixed(1) + "," + y(p.v).toFixed(1); pen = true; });
     s += `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
@@ -369,14 +461,14 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
     const bw = (W - L - R) / pts.length, gap = Math.min(4, bw * 0.3);
     let s = "";
     [lo, (lo + hi) / 2, hi].forEach(v => { s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)"/>
-      <text x="${L - 6}" y="${y(v) + 3.5}" font-size="10.5" fill="var(--muted)" text-anchor="end" class="tab">${Math.round(v * 100)}%</text>`; });
+      <text x="${L - 6}" y="${y(v) + 3.5}" font-size="11" fill="var(--muted)" text-anchor="end" class="tab">${Math.round(v * 100)}%</text>`; });
     const step = Math.max(1, Math.ceil(pts.length / Math.max(2, Math.floor((W - L) / 70))));
     pts.forEach((p, i) => {
       const x0 = L + i * bw + gap / 2, w = Math.max(1, bw - gap);
       if (p.v != null) { const top = y(p.v), h = H - B - top, r = Math.min(4, w / 2, h);
         s += `<path d="M${x0},${H - B}V${top + r}Q${x0},${top} ${x0 + r},${top}H${x0 + w - r}Q${x0 + w},${top} ${x0 + w},${top + r}V${H - B}Z" fill="${status(p.v)}" data-i="${i}"/>`; }
       s += `<rect x="${L + i * bw}" y="${T}" width="${bw}" height="${H - T - B}" fill="transparent" data-i="${i}"/>`;
-      if (i % step === 0) s += `<text x="${x0 + w / 2}" y="${H - 5}" font-size="10.5" fill="var(--muted)" text-anchor="middle">${tm(p.t, win)}</text>`;
+      if (i % step === 0) s += `<text x="${x0 + w / 2}" y="${H - 5}" font-size="11" fill="var(--muted)" text-anchor="middle">${tm(p.t, win)}</text>`;
     });
     s += `<line x1="${L}" x2="${W - R}" y1="${H - B}" y2="${H - B}" stroke="var(--axis)"/>`;
     el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" height="${H}" role="img" aria-label="${esc(label)}">${s}</svg>`;
@@ -385,14 +477,14 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
     el.firstChild.addEventListener("mouseleave", hideTip);
   }
 
-  function donut(el, segs, center, size = 150) {
+  function donut(el, segs, center, size = 148) {
     const total = segs.reduce((a, s) => a + s.value, 0), R = size / 2, w = 16, r = R - w / 2, C = 2 * Math.PI * r;
     let s = `<circle cx="${R}" cy="${R}" r="${r}" fill="none" stroke="var(--grid)" stroke-width="${w}"/>`, off = 0;
     const shown = segs.filter(x => x.value > 0), gapLen = shown.length > 1 ? 2 : 0;
     if (total) shown.forEach(x => { const len = C * x.value / total;
       s += `<circle cx="${R}" cy="${R}" r="${r}" fill="none" stroke="${x.color}" stroke-width="${w}" stroke-dasharray="${Math.max(0, len - gapLen)} ${C}"
-        stroke-dashoffset="${-off}" transform="rotate(-90 ${R} ${R})" data-l="${esc(x.label)}" data-v="${x.value}" style="cursor:default"/>`; off += len; });
-    el.innerHTML = `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" role="img" aria-label="${esc(center[1])}">${s}</svg><div class="center"><b class="num">${center[0]}</b><span>${center[1]}</span></div>`;
+        stroke-dashoffset="${-off}" transform="rotate(-90 ${R} ${R})" data-l="${esc(x.label)}" data-v="${x.value}"/>`; off += len; });
+    el.innerHTML = `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" role="img" aria-label="${esc(center[1])} ${esc(center[0])}">${s}</svg><div class="center"><b class="num">${center[0]}</b><span>${center[1]}</span></div>`;
     el.firstChild.addEventListener("mousemove", ev => { const t = ev.target; if (!t.dataset.l) return hideTip();
       showTip(`${t.dataset.l} <b>${num(+t.dataset.v)}</b>（${pct(total ? t.dataset.v / total : null)}）`, ev); });
     el.firstChild.addEventListener("mouseleave", hideTip);
@@ -408,8 +500,66 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
   }
 
   const meter = v => `<span class="rate"><span class="meter"><i style="width:${v == null ? 0 : Math.round(v * 100)}%;background:${status(v)}"></i></span><span class="tab">${pct(v)}</span></span>`;
+  const emptyRow = (cols, text) => `<tbody><tr><td class="empty" colspan="${cols}">${text}</td></tr></tbody>`;
+
+  /* ── 域名表：服务端搜索 / 排序 / 分页，每页 20 行 ── */
+  const dom = { sort: "attempts", order: "desc", q: "", offset: 0, limit: 20, abnormal: false, group: store.get("group") === "1" };
+  const DCOLS = [["host", "域名", ""], [null, "WAF", ""], ["attempts", "访问次数", "r"], ["success_rate", "成功率", "r"],
+                 ["pass_rate", "过盾率", "r"], ["avg_ms", "平均耗时", "r"], ["p95_ms", "P95", "r"]];
+  const firstOrder = s => ({ host: "asc", success_rate: "asc", pass_rate: "asc" }[s] || "desc");   // 比例默认最差的在前
+  let domSeq = 0, lastDom = null;
+  const syncChips = () => { $("dabn").setAttribute("aria-pressed", dom.abnormal); $("dgrp").setAttribute("aria-pressed", dom.group); };
+  syncChips();
+
+  async function loadDomains() {
+    const seq = ++domSeq;
+    const p = new URLSearchParams({ window: win, sort: dom.sort, order: dom.order, q: dom.q, offset: dom.offset, limit: dom.limit,
+                                    abnormal: dom.abnormal ? 1 : 0, group: dom.group ? 1 : 0 });
+    if (token) p.set("token", token);
+    try {
+      const r = await fetch(`api/domains?${p}`, { credentials: "same-origin" });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "HTTP " + r.status);
+      const res = await r.json();
+      if (seq !== domSeq) return;                                  // 只认最后一次请求，防止快速翻页时旧结果覆盖新结果
+      if (res.offset > 0 && res.offset >= res.matched) { dom.offset = Math.max(0, Math.floor((res.matched - 1) / dom.limit) * dom.limit); return loadDomains(); }
+      lastDom = res; renderDomains(res);
+    } catch (e) {
+      if (seq === domSeq) $("domtable").innerHTML = emptyRow(7, "域名表加载失败：" + esc(e.message));
+    }
+  }
+
+  function renderDomains(res) {
+    const unit = res.group ? "主域名" : "域名";
+    $("dom-hint").textContent = `共 ${num(res.total)} 个${unit} · 异常 ${num(res.abnormal)}` + (dom.q ? ` · 匹配 ${num(res.matched)}` : "");
+    $("dabn-n").textContent = num(res.abnormal);
+    const head = `<thead><tr>${DCOLS.map(([k, label, cls]) => {
+      if (!k) return `<th class="${cls}">${label}</th>`;
+      const on = res.sort === k, arr = on ? (res.order === "asc" ? "▲" : "▼") : "▼";
+      return `<th class="${cls}" aria-sort="${on ? (res.order === "asc" ? "ascending" : "descending") : "none"}"><button class="th-btn" data-sort="${k}">${label}<span class="arr">${arr}</span></button></th>`;
+    }).join("")}</tr></thead>`;
+    const empty = dom.q ? `没有匹配「${esc(dom.q)}」的${unit}` : dom.abnormal ? `该时间窗没有异常${unit}` : "该时间窗内没有页面采集记录";
+    $("domtable").innerHTML = head + (res.rows.length ? `<tbody>` + res.rows.map(x => {
+      const subs = res.group && x.hosts.length > 1 ? `<span class="vsub"> · ${x.hosts.length} 个子域</span>` : "";
+      const tip = (res.group ? x.hosts.join("\n") : x.host) + (x.few ? `\n样本不足 ${res.min_n} 次，比例仅供参考` : "") + (x.abnormal ? "\n异常：成功率或过盾率 < 70%" : "");
+      return `<tr class="${x.few ? "few" : ""}"><td class="host" title="${esc(tip)}">${x.abnormal ? `<span class="sdot" style="background:var(--crit)"></span>` : ""}${esc(x.host)}${subs}</td>
+        <td><span class="waf-tag"><i style="background:${WAF[x.waf] ? WAF[x.waf][1] : "var(--axis)"}"></i>${WAF[x.waf] ? WAF[x.waf][0] : esc(x.waf)}</span></td>
+        <td class="r">${num(x.attempts)}</td><td class="r">${meter(x.success_rate)}</td><td class="r tab">${pct(x.pass_rate)}</td>
+        <td class="r">${dur(x.avg_ms)}</td><td class="r">${dur(x.p95_ms)}</td></tr>`; }).join("") + `</tbody>` : emptyRow(7, empty));
+    const a = res.matched ? res.offset + 1 : 0, b = res.offset + res.rows.length;
+    $("dpage-info").textContent = res.matched ? `${num(a)}–${num(b)} / ${num(res.matched)}` : "";
+    $("dprev").disabled = res.offset <= 0; $("dnext").disabled = b >= res.matched;
+  }
+
+  $("domtable").addEventListener("click", ev => { const b = ev.target.closest(".th-btn"); if (!b) return;
+    const k = b.dataset.sort; dom.order = dom.sort === k ? (dom.order === "asc" ? "desc" : "asc") : firstOrder(k); dom.sort = k; dom.offset = 0; loadDomains(); });
+  let qt; $("dq").addEventListener("input", ev => { clearTimeout(qt); qt = setTimeout(() => { dom.q = ev.target.value.trim(); dom.offset = 0; loadDomains(); }, 300); });
+  $("dabn").onclick = () => { dom.abnormal = !dom.abnormal; dom.offset = 0; syncChips(); loadDomains(); };
+  $("dgrp").onclick = () => { dom.group = !dom.group; store.set("group", dom.group ? "1" : "0"); dom.offset = 0; syncChips(); loadDomains(); };
+  $("dprev").onclick = () => { dom.offset = Math.max(0, dom.offset - dom.limit); loadDomains(); };
+  $("dnext").onclick = () => { dom.offset += dom.limit; loadDomains(); };
 
   async function load() {
+    loadDomains();
     try {
       const r = await fetch(`api/summary?window=${win}` + (token ? `&token=${encodeURIComponent(token)}` : ""), { credentials: "same-origin" });
       if (!r.ok) throw new Error(r.status === 401 ? "需要登录（刷新页面重新输入密码）" : ((await r.json().catch(() => ({}))).error || "HTTP " + r.status));
@@ -427,21 +577,23 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
     $("updated").textContent = `更新时间：${new Date(d.now * 1000).toLocaleString("zh-CN", { hour12: false })}`;
     $("foot").textContent = `每 10 秒刷新 · 窗口 ${wn}`;
 
-    $("k-ip-label").textContent = `${wn} IP 质检数`;
+    /* KPI */
     $("k-ip").textContent = num(ip.checked); $("k-ip-rate").textContent = pct(ip.pass_rate);
     $("k-ip-d").innerHTML = delta(ip.pass_rate, prev.ip.pass_rate, { kind: "pt" });
     $("k-br").innerHTML = `${num(br.online)} <small>/ ${num(br.target)}</small>`;
     $("k-br-rate").textContent = pct(br.start_rate); $("k-br-exc").textContent = num(br.exceptions);
-    $("k-pg-label").textContent = `${wn} HTML 成功数`;
     $("k-pg").textContent = num(pg.success); $("k-pg-rate").textContent = pct(pg.success_rate);
     $("k-pg-d").innerHTML = delta(pg.success_rate, prev.pages.success_rate, { kind: "pt" });
+    const passR = rate(pg.passed, pg.attempts);
+    $("k-pass").textContent = pct(passR); $("k-np").textContent = num(pg.attempts - pg.passed);
+    $("k-pass-d").innerHTML = delta(passR, rate(prev.pages.passed, prev.pages.attempts), { kind: "pt" });
     $("k-ms").textContent = dur(pg.avg_ms); $("k-p95").textContent = dur(pg.p95_ms);
     $("k-ms-d").innerHTML = delta(pg.avg_ms, prev.pages.avg_ms, { kind: "rel", betterLow: true });
     $("k-pend").textContent = num(rt.pending); $("k-run").textContent = num(rt.running); $("k-inst").textContent = num(rt.online_instances);
 
     /* 趋势小图：三张各自单轴 */
     const tr = d.trend;
-    $("trend-hint").textContent = { "1d": "按小时", "7d": "每 6 小时", "30d": "按天" }[d.window];
+    $("trend-hint").textContent = `${wn} · ${grain[d.window]}`;
     const lastv = k => { for (let i = tr.length - 1; i >= 0; i--) if (tr[i][k] != null) return tr[i][k]; return null; };
     $("m1-now").textContent = pct(lastv("success_rate")); $("m2-now").textContent = lastv("online") == null ? "–" : num(lastv("online"));
     $("m3-now").textContent = dur(lastv("avg_ms"));
@@ -449,31 +601,6 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
          { color: "var(--s1)", fmt: (v, axis) => axis ? Math.round(v * 100) + "%" : pct(v), label: "HTML 成功率" });
     line($("m2"), tr.map(p => ({ t: p.t, v: p.online })), { color: "var(--s3)", fmt: (v, axis) => axis ? Math.round(v) : v.toFixed(1), yMin: 0, label: "在线浏览器（平均）" });
     line($("m3"), tr.map(p => ({ t: p.t, v: p.avg_ms })), { color: "var(--s2)", fmt: (v, axis) => dur(v), yMin: 0, label: "平均耗时" });
-
-    /* 厂商 × 域名矩阵 */
-    const vs = d.vendors.slice(0, 6);
-    const byV = vs.map(v => Object.fromEntries(v.domains.map(x => [x.host, x])));
-    const cell = x => x ? `<td class="cell"><b>${pct(x.success_rate)}</b><span>${kfmt(x.success)} / ${kfmt(x.attempts - x.success)}</span><div class="bar"><i style="width:${Math.round(x.success_rate * 100)}%;background:${status(x.success_rate)}"></i></div></td>`
-                        : `<td class="cell"><span>–</span></td>`;
-    $("matrix").innerHTML = vs.length ? `<table class="matrix"><tr><th>域名 \\ 厂商</th>${vs.map(v => `<th>${esc(v.vendor)}</th>`).join("")}</tr>` +
-      `<tr><td><span class="vsub">IP 质检通过率</span></td>${vs.map(v => `<td class="cell"><span>${pct(v.ip_pass_rate)}（${kfmt(v.ip_checked)}）</span></td>`).join("")}</tr>` +
-      d.domains.slice(0, 12).map(dm => `<tr><td title="${esc(dm.host)}">${esc(dm.host.replace(/^www\./, ""))}</td>${byV.map(b => cell(b[dm.host])).join("")}</tr>`).join("") +
-      `<tr><td>合计</td>${vs.map(v => cell(v.attempts ? { success_rate: v.success_rate, success: v.success, attempts: v.attempts } : null)).join("")}</tr></table>`
-      : `<div class="empty">该时间窗无数据</div>`;
-
-    /* WAF */
-    $("wafs").innerHTML = d.waf.map(w => `<div class="waf" style="--c:${WAF[w.waf][1]}">
-      <div class="name">${WAF[w.waf][0]}<span class="sdot" style="background:${status(w.pass_rate)}" title="${statusWord(w.pass_rate)}"></span></div>
-      <div class="big num">${pct(w.pass_rate)} <small>过盾率${w.pass_rate == null ? "" : " · " + statusWord(w.pass_rate)}</small></div>
-      <div class="facts"><span>尝试 <b>${num(w.attempts)}</b></span><span>过盾 <b>${num(w.passed)}</b></span><span>均耗时 <b>${dur(w.avg_ms)}</b></span><span>P95 <b>${dur(w.p95_ms)}</b></span></div></div>`).join("");
-
-    /* 域名表 */
-    $("domtable").innerHTML = d.domains.length ? `<tr><th>域名</th><th>WAF</th><th class="r">访问次数</th><th class="r">成功率</th><th class="r">过盾率</th><th class="r">平均耗时</th><th class="r">P95</th><th class="r">当前 篇/分</th></tr>` +
-      d.domains.map(x => `<tr><td class="host" title="${esc(x.host)}">${esc(x.host)}</td>
-        <td><span class="waf-tag"><i style="background:${WAF[x.waf] ? WAF[x.waf][1] : "var(--axis)"}"></i>${WAF[x.waf] ? WAF[x.waf][0] : esc(x.waf)}</span></td>
-        <td class="r">${num(x.attempts)}</td><td class="r">${meter(x.success_rate)}</td><td class="r tab">${pct(x.pass_rate)}</td>
-        <td class="r">${dur(x.avg_ms)}</td><td class="r">${dur(x.p95_ms)}</td><td class="r">${x.per_min || "–"}</td></tr>`).join("")
-      : `<tr><td class="empty">该时间窗内没有页面采集记录</td></tr>`;
 
     /* 结果分布 */
     const o = d.outcomes, segs = [
@@ -484,28 +611,55 @@ td.host { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-weig
     const ot = o.success + o.http_failed + o.not_passed;
     $("outlegend").innerHTML = segs.map(s => `<div><i style="background:${s.color}"></i>${s.label}<span class="n">${num(s.value)}</span><b>${pct(ot ? s.value / ot : null)}</b></div>`).join("");
 
-    /* IP */
-    donut($("ipdonut"), [{ label: "通过", value: ip.passed, color: "var(--good)" }, { label: "不通过", value: ip.failed, color: "var(--crit)" }], [pct(ip.pass_rate), "通过率"], 132);
-    $("ip-ok").textContent = num(ip.passed); $("ip-fail").textContent = num(ip.failed); $("ip-ms").textContent = dur(ip.avg_ms);
-    $("ipbars-title").textContent = `近 ${wn} 通过率（${{ "1d": "按小时", "7d": "每 6 小时", "30d": "按天" }[d.window]}）`;
-    bars($("ipbars"), tr.map(p => ({ t: p.t, v: p.ip_pass_rate, extra: `<br>质检 ${num(p.ip_checked)}` })), { fmt: pct, label: "IP 质检通过率" });
-    $("reasons").innerHTML = ip.fail_reasons.length ? `<span>不通过原因</span>` + ip.fail_reasons.map(r => `<span>${esc(r.reason)} <b>${num(r.n)}</b></span>`).join("") : "";
+    /* 访问频率排行 */
+    const fmax = Math.max(0, ...rt.domain_freq.map(f => f.per_min));
+    $("freq").innerHTML = rt.domain_freq.length ? rt.domain_freq.map(f => `<div class="it"><span class="h" title="${esc(f.host)}">${esc(f.host.replace(/^www\./, ""))}</span>
+      <span class="v"><b>${f.per_min}</b> /分</span><span class="track"><i style="width:${fmax ? Math.max(2, f.per_min / fmax * 100) : 0}%"></i></span></div>`).join("")
+      : `<div class="empty">近 5 分钟无访问</div>`;
 
-    /* 实时 */
-    $("freq").innerHTML = rt.domain_freq.length ? rt.domain_freq.map(f => `<span>${esc(f.host)} <b>${f.per_min}</b>/分</span>`).join("") : `<span>近 5 分钟无访问</span>`;
+    /* 厂商 × 域名矩阵 */
+    const vs = d.vendors.slice(0, 6);
+    const byV = vs.map(v => Object.fromEntries(v.domains.map(x => [x.host, x])));
+    const cell = x => x ? `<td class="cell"><b>${pct(x.success_rate)}</b><span>${kfmt(x.success)} / ${kfmt(x.attempts - x.success)}</span><div class="bar"><i style="width:${Math.round(x.success_rate * 100)}%;background:${status(x.success_rate)}"></i></div></td>`
+                        : `<td class="cell"><span>–</span></td>`;
+    $("matrix").innerHTML = vs.length ? `<table class="matrix"><thead><tr><th>域名 \\ 厂商</th>${vs.map(v => `<th>${esc(v.vendor)}</th>`).join("")}</tr></thead><tbody>` +
+      `<tr><td><span class="vsub">IP 质检通过率</span></td>${vs.map(v => `<td class="cell"><span>${pct(v.ip_pass_rate)}（${kfmt(v.ip_checked)}）</span></td>`).join("")}</tr>` +
+      d.domains.slice(0, 12).map(dm => `<tr><td title="${esc(dm.host)}">${esc(dm.host.replace(/^www\./, ""))}</td>${byV.map(b => cell(b[dm.host])).join("")}</tr>`).join("") +
+      `<tr class="total"><td>合计</td>${vs.map(v => cell(v.attempts ? { success_rate: v.success_rate, success: v.success, attempts: v.attempts } : null)).join("")}</tr></tbody></table>`
+      : `<div class="empty">该时间窗无数据</div>`;
+
+    /* IP */
+    donut($("ipdonut"), [{ label: "通过", value: ip.passed, color: "var(--good)" }, { label: "不通过", value: ip.failed, color: "var(--crit)" }], [pct(ip.pass_rate), "通过率"], 112);
+    $("ip-ok").textContent = num(ip.passed); $("ip-fail").textContent = num(ip.failed); $("ip-ms").textContent = dur(ip.avg_ms);
+    $("ipbars-title").textContent = `${wn}通过率 · ${grain[d.window]}`;
+    bars($("ipbars"), tr.map(p => ({ t: p.t, v: p.ip_pass_rate, extra: `<br>质检 ${num(p.ip_checked)}` })), { fmt: pct, label: "IP 质检通过率" });
+    $("reasons").innerHTML = ip.fail_reasons.length ? ip.fail_reasons.map(r => `<span>${esc(r.reason)}<b>${num(r.n)}</b></span>`).join("") : "";
+
+    /* WAF：每家一张卡，各占 4 列 */
+    $("waf").innerHTML = d.waf.map(w => `<div class="card c4 waf" style="--c:${WAF[w.waf][1]}">
+      <div class="card-h"><h2>${WAF[w.waf][0]}</h2><span class="hint"><span class="sdot" style="background:${status(w.pass_rate)};margin-right:6px;vertical-align:0"></span>${statusWord(w.pass_rate) || "无数据"}</span></div>
+      <div class="card-b"><div class="big num">${pct(w.pass_rate)}<small>过盾率</small></div>
+        <div class="track"><i style="width:${w.pass_rate == null ? 0 : Math.round(w.pass_rate * 100)}%;background:${status(w.pass_rate)}"></i></div>
+        <div class="facts"><div><span>尝试</span><b>${num(w.attempts)}</b></div><div><span>过盾</span><b>${num(w.passed)}</b></div>
+          <div><span>均耗时</span><b>${dur(w.avg_ms)}</b></div><div><span>P95</span><b>${dur(w.p95_ms)}</b></div></div></div></div>`).join("");
+
+    /* 实时事件 */
     const lv = { info: "var(--good)", warn: "var(--warn)", warning: "var(--warn)", error: "var(--crit)", critical: "var(--crit)" };
     const kind = { page: "页面", browser: "浏览器", log: "日志" };
-    $("feed").innerHTML = rt.events.length ? rt.events.map(e => `<div class="ev"><span class="sdot" style="background:${lv[e.level] || "var(--muted)"}"></span>
+    $("feed").innerHTML = rt.events.length ? rt.events.map(e => `<div class="ev"><span class="sdot" style="background:${lv[e.level] || "var(--muted)"}" title="${esc(e.level)}"></span>
       <span class="t">${clock(e.ts)}</span><span class="k">${kind[e.type] || esc(e.type)}</span><span class="m" title="${esc(e.inst)}：${esc(e.msg)}">${esc(e.msg)}</span></div>`).join("")
       : `<div class="empty">近 1 小时无事件</div>`;
 
     /* 浏览器与终端 */
     $("br-hint").textContent = `启动 ${num(br.starts)} 次 · 成功率 ${pct(br.start_rate)} · 异常 ${num(br.exceptions)} · 平均过盾 ${br.avg_pass_s == null ? "–" : br.avg_pass_s + "s"}`;
-    $("insttable").innerHTML = rt.instances.length ? `<tr><th>终端</th><th>批次</th><th>厂商</th><th>模式</th><th class="r">在线浏览器</th><th class="r">待下载</th><th class="r">进行中</th><th class="r">成功 / 失败</th><th>最近心跳</th></tr>` +
-      rt.instances.map(i => `<tr><td><span class="dot ${i.online ? "on" : ""}" style="margin-right:8px"></span>${esc(i.inst)}</td><td>${esc(i.batch)}</td><td>${esc(i.vendor)}</td><td>${esc(i.mode)}</td>
-        <td class="r">${num(i.browsers_online)} / ${num(i.workers)}</td><td class="r">${num(i.pending)}</td><td class="r">${num(i.running)}</td>
-        <td class="r">${num(i.success)} / ${num(i.failed)}</td><td style="color:${i.online ? "inherit" : "var(--muted)"}">${new Date(i.last_seen * 1000).toLocaleString("zh-CN", { hour12: false })}${i.online ? "" : "（离线）"}</td></tr>`).join("")
-      : `<tr><td class="empty">还没有终端上报（检查终端 [monitor] enabled 与 amqp_url，或用 paperlite-monitor test 验证）</td></tr>`;
+    const ago = t => { const s = Math.max(0, d.now - t); return s < 60 ? `${Math.round(s)} 秒前` : s < 3600 ? `${Math.round(s / 60)} 分钟前` : s < 86400 ? `${Math.round(s / 3600)} 小时前` : `${Math.round(s / 86400)} 天前`; };
+    $("insttable").innerHTML = rt.instances.length ? `<thead><tr><th>终端</th><th>批次</th><th class="r">在线浏览器</th><th class="r">待下载 / 进行中</th><th class="r">成功 / 失败</th><th class="r">心跳</th></tr></thead><tbody>` +
+      rt.instances.map(i => `<tr><td><span class="dot ${i.online ? "on" : ""}" style="margin-right:8px" title="${i.online ? "在线" : "离线"}"></span>${esc(i.inst)}</td>
+        <td style="line-height:1.3">${esc(i.batch)}<span class="vsub" style="display:block">${esc(i.vendor)} · ${esc(i.mode)}</span></td>
+        <td class="r">${num(i.browsers_online)} / ${num(i.workers)}</td><td class="r">${num(i.pending)} / ${num(i.running)}</td>
+        <td class="r">${num(i.success)} / ${num(i.failed)}</td>
+        <td class="r" style="color:${i.online ? "inherit" : "var(--muted)"}" title="${new Date(i.last_seen * 1000).toLocaleString("zh-CN", { hour12: false })}">${ago(i.last_seen)}${i.online ? "" : " · 离线"}</td></tr>`).join("") + `</tbody>`
+      : emptyRow(6,"还没有终端上报（检查终端 [monitor] enabled 与 amqp_url，或用 paperlite-monitor test 验证）");
   }
 
   let rz; addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => last && render(last), 150); });
