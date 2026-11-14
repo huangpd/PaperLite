@@ -406,6 +406,51 @@ class TaskDB:
                 scanned += len(rows)
             return None
 
+    def claim_chunk(self, worker: str, limit: int = 50) -> list[Task]:
+        """
+        批量原子认领连续任务切片。
+        按 (challenge_count, id) 顺序提取，在单个 SQLite 事务中直接置为 running 并绑定 worker。
+        """
+        if limit <= 0:
+            return []
+        with self._lock:
+            c = self._conn
+            rows = c.execute(
+                """
+                UPDATE paper_pdf_resources 
+                SET status = 'running', claimed_by = ?, updated_at = ?
+                WHERE id IN (
+                    SELECT id FROM paper_pdf_resources INDEXED BY idx_claim
+                    WHERE status = 'pending' AND flag IS NULL
+                    ORDER BY challenge_count, id
+                    LIMIT ?
+                )
+                RETURNING id, doi, url, retry_count, challenge_count, url_type
+                """,
+                (worker, now_text(), limit),
+            ).fetchall()
+            return [
+                Task(r["id"], r["doi"], r["url"], r["retry_count"], r["challenge_count"], r["url_type"])
+                for r in rows
+            ]
+
+    def release_tasks(self, tasks: list[Task]) -> int:
+        """
+        将 worker 尚未执行完的批量任务瞬间放回 pending，解除 worker 绑定。
+        通常在换 IP 或退出生命周期时调用，确保零任务残留。
+        """
+        if not tasks:
+            return 0
+        ids = [t.id for t in tasks]
+        with self._lock:
+            placeholders = ",".join("?" for _ in ids)
+            cur = self._conn.execute(
+                f"UPDATE paper_pdf_resources SET status = 'pending', claimed_by = NULL, updated_at = ? "
+                f"WHERE id IN ({placeholders}) AND status = 'running'",
+                (now_text(), *ids),
+            )
+            return cur.rowcount
+
     def _volume_open(self, volume: str, n: int) -> bool:
         """调用方已持锁。卷期已下到过 PDF，或在途 + 已判没有 PDF 的少于 n 篇。"""
         c = self._conn

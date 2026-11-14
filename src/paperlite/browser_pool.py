@@ -104,11 +104,19 @@ class BrowserPool:
         session: Optional[BrowserSession] = None
         lease: Optional[Lease] = None
         net_errors = 0                                      # 当前 IP 连续代理网络错误次数
+        pending_chunk: list[Task] = []                     # 当前 Worker 本地持有的切片缓冲区
         try:
             while not stop.is_set() and not self._drained.is_set():
                 # 没有浏览器，或 IP 快到期：换新 IP 重开
                 if (session is None or lease is None or lease.left() < self.cfg.min_left_s
                         or net_errors >= _NET_DISCARD_AFTER):
+                    # 换 IP / 重开浏览器前，将本地尚未执行的切片任务瞬间放回待下载池
+                    if pending_chunk:
+                        released = await asyncio.to_thread(self.db.release_tasks, pending_chunk)
+                        if released:
+                            logger.info("%s 换 IP 前将 %d 个未消费任务安全放回待下载池", name, released)
+                        pending_chunk.clear()
+
                     if net_errors >= _NET_DISCARD_AFTER and lease is not None:
                         logger.warning("%s IP %s 连续 %d 次代理网络错误，提前换 IP（剩余寿命 %.0fs）",
                                        name, lease.exit_ip or lease.server, net_errors, lease.left())
@@ -120,10 +128,26 @@ class BrowserPool:
                     if session is None:
                         continue                       # 停了或一直取不到 IP
                     self._live.add(name)
-                task = await asyncio.to_thread(self.db.claim, name)
-                if task is None:
-                    self._drained.set()                # 没任务了，通知其它 worker 收工
-                    break
+
+                # 本地切片为空时，以浏览器/IP当前生命周期为准，动态认领切片大小
+                if not pending_chunk:
+                    left_s = lease.left()
+                    if left_s < self.cfg.min_left_s:
+                        continue                       # 寿命不足跑新切片，触发下轮换 IP
+
+                    # 动态适配生命周期：按当前剩余秒数计算可消费数量（按每篇 8s 估算），上限 50 篇，下限 1 篇
+                    batch_size = min(50, max(1, int((left_s - self.cfg.min_left_s) / 8)))
+                    pending_chunk = await asyncio.to_thread(self.db.claim_chunk, name, batch_size)
+                    if not pending_chunk:
+                        # 兜底：尝试单篇认领，若仍为空说明所有任务已领完
+                        single_task = await asyncio.to_thread(self.db.claim, name)
+                        if single_task:
+                            pending_chunk = [single_task]
+                        else:
+                            self._drained.set()
+                            break
+
+                task = pending_chunk.pop(0)
                 try:
                     net_err = await self._do_task(task, session, lease, name)
                     net_errors = net_errors + 1 if net_err else 0
@@ -131,12 +155,18 @@ class BrowserPool:
                     logger.exception("%s 处理任务异常，放回 pending", name)
                     await asyncio.to_thread(self.db.retry_later, task, count=False,
                                             error_kind="challenge_failed", error_message="浏览器 worker 异常")
+                    if pending_chunk:
+                        await asyncio.to_thread(self.db.release_tasks, pending_chunk)
+                        pending_chunk.clear()
                     self._live.discard(name)
                     session = await self._discard(session)      # 浏览器可能已坏，下轮重开
                     continue
                 lo, hi = self.cfg.page_interval_s
                 await asyncio.sleep(random.uniform(lo, hi))     # 同域名限速
         finally:
+            if pending_chunk:
+                await asyncio.to_thread(self.db.release_tasks, pending_chunk)
+                pending_chunk.clear()
             self._live.discard(name)
             if session is not None:
                 await session.close()

@@ -420,6 +420,9 @@ _COMMANDS = {
     "retry": "把 failed / non_pdf 的任务重置为 pending",
     "export": "导出任务为 CSV",
     "turnstile": "按 URL + sitekey 取 Cloudflare Turnstile token（--serve 起 HTTP 服务）",
+    "preprocess": "预处理：基于 DuckDB 极速聚类大类小类、嗅探落地域名、双视角体检定级并导出 domain_rules.toml",
+    "resolve": "预处理阶段一：基于 DuckDB 聚类族群并嗅探真实落地域名，建档至 SQLite 库",
+    "audit": "预处理阶段二：仅对已嗅探的独立域名做双视角反爬体检，导出 domain_rules.toml",
     "help": "显示某个命令的帮助",
 }
 
@@ -545,6 +548,28 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p.add_argument("--serve", type=int, metavar="PORT", help="起 HTTP 服务：POST /solve {url, sitekey, ...}")
     p.add_argument("--bind", default="127.0.0.1", help="--serve 监听地址，默认 127.0.0.1")
     p.add_argument("--concurrency", type=int, default=4, help="--serve 同时运行的浏览器数，默认 4")
+
+    # 预处理命令族
+    p = cmd("preprocess")
+    p.add_argument("--urls", required=True, help="输入的 CSV 文件路径（含 DOI 列或 URL 列）")
+    p.add_argument("--out-map", default="doi_routes.db", help="阶段一中间态 SQLite 映射库，默认 doi_routes.db")
+    p.add_argument("--out-rules", default="domain_rules.toml", help="阶段二最终导出的 TOML 规则文件，默认 domain_rules.toml")
+    p.add_argument("--proxy", help="使用的代理地址 (如 http://127.0.0.1:7897)，不给则尝试读配置或直连")
+    p.add_argument("--concurrency", type=int, default=6, help="阶段一轻量跳转嗅探并发数，默认 6")
+
+    p = cmd("resolve")
+    p.add_argument("--urls", required=True, help="输入的 CSV 文件路径（含 DOI 列或 URL 列）")
+    p.add_argument("--out-map", default="doi_routes.db", help="输出的 SQLite 映射库，默认 doi_routes.db")
+    p.add_argument("--proxy", help="使用的代理地址 (如 http://127.0.0.1:7897)")
+    p.add_argument("--concurrency", type=int, default=6, help="轻量跳转嗅探并发数，默认 6")
+    p.add_argument("--limit", type=int, help="最多只嗅探前 N 个代表族群（用于小规模测试）")
+
+    p = cmd("audit")
+    p.add_argument("--map", default="doi_routes.db", help="阶段一生成的 SQLite 映射库，默认 doi_routes.db")
+    p.add_argument("--out-rules", default="domain_rules.toml", help="最终导出的 TOML 规则文件，默认 domain_rules.toml")
+    p.add_argument("--proxy", help="使用的代理地址 (如 http://127.0.0.1:7897)")
+    p.add_argument("--limit", type=int, help="最多只体检前 N 个独立域名（用于小规模测试）")
+
     p = cmd("help")
     p.add_argument("command", nargs="?", choices=[c for c in _COMMANDS if c != "help"], metavar="<命令>")
     return ap, parsers
@@ -617,6 +642,27 @@ def main() -> None:
         return
     if args.cmd == "turnstile":
         _turnstile(args, parsers["turnstile"])
+        return
+    if args.cmd == "resolve":
+        from paperlite.preprocess import PreprocessManager
+        asyncio.run(PreprocessManager.run_resolve(
+            csv_path=args.urls, out_db=args.out_map, proxy=args.proxy,
+            concurrency=args.concurrency, limit_patterns=args.limit
+        ))
+        return
+    if args.cmd == "audit":
+        from paperlite.preprocess import PreprocessManager
+        asyncio.run(PreprocessManager.run_audit(
+            in_db=args.map, out_toml=args.out_rules, proxy=args.proxy,
+            limit_domains=args.limit
+        ))
+        return
+    if args.cmd == "preprocess":
+        from paperlite.preprocess import PreprocessManager
+        asyncio.run(PreprocessManager.run_pipeline(
+            csv_path=args.urls, out_db=args.out_map, out_toml=args.out_rules,
+            proxy=args.proxy, concurrency=args.concurrency
+        ))
         return
 
     if args.cmd == "run" and not args.curl:         # 浏览器模式（默认）

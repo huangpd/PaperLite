@@ -4,7 +4,9 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# 本地配置（含代理密码、代理签名、监控密码，不能提交）
+# 本地配置（含代理密码、代理签名、监控密码等敏感信息，一律不入库）
+*.toml
+!pyproject.toml
 config.toml
 doi-landing-juliang.toml
 sciencedirect-slow.toml
@@ -24,6 +26,7 @@ log/
 artifacts/
 *.parquet
 *.duckdb
+*.csv
 acm_doi_urls.csv
 sciencedirect.csv
 

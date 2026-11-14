@@ -22,6 +22,7 @@ classifiers = [
 dependencies = [
     "cloakbrowser[geoip]==0.6.4",
     "curl-cffi>=0.15.0",
+    "duckdb>=1.0.0",
     "redis>=5.0",
     "certifi>=2024.2.2",
     "pika>=1.3",                  # 监控上报 / 面板（paperlite-monitor）；未启用 [monitor] 时不会被导入
