@@ -57,6 +57,7 @@ def _configured_run_args(args, run: RunConfig, config: str | None = None):
         db=None, storage=None,
         urls=run.urls or None, type=run.url_type, workers=run.workers,
         curl=run.mode == "curl", browser=run.mode == "browser",
+        auto=run.mode == "auto", rules=getattr(run, "rules", "domain_rules.toml"),
         no_proxy=not run.proxy, headed=run.headed,
     )
 
@@ -334,8 +335,9 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
         raise SystemExit(str(e))
     if reclaimed:
         logger.info("上次中断残留的 %d 个 running 任务已放回 pending", reclaimed)
+    rules_file = getattr(args, "rules", "domain_rules.toml") if getattr(args, "auto", False) else None
     try:
-        pool = BrowserPool(cfg, proxy, db, out, args.workers, no_proxy=no_proxy)
+        pool = BrowserPool(cfg, proxy, db, out, args.workers, no_proxy=no_proxy, rules=rules_file)
     except ValueError as e:
         db.close()
         raise SystemExit(str(e))
@@ -514,6 +516,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     g = p.add_mutually_exclusive_group()
     g.add_argument("--browser", action="store_true", help="浏览器模式（默认）：每浏览器+IP 过盾一次后连续下、整页存 .html；可混多主机、能跟跳转")
     g.add_argument("--curl", action="store_true", help="curl 模式：浏览器过盾存 cookie、curl 批量下，省资源；须单主机")
+    g.add_argument("--auto", action="store_true", help="自适应模式：结合 domain_rules.toml 自动对 curl 友好站点直连秒下，对强风控站点走无头浏览器")
+    p.add_argument("--rules", default="domain_rules.toml", help="自适应分流规则文件，默认 domain_rules.toml")
     p.add_argument("--no-proxy", action="store_true", help="仅浏览器模式：直连本机 IP、不取代理（本地测试，无需代理配置）")
     p.add_argument("--headed", action="store_true", help="仅浏览器模式：有界面运行（调试）")
     p = cmd("status")

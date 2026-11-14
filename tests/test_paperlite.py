@@ -1377,7 +1377,7 @@ class CliArgsTest(unittest.TestCase):
         self.assertEqual(
             set(_COMMANDS),
             {"init", "import", "run", "produce", "download", "status",
-             "inspect", "retry", "export", "turnstile", "help"},
+             "inspect", "retry", "export", "turnstile", "preprocess", "resolve", "audit", "help"},
         )
         # 每个命令都建了子解析器（help 自身也在内）
         self.assertEqual(set(self.parsers), set(_COMMANDS))

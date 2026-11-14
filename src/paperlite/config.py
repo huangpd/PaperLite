@@ -130,12 +130,13 @@ class RunConfig:
     """paperlite run config.toml（或裸 paperlite）启动时采用的参数。command 为空则裸命令只显示帮助。"""
 
     command: str = ""
-    mode: str = "browser"             # 默认浏览器模式（可混多主机）；curl 为单主机 cookie 池
+    mode: str = "browser"             # 默认浏览器模式（可混多主机）；curl 为单主机 cookie 池；auto 为自适应路由
     proxy: bool = True
     workers: int = 20
     urls: str = ""
     url_type: str = "pdf"
     headed: bool = False
+    rules: str = "domain_rules.toml"  # 路由规则文件路径（auto 模式下自动分流）
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "RunConfig":
@@ -143,14 +144,14 @@ class RunConfig:
         cfg = cls(**raw)
         if cfg.command not in ("", "run"):
             raise ValueError("[run] command 目前只支持 run")
-        if cfg.mode not in ("browser", "curl"):
-            raise ValueError("[run] mode 必须是 browser 或 curl")
+        if cfg.mode not in ("browser", "curl", "auto"):
+            raise ValueError("[run] mode 必须是 browser, curl 或 auto")
         if cfg.workers < 1:
             raise ValueError("[run] workers 必须大于 0")
         if cfg.url_type not in ("pdf", "html"):
             raise ValueError("[run] url_type 必须是 pdf 或 html")
-        if not cfg.proxy and cfg.mode != "browser":
-            raise ValueError("[run] proxy = false 只支持 browser 模式")
+        if not cfg.proxy and cfg.mode not in ("browser", "auto"):
+            raise ValueError("[run] proxy = false 只支持 browser 或 auto 模式")
         return cfg
 
 

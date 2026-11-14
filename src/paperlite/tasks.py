@@ -554,6 +554,20 @@ class TaskDB:
             rows = self._conn.execute("SELECT status, count(*) FROM paper_pdf_resources GROUP BY status").fetchall()
         return {s: 0 for s in Status.ALL} | {r[0]: r[1] for r in rows}
 
+    def has_claimable(self) -> bool:
+        """是否存在 status='pending' 且未被标记 (flag IS NULL) 的可认领任务。"""
+        with self._lock:
+            return bool(self._conn.execute(
+                "SELECT 1 FROM paper_pdf_resources WHERE status = 'pending' AND flag IS NULL LIMIT 1"
+            ).fetchone())
+
+    def running_count(self) -> int:
+        """当前处于 running 状态的任务数。"""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT count(*) FROM paper_pdf_resources WHERE status = 'running'"
+            ).fetchone()[0]
+
     def kind_counts(self) -> list[tuple[str, str, int, int]]:
         """[(status, error_kind, 条数, 其中按卷期推断的条数)]"""
         with self._lock:

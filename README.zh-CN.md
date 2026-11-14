@@ -9,8 +9,10 @@
 PaperLite 是一个面向大批量场景的 PDF 与网页下载工具，适用于部署在 Cloudflare 等反爬防护之后的站点。它通过轮换的短效代理驱动真实浏览器，将每个任务持久化到本地 SQLite 数据库，中断后可从断点继续。
 
 - **一份配置即一个批次**：任意多个主机的 URL 导入同一个任务库，统一调度。
+- **自适应混合模式（推荐）**：结合体检规则 `domain_rules.toml`，对静态友好域名（Springer等）毫秒级 cURL 直下，对强风控域名无缝切换真实无头浏览器动态解盾。
 - **默认浏览器模式**：每个 worker 独占一个浏览器和一个 IP，过盾一次后连续下载；自动跟随跳转，可保存 PDF 或完整 HTML 页面。
 - **可续跑、可追溯**：任务状态、错误分类和每次尝试的指标均存于 SQLite；`Ctrl+C` 会把在途任务放回队列。
+- **动态生命周期切片认领**：基于出口 IP 真实剩余寿命（Lease）自适应领取任务切片（Chunk），单事务批量认领，换 IP 或异常中断时 0 延迟安全回滚。
 - **自我保护**：代理体检、IP 中途失效自动换 IP、代理配额耗尽时熔断，以及跳过失效页或重复内容的启发式规则。
 - **可选的集群监控**：各终端把指标上报到 RabbitMQ，由内置面板跨机器汇总展示。
 
@@ -20,6 +22,7 @@ PaperLite 是一个面向大批量场景的 PDF 与网页下载工具，适用�
 - [环境要求](#环境要求)
 - [安装](#安装)
 - [快速开始](#快速开始)
+- [自适应与预处理流水线](#自适应与预处理流水线)
 - [配置](#配置)
 - [命令参考](#命令参考)
 - [运维](#运维)
@@ -32,15 +35,15 @@ PaperLite 是一个面向大批量场景的 PDF 与网页下载工具，适用�
 
 ## 工作原理
 
-PaperLite 有两种运行模式，共用同一套任务库、存储布局和命令。
+PaperLite 提供自适应模式、纯浏览器模式与 curl 模式三种运行形态，共用同一套任务库、存储布局和运维命令。
 
-| | 浏览器模式（默认） | curl 模式（`--curl`） |
-|---|---|---|
-| 工作方式 | N 个 worker，各自独占浏览器与 IP | 浏览器过盾后把 cookie 存入身份池，`curl_cffi` 线程领用下载 |
-| 每批次主机数 | 任意混合 | 仅限一个 |
-| 跳转 / 网页 | 自动跟随，网页保存为 `.html` | 以 PDF 为主 |
-| 外部依赖 | 无 | Redis（身份池） |
-| 适用场景 | 来源混杂的 URL 列表 | 单站点海量任务、追求单 IP 吞吐 |
+| | 自适应模式 (`auto`，推荐) | 浏览器模式 (`browser`，默认) | curl 模式 (`--curl`) |
+|---|---|---|---|
+| 工作方式 | 结合 `domain_rules.toml` 静态站点秒级直下、强风控站点无头浏览器动态过盾 | N 个 worker，各自独占浏览器与 IP | 浏览器过盾后把 cookie 存入身份池，`curl_cffi` 线程领用下载 |
+| 每批次主机数 | 任意多主机混合（自动路由分流） | 任意混合 | 仅限一个 |
+| 跳转 / 网页 | 智能自动嗅探与识别，保存 `.html` / `.pdf` | 自动跟随，网页保存为 `.html` | 以 PDF 为主 |
+| 外部依赖 | 无（免 Redis） | 无 | Redis（身份池） |
+| 吞吐表现 | 极致兼顾：静态页 0.2s，盾页 100% 成功 | 稳定穿透，单机 2~20 并发 | 单站点海量任务、追求单 IP 吞吐 |
 
 `[paths]` 中的两个位置相互独立：
 
@@ -96,6 +99,94 @@ paperlite run config.toml
 
 > **建议**：每次运行都写进配置文件，而不是堆在命令行上。配置文件记录了批次使用的任务库、模式和输出位置，重跑、换机器、交接都可以照着它复现。
 
+## 自适应与预处理流水线
+
+面对百万级、跨数十家出版商的混合任务，PaperLite 提供了两阶段预处理子系统与自适应执行引擎：
+
+```
+[原始任务集 (如 195 万 DOI)] 
+         │ 
+         ▼ (DuckDB 向量化聚类: 0.22 秒聚类出代表族群)
+   [阶段一: resolve] ───轻量并发探查落地域名───► [doi_domain_routes (映射库)]
+         │ 
+         ▼ 
+   [阶段二: audit]   ───双视角反爬体检定级─────► [domain_rules.toml (分流规则)]
+         │ 
+         ▼ 
+   [自适应执行: paperlite run (mode="auto")]
+     ├─ curl_direct (Springer 等) ──► 0.2s 极速 cURL 直下
+     └─ browser_only (Cell/SD 等)  ──► CloakBrowser 智能过盾渲染
+```
+
+### 1. 运行预处理（一键生成路由快照）
+
+```bash
+# 全流程一键体检生成规则
+paperlite preprocess --urls raw_dois.csv --out-rules domain_rules.toml
+
+# 或拆分为两阶段分别执行：
+# 阶段一：基于 DuckDB 极速聚类并嗅探落地域名（200 万数据几分钟内嗅探完毕）
+paperlite resolve --urls raw_dois.csv --out-map doi_routes.db --concurrency 6
+
+# 阶段二：对嗅探出的独立域名进行双视角反爬体检（无需逐篇排查，仅测独立域名）
+paperlite audit --map doi_routes.db --out-rules domain_rules.toml
+```
+
+生成的 `domain_rules.toml` 结构清晰易读，支持人工自定义覆盖：
+
+```toml
+[modes.curl_direct]
+domains = ["link.springer.com", "linkinghub.elsevier.com"]
+
+[modes.curl_pool]
+domains = ["academic.oup.com", "www.sciencedirect.com"]
+
+[modes.browser_only]
+domains = ["cell.com", "celltherapyjournal.org", "ajog.org", "ajo.com"]
+
+[overrides]
+# 支持用户随时手动覆盖："my-site.com" = "browser_only"
+```
+
+### 2. 配置与启动自适应批次
+
+在批次配置文件中指定 `mode = "auto"` 即可自动启用混合调度：
+
+```toml
+[paths]
+db      = "db/tasks.db"
+storage = "file/tasks"
+log_dir = "log"
+
+[limits]
+max_browsers = 3
+page_interval_s = [2, 5]
+pass_timeout_s = 45
+
+[run]
+command = "run"
+mode    = "auto"                # 启用自适应模式
+rules   = "domain_rules.toml"   # 加载体检导出的规则快照
+proxy   = false                 # 直连本机网络（生产环境填 true）
+workers = 3
+url_type = "html"
+```
+
+启动命令：
+
+```bash
+paperlite run config.toml
+# 或通过命令行临时覆盖：
+paperlite run --auto --rules domain_rules.toml --workers 3
+```
+
+### 3. 运行机制：生命周期驱动的切片认领（Chunk Leasing）
+
+在自适应与浏览器模式下，PaperLite 采用切片认领机制，彻底解决并发锁争抢与域名穿插问题：
+- **生命周期动态适配**：根据代理 IP 当前剩余秒数（`lease.left()`）智能计算 Worker 可认领的任务数（`min(20, max(1, left_s / 8))`）。
+- **原子事务与保序**：任务入库严格按 `(pattern_key, doi)` 聚类排序，认领时直接在单个 SQLite 事务中完成状态切换与绑定。
+- **零丢失安全回滚**：当 IP 寿命临近、发生网络异常或进程退出时，Worker 本地未消费的切片任务瞬间释放回待下载池，不丢任务、不卡死。
+
 ## 配置
 
 配置文件的查找顺序为：`--config`，其次是环境变量 `PAPERLITE_CONFIG`，最后是当前目录的 `config.toml`。`paperlite init` 生成的模板（[`src/paperlite/config.example.toml`](src/paperlite/config.example.toml)）包含全部配置项及说明。
@@ -105,11 +196,14 @@ paperlite run config.toml
 ```toml
 [run]
 command  = "run"        # 让不带子命令的 paperlite 也按此启动；留空则只打印帮助
-mode     = "browser"    # browser | curl
-proxy    = true         # false 等同于 --no-proxy（仅浏览器模式）
+mode     = "auto"       # auto（自适应推荐） | browser（纯浏览器） | curl（单站cookie池）
+rules    = "domain_rules.toml" # auto 模式下的路由规则快照
+proxy    = true         # false 等同于 --no-proxy（直连本机网络）
 workers  = 20           # 浏览器模式为并发浏览器数，curl 模式为下载线程数
 urls     = "mixed.csv"  # 可选，启动时先导入
-url_type = "pdf"        # pdf | html
+url_type = "html"       # pdf | html
+headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调试
+```
 headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调试
 ```
 
@@ -146,7 +240,10 @@ headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调
 |---|---|
 | `init [--force]` | 生成 `config.toml` 模板 |
 | `import --urls FILE [--type pdf\|html]` | 导入任务。支持一行一个 URL 的文本文件，或含 `url` 列的 CSV（可选 `doi`、`source`、`batch_no`、`url_type` 列）。重复导入不会重置已有任务 |
-| `run [CONFIG] [--urls FILE] [--workers N]` | 下载直至队列清空。默认浏览器模式；`--curl` 切换到 curl 模式；`--no-proxy` 使用本机 IP |
+| `run [CONFIG] [--urls FILE] [--workers N]` | 下载直至队列清空。默认浏览器模式；`--auto` 开启自适应混合路由；`--curl` 切换到 curl 模式；`--no-proxy` 使用本机 IP |
+| `preprocess --urls FILE [--out-rules TOML]` | 全流程预处理：DuckDB 极速聚类、并发跳转嗅探真实域名、双视角反爬体检定级并导出分流规则 |
+| `resolve --urls FILE [--out-map DB]` | 预处理阶段一：聚类代表族群并嗅探落地域名，建档至 SQLite 映射库 |
+| `audit [--map DB] [--out-rules TOML]` | 预处理阶段二：仅对已嗅探的独立域名做双视角反爬体检，导出 `domain_rules.toml` |
 | `produce [--keep N]` | curl 模式：只运行身份生产者（常驻） |
 | `download [--workers N]` | curl 模式：只运行下载线程，需另有生产者在运行 |
 | `status` | 各状态计数、按 `error_kind` 分组的失败数、已停卷期，curl 模式下还包括身份池 |

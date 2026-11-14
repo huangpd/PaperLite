@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
-from paperlite.browser import BrowserSession
+from paperlite.browser import BrowserSession, RenderResult
 from paperlite.config import Limits
 from paperlite.inspect import WindowInspector
 from paperlite.logutil import log_event
@@ -61,7 +61,7 @@ class BrowserPool:
     """N 个 worker 协程并发，每个 worker 独占一个 浏览器+IP，串行领取任务下载。"""
 
     def __init__(self, cfg: Limits, proxy: Optional[ProxySettings], db: TaskDB, out: Path, workers: int,
-                 no_proxy: bool = False) -> None:
+                 no_proxy: bool = False, rules: Optional[str] = None) -> None:
         if workers > cfg.max_browsers:
             logger.info("worker 数 %d 超过 max_browsers %d，按 %d 运行", workers, cfg.max_browsers, cfg.max_browsers)
             workers = cfg.max_browsers
@@ -83,6 +83,12 @@ class BrowserPool:
         self.inspector = (WindowInspector(db, cfg.title_dup_trigger, cfg.rule_min_precision,
                                           cfg.rule_min_support, cfg.title_window_size)
                           if cfg.title_dup_trigger else None)
+        self.rules_path = rules
+        self.routes: dict[str, str] = {}
+        if self.rules_path and Path(self.rules_path).exists():
+            from paperlite.preprocess.store import PreprocessStore
+            self.routes = PreprocessStore.load_route_cache(self.rules_path)
+            logger.info("⚡️ 自适应模式就绪：已加载 %d 条出版商域名路由规则", len(self.routes))
 
     def online(self) -> int:
         """当前开着（已过盾可用）的浏览器数。"""
@@ -135,17 +141,31 @@ class BrowserPool:
                     if left_s < self.cfg.min_left_s:
                         continue                       # 寿命不足跑新切片，触发下轮换 IP
 
-                    # 动态适配生命周期：按当前剩余秒数计算可消费数量（按每篇 8s 估算），上限 50 篇，下限 1 篇
-                    batch_size = min(50, max(1, int((left_s - self.cfg.min_left_s) / 8)))
+                    # 若启用了巡检实时归纳 (title_dup_trigger)，单篇认领以便规则实时拦截；
+                    # 否则动态适配生命周期批量认领切片（按每篇 8s 估算），上限 20 篇，下限 1 篇
+                    if self.cfg.title_dup_trigger:
+                        batch_size = 1
+                    else:
+                        batch_size = min(20, max(1, int((left_s - self.cfg.min_left_s) / 8)))
                     pending_chunk = await asyncio.to_thread(self.db.claim_chunk, name, batch_size)
                     if not pending_chunk:
-                        # 兜底：尝试单篇认领，若仍为空说明所有任务已领完
+                        # 兜底：尝试单篇认领
                         single_task = await asyncio.to_thread(self.db.claim, name)
                         if single_task:
                             pending_chunk = [single_task]
                         else:
-                            self._drained.set()
-                            break
+                            has_more = await asyncio.to_thread(self.db.has_claimable)
+                            running = await asyncio.to_thread(self.db.running_count)
+                            if not has_more and running == 0:
+                                self._drained.set()
+                                break
+                            elif not has_more:
+                                # 无可认领任务，但尚有 worker 在运行任务，等待可能异常放回的任务或顺利收尾
+                                await asyncio.sleep(2)
+                                continue
+                            else:
+                                await asyncio.sleep(0.5)
+                                continue
 
                 task = pending_chunk.pop(0)
                 try:
@@ -235,10 +255,63 @@ class BrowserPool:
         if self.inspector is not None and r.title:
             await asyncio.to_thread(self.inspector.observe, task.doi, task.url, r.title)
 
+    def _resolve_task_host(self, task: Task) -> str:
+        """从数据库映射表或 URL 提取真实落地域名"""
+        try:
+            from paperlite.preprocess.cluster import PatternExtractor
+            _, pk = PatternExtractor.extract(task.doi)
+            with self.db._lock:
+                row = self.db._conn.execute(
+                    "SELECT real_host FROM doi_domain_routes WHERE pattern_key = ?", (pk,)
+                ).fetchone()
+                if row and row[0]:
+                    return row[0].lower()
+        except Exception:
+            pass
+        return (urlsplit(task.url).hostname or "").lower()
+
+    async def _fetch_curl_direct(self, url: str, lease: Lease) -> RenderResult:
+        """对判定为 curl_direct 的站点执行秒级 cURL 抓取，免除启动/渲染无头浏览器的开销"""
+        import re
+        from curl_cffi.requests import AsyncSession
+        t0 = time.monotonic()
+        proxy_url = None
+        if not self.no_proxy and lease and lease.server and self.proxy:
+            proxy_url = self.proxy.url_for(lease.server)
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        try:
+            async with AsyncSession(impersonate="chrome120") as s:
+                resp = await s.get(url, proxies=proxies, timeout=20, allow_redirects=True)
+                m = re.search(r"<title[^>]*>(.*?)</title>", resp.text, re.I | re.S)
+                title = m.group(1).strip() if m else ""
+                elapsed = round(time.monotonic() - t0, 1)
+                return RenderResult(
+                    ok=resp.status_code < 400,
+                    seconds=elapsed,
+                    url=str(resp.url),
+                    status=resp.status_code,
+                    title=title,
+                    html=resp.text,
+                    clicks=0,
+                    waf="none",
+                )
+        except Exception as e:
+            return RenderResult(ok=False, seconds=round(time.monotonic() - t0, 1), error=str(e))
+
     async def _do_task(self, task: Task, session: BrowserSession, lease: Lease, name: str) -> bool:
         """下载一篇；返回 True 表示失败原因是代理网络错误（IP 可能已失效），由 worker 决定是否换 IP。"""
         t0 = time.monotonic()
-        r = await session.render(task.url, self.cfg.pass_timeout_s)
+
+        # 自适应路由分流
+        target_host = self._resolve_task_host(task)
+        mode = self.routes.get(target_host, "browser_only") if self.routes else "browser_only"
+
+        if mode == "curl_direct":
+            logger.info("%s ⚡️ [AUTO 分流] %s (%s) 命中 curl_direct 模式，采用轻量 cURL 直下", name, task.doi, target_host)
+            r = await self._fetch_curl_direct(task.url, lease)
+        else:
+            r = await session.render(task.url, self.cfg.pass_timeout_s)
+
         elapsed = int((time.monotonic() - t0) * 1000)
         host = urlsplit(task.url).hostname or ""
         code = r.status or 200
