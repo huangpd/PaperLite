@@ -83,6 +83,26 @@ class AutoScheduler:
         self.routes: dict[str, str] = dict(routes) if routes is not None else {}
         if not self.routes and Path(self.rules_path).exists():
             self.routes = PreprocessStore.load_route_cache(self.rules_path)
+        self._ip_source: Optional[IpSource] = IpSource(self.proxy) if (self.proxy and not self.no_proxy) else None
+        self._direct_lease: Optional[Lease] = None
+        self._lease_lock = threading.Lock()
+
+    def _get_direct_proxy_url(self) -> Optional[str]:
+        """为 curl_direct 维持一个可用的代理租约（若没有或快到期则从 IpSource 提取一次）。"""
+        if self.no_proxy or not self.proxy or not self._ip_source:
+            return None
+        with self._lease_lock:
+            now = time.time()
+            if self._direct_lease is None or self._direct_lease.left(now) < 30:
+                try:
+                    self._direct_lease = self._ip_source.extract_checked()
+                    logger.info("⚡️ [curl_direct] 提取代理成功: %s (出口 IP: %s, 寿命 %.0fs)",
+                                self._direct_lease.server, self._direct_lease.exit_ip,
+                                self._direct_lease.left())
+                except Exception as e:
+                    logger.warning("⚡️ [curl_direct] 提取代理失败 (%s)，降级为本机直连", e)
+                    return None
+            return self.proxy.url_for(self._direct_lease.server)
 
     def run(self, stop: Optional[threading.Event] = None) -> None:
         stop = stop or threading.Event()
@@ -158,9 +178,7 @@ class AutoScheduler:
                     async def fetch_one(task: Task) -> bool:
                         nonlocal consecutive_blocks
                         t0 = time.monotonic()
-                        proxy_url = None
-                        if not self.no_proxy and self.proxy:
-                            proxy_url = f"{self.proxy.scheme}://{self.proxy.username}:{self.proxy.password}@{self.proxy.api_url}" if self.proxy.username else None
+                        proxy_url = self._get_direct_proxy_url()
                         proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
                         dest = pdf_path(self.out, task.doi, ".html" if task.url_type == "html" else ".pdf")
                         try:
