@@ -621,9 +621,13 @@ class TaskDB:
                             LIMIT 1
                         )
                         WHERE real_host IS NULL AND doi IS NOT NULL
+                          AND EXISTS (
+                              SELECT 1 FROM doi_domain_routes r 
+                              WHERE paper_pdf_resources.doi LIKE r.pattern_key || '%'
+                          )
                     """)
                     updated += cur.rowcount
-                self._conn.execute("""
+                cur_url = self._conn.execute("""
                     UPDATE paper_pdf_resources
                     SET real_host = (
                         CASE 
@@ -635,6 +639,7 @@ class TaskDB:
                     )
                     WHERE real_host IS NULL
                 """)
+                updated += cur_url.rowcount
                 self._conn.execute("COMMIT")
                 return updated
             except Exception:
@@ -659,10 +664,16 @@ class TaskDB:
             sql += " AND error_kind = ?"
             args.append(error_kind)
         with self._lock:
-            n = self._conn.execute(sql, args).rowcount
-            self._conn.execute("DELETE FROM volume_stops WHERE volume NOT IN (SELECT volume FROM paper_pdf_resources "
-                               "WHERE inferred = 1 AND volume IS NOT NULL)")
-            return n
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                n = self._conn.execute(sql, args).rowcount
+                self._conn.execute("DELETE FROM volume_stops WHERE volume NOT IN (SELECT volume FROM paper_pdf_resources "
+                                   "WHERE inferred = 1 AND volume IS NOT NULL)")
+                self._conn.execute("COMMIT")
+                return n
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def reset_stopped_volumes(self) -> tuple[int, int]:
         """
@@ -670,14 +681,20 @@ class TaskDB:
         只重置推断的那部分没用：样本仍在，会立刻满足停止条件、推断的任务永远领不到。返回 (卷期数, 任务数)。
         """
         with self._lock:
-            vols = [r[0] for r in self._conn.execute("SELECT volume FROM volume_stops")]
-            n = 0
-            for v in vols:
-                n += self._conn.execute(
-                    "UPDATE paper_pdf_resources SET status = 'pending', inferred = 0, retry_count = 0, "
-                    "claimed_by = NULL, updated_at = ? WHERE volume = ? AND status = 'non_pdf'", (now_text(), v)).rowcount
-            self._conn.execute("DELETE FROM volume_stops")
-            return len(vols), n
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                vols = [r[0] for r in self._conn.execute("SELECT volume FROM volume_stops")]
+                n = 0
+                for v in vols:
+                    n += self._conn.execute(
+                        "UPDATE paper_pdf_resources SET status = 'pending', inferred = 0, retry_count = 0, "
+                        "claimed_by = NULL, updated_at = ? WHERE volume = ? AND status = 'non_pdf'", (now_text(), v)).rowcount
+                self._conn.execute("DELETE FROM volume_stops")
+                self._conn.execute("COMMIT")
+                return len(vols), n
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def volume_summary(self) -> tuple[int, int]:
         """(被停掉的卷期数, 按卷期推断、未请求的任务数)"""
@@ -687,7 +704,7 @@ class TaskDB:
         return v, n
 
     def rows(self, status: Optional[str] = None):
-        sql = ("SELECT id, doi, volume, url, url_type, final_url, title, status, error_kind, inferred, http_status, file_size, elapsed_ms, "
+        sql = ("SELECT id, doi, volume, url, url_type, real_host, final_url, title, status, error_kind, inferred, http_status, file_size, elapsed_ms, "
                "exit_ip, retry_count, challenge_count, file_path, error_message, updated_at FROM paper_pdf_resources")
         args: tuple = ()
         if status:

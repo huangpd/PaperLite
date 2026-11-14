@@ -187,8 +187,11 @@ class AutoScheduler:
                                 resp = await session.get(task.url, proxies=proxies, timeout=20, allow_redirects=True)
                                 code = resp.status_code
                                 elapsed = int((time.monotonic() - t0) * 1000)
-                                m = re.search(r"<title[^>]*>(.*?)</title>", resp.text, re.I | re.S)
-                                title = m.group(1).strip() if m else ""
+                                title = ""
+                                if code >= 400 or "html" in (resp.headers.get("content-type") or "").lower():
+                                    snippet = resp.text[:4096] if resp.text else ""
+                                    m = re.search(r"<title[^>]*>(.*?)</title>", snippet, re.I | re.S)
+                                    title = m.group(1).strip() if m else ""
                                 is_waf = code in (403, 429) or any(p in title.lower() for p in ("just a moment", "attention required", "security check", "cf-mitigated"))
                                 if is_waf:
                                     consecutive_blocks += 1
@@ -198,7 +201,6 @@ class AutoScheduler:
                                     )
                                     return False
                                 elif code < 400:
-                                    consecutive_blocks = 0
                                     content = resp.content
 
                                     # 1. 若任务期望 PDF，必须校验魔数 %PDF-，防止将 200 HTML 付费墙/摘要页当成 PDF
@@ -223,8 +225,9 @@ class AutoScheduler:
                                     try:
                                         tmp.write_bytes(content)
                                         tmp.replace(dest)
-                                    finally:
+                                    except Exception:
                                         tmp.unlink(missing_ok=True)
+                                        raise
 
                                     await asyncio.to_thread(
                                         self.db.finish, task, Status.SUCCESS, http_status=code,
@@ -248,7 +251,9 @@ class AutoScheduler:
                                 return False
 
                     tasks = [fetch_one(t) for t in chunk]
-                    await asyncio.gather(*tasks)
+                    results = await asyncio.gather(*tasks)
+                    if any(results):
+                        consecutive_blocks = 0
 
                     if consecutive_blocks >= 3:
                         logger.warning(
@@ -264,8 +269,9 @@ class AutoScheduler:
         """针对单个 curl_pool 域名，启动 demand-driven 的 Producer + Downloader 对。"""
         if not self.store:
             try:
-                self.store = IdentityStore(self.cfg.redis_url, self.cfg.key_prefix)
-                self.store.ping()
+                store = IdentityStore(self.cfg.redis_url, self.cfg.key_prefix)
+                store.ping()
+                self.store = store
             except Exception as e:
                 logger.warning("Redis 未连接 (%s)，域名 %s 降级至浏览器池渲染", e, host)
                 self.routes[host] = "browser_only"

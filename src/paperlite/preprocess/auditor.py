@@ -56,7 +56,8 @@ class DifferentialJudge:
         if curl_status != 200:
             return False, 0.0, f"HTTP状态码异常 ({curl_status})"
 
-        if "cf-mitigated" in curl_headers or "access denied" in curl_body.lower():
+        lower_headers = {str(k).lower(): str(v).lower() for k, v in curl_headers.items()}
+        if "cf-mitigated" in lower_headers or "access denied" in curl_body.lower():
             return False, 0.0, "触发 WAF 阻断/质询"
 
         m = re.search(r"<title[^>]*>(.*?)</title>", curl_body, re.I | re.S)
@@ -160,7 +161,10 @@ class DomainAuditor:
             )
         finally:
             if browser:
-                await browser.close()
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     def probe_curl(
         self, url: str, cookies: Optional[dict] = None, ua: Optional[str] = None

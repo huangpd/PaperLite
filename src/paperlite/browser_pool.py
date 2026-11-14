@@ -183,8 +183,9 @@ class BrowserPool:
                     self._live.discard(name)
                     session = await self._discard(session)      # 浏览器可能已坏，下轮重开
                     continue
-                lo, hi = self.cfg.page_interval_s
-                await asyncio.sleep(random.uniform(lo, hi))     # 同域名限速
+                if not net_err:
+                    lo, hi = self.cfg.page_interval_s
+                    await asyncio.sleep(random.uniform(lo, hi))     # 同域名限速
         finally:
             if pending_chunk:
                 await asyncio.to_thread(self.db.release_tasks, pending_chunk)
@@ -324,7 +325,7 @@ class BrowserPool:
                 self.stats.add("failed")      # 满次数判死；否则放回 pending 等后面重试，不计数
             logger.info("%s 渲染失败（第 %d 次%s）%s: %s", name, task.challenge_count + 1,
                         "，判失败" if failed else "，稍后重试", task.url, r.error)
-            return
+            return False
 
         dest = pdf_path(self.out, task.doi, ".html")
         if task.url_type == UrlType.PDF and not getattr(self, "_warned_pdf_type", False):
@@ -338,16 +339,17 @@ class BrowserPool:
             await self._observe(task, r)      # 失效页也进巡检：整批 404 同标题可归纳规则、跳过其余 pending
             self.stats.add("failed")
             logger.info("网页 HTTP %d %s %s", code, task.url, r.title)
-            return
+            return False
 
-        body = r.html.encode("utf-8")
+        body = (r.html or "").encode("utf-8")
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".part")
         try:
             tmp.write_bytes(body)
             tmp.replace(dest)
-        finally:
+        except Exception:
             tmp.unlink(missing_ok=True)
+            raise
         await asyncio.to_thread(self.db.finish, task, Status.SUCCESS, http_status=code, file_path=str(dest),
                                 file_size=len(body), elapsed_ms=elapsed, exit_ip=lease.exit_ip,
                                 title=r.title or None, final_url=r.url or None)
@@ -357,3 +359,4 @@ class BrowserPool:
         log_event(logger, logging.INFO, "page_saved", "页面保存成功",
                   doi=task.doi, target=r.url.rsplit("/", 1)[-1][:40] or r.url,
                   seconds=round(r.seconds, 1), clicks=r.clicks)
+        return False

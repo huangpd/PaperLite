@@ -7,6 +7,7 @@ paperlite.preprocess.store
 支持幂等断点续跑、极速跳过已完成项、以及导出不可变的只读规则文件。
 """
 
+from contextlib import contextmanager
 import datetime
 import logging
 import sqlite3
@@ -25,14 +26,21 @@ class PreprocessStore:
         self.db_path = Path(db_path).resolve()
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextmanager
+    def _conn(self):
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    _get_conn = _conn
 
     def _init_db(self) -> None:
         """初始化 SQLite 模式表"""
-        with self._get_conn() as conn:
+        with self._conn() as conn:
             conn.executescript(
                 """
                 -- 1. DOI 族群模式、代表样本与真实落地域名映射表 (聚类抽样与域名解析统一核心表)
@@ -65,13 +73,15 @@ class PreprocessStore:
     def save_resolved_targets(self, targets: List[ResolvedTarget]) -> None:
         """批量保存或更新已解析的落地域名"""
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with self._get_conn() as conn:
+        valid_targets = [t for t in targets if t.real_host != "error"]
+        with self._conn() as conn:
             conn.executemany(
                 """
                 INSERT INTO doi_domain_routes 
-                (pattern_key, publisher_doi, sample_doi, real_host, final_url, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (pattern_key, publisher_doi, sample_doi, sample_url, real_host, final_url, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pattern_key) DO UPDATE SET
+                    sample_url = coalesce(excluded.sample_url, doi_domain_routes.sample_url),
                     real_host = excluded.real_host,
                     final_url = excluded.final_url,
                     updated_at = excluded.updated_at
@@ -81,15 +91,15 @@ class PreprocessStore:
                         t.pattern_key,
                         t.pattern_key.split("/")[0],
                         t.sample_doi,
+                        f"https://doi.org/{t.sample_doi}" if t.sample_doi else None,
                         t.real_host,
                         t.final_url,
                         now,
                     )
-                    for t in targets
-                    if t.real_host != "error"
+                    for t in valid_targets
                 ],
             )
-        logger.info(f"成功持久化 {len(targets)} 条族群域名映射至 {self.db_path.name}")
+        logger.info(f"成功持久化 {len(valid_targets)} 条有效族群域名映射至 {self.db_path.name}")
 
     def get_existing_patterns(self) -> set[str]:
         """获取已经解析过的 pattern_key 集合 (支持 0 秒跳过)"""

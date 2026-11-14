@@ -285,16 +285,21 @@ def _status(args, cfg) -> None:
 
 def _export(args) -> None:
     db = _open_db(args)
-    rows = db.rows(args.status)
-    out = open(args.file, "w", newline="", encoding="utf-8") if args.file != "-" else sys.stdout
-    w = csv.writer(out)
-    if rows:
-        w.writerow(rows[0].keys())
-    w.writerows(tuple(r) for r in rows)
-    if out is not sys.stdout:
-        out.close()
-        print(f"导出 {len(rows)} 行到 {args.file}")
-    db.close()
+    try:
+        rows = db.rows(args.status)
+        out = open(args.file, "w", newline="", encoding="utf-8") if args.file != "-" else sys.stdout
+        try:
+            w = csv.writer(out)
+            if rows:
+                w.writerow(rows[0].keys())
+            w.writerows(tuple(r) for r in rows)
+            if out is not sys.stdout:
+                print(f"导出 {len(rows)} 行到 {args.file}")
+        finally:
+            if out is not sys.stdout:
+                out.close()
+    finally:
+        db.close()
 
 
 def _turnstile(args, parser) -> None:

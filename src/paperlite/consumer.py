@@ -126,7 +126,7 @@ def rate_limit_wait(headers, identity_left: float, min_left: float) -> Optional[
             delay = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
         except (TypeError, ValueError, OverflowError):
             return None
-    if not 0 <= delay <= _MAX_RATE_LIMIT_WAIT_S or identity_left - delay < min_left:
+    if not 0 < delay <= _MAX_RATE_LIMIT_WAIT_S or identity_left - delay < min_left:
         return None
     return delay
 
@@ -354,8 +354,9 @@ class Downloader:
                 if size < self.cfg.min_file_size:
                     raise BadPdf(f"文件过小（{size} 字节），可能不完整", retry=True)
                 tmp.replace(dest)
-            finally:
+            except Exception:
                 tmp.unlink(missing_ok=True)
+                raise
             return Fetched(resp.status_code, dict(resp.headers), dest, size, b"", str(getattr(resp, "url", "") or url))
         finally:
             try:
@@ -496,8 +497,9 @@ class Downloader:
         try:
             tmp.write_bytes(body)
             tmp.replace(dest)
-        finally:
+        except Exception:
             tmp.unlink(missing_ok=True)
+            raise
         self.db.finish(task, Status.SUCCESS, http_status=code, file_path=str(dest), file_size=len(body),
                        elapsed_ms=elapsed_ms, exit_ip=ident.exit_ip, title=title or None,
                        final_url=final_url or None)

@@ -164,6 +164,18 @@ class TestPreprocess(unittest.TestCase):
                 self.assertEqual(row["real_host"], "www.sciencedirect.com")
                 self.assertTrue(row["sample_url"].startswith("https://doi.org/"))
 
+    def test_differential_judge_case_insensitive_waf(self):
+        gt = GroundTruth(
+            url="https://example.com/article/1",
+            host="example.com",
+            title="Real Paper Title",
+            visible_text_len=15000,
+            abstract_anchor="real abstract content",
+        )
+        ok, score, reason = DifferentialJudge.evaluate(gt, 200, {"Cf-Mitigated": "challenge"}, "content")
+        self.assertFalse(ok)
+        self.assertIn("WAF", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

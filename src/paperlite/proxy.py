@@ -182,6 +182,7 @@ class IpSource:
             c.setopt(CurlOpt.URL, url.encode())
             c.setopt(CurlOpt.PROXY, self.s.url_for(lease.server).encode())
             c.setopt(CurlOpt.WRITEDATA, buf)
+            c.setopt(CurlOpt.CAINFO, certifi.where().encode())
             c.setopt(CurlOpt.FOLLOWLOCATION, 0)
             c.setopt(CurlOpt.CONNECTTIMEOUT_MS, int(self.s.connect_timeout_s * 1000))
             c.setopt(CurlOpt.TIMEOUT_MS, int(self.s.check_timeout_s * 1000))

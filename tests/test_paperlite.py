@@ -495,6 +495,18 @@ class TaskDBTest(unittest.TestCase):
             other.lock_for_download()                                   # 同一个库只允许一个下载进程
         other.close()
 
+    def test_backfill_real_hosts_counts_both_routes_and_urls(self):
+        self.db.import_urls([{"url": "https://example.com/1", "doi": "10.1016/j.test.1"},
+                             {"url": "https://other.com/2", "doi": "10.9999/other.2"}])
+        self.db._conn.execute("CREATE TABLE doi_domain_routes (pattern_key TEXT PRIMARY KEY, real_host TEXT)")
+        self.db._conn.execute("INSERT INTO doi_domain_routes VALUES ('10.1016/j.test', 'www.sciencedirect.com')")
+        self.db._conn.execute("UPDATE paper_pdf_resources SET real_host = NULL")
+        updated = self.db.backfill_real_hosts()
+        self.assertEqual(updated, 2)
+        rows = {r["url"]: r["real_host"] for r in self.db.rows()}
+        self.assertEqual(rows["https://example.com/1"], "www.sciencedirect.com")
+        self.assertEqual(rows["https://other.com/2"], "other.com")
+
 
 class VolumeStopTest(unittest.TestCase):
     def setUp(self):
