@@ -96,10 +96,12 @@ CREATE TABLE IF NOT EXISTS paper_pdf_resources (
     elapsed_ms    INTEGER,
     exit_ip       TEXT,
     claimed_by    TEXT,
+    real_host     TEXT,
     created_at    TEXT    NOT NULL,
     updated_at    TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_claim ON paper_pdf_resources (challenge_count, id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_host_claim ON paper_pdf_resources (real_host, challenge_count, id) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_status ON paper_pdf_resources (status, error_kind);
 CREATE INDEX IF NOT EXISTS idx_volume ON paper_pdf_resources (volume, status) WHERE volume IS NOT NULL;
 CREATE TABLE IF NOT EXISTS volume_stops (
@@ -210,6 +212,8 @@ class TaskDB:
                 self._conn.execute("ALTER TABLE paper_pdf_resources ADD COLUMN title TEXT")
             if cols and "flag" not in cols:
                 self._conn.execute("ALTER TABLE paper_pdf_resources ADD COLUMN flag TEXT")
+            if cols and "real_host" not in cols:
+                self._conn.execute("ALTER TABLE paper_pdf_resources ADD COLUMN real_host TEXT")
             self._conn.executescript(_SCHEMA)
 
     def close(self) -> None:
@@ -368,24 +372,26 @@ class TaskDB:
     _CLAIM_BATCH = 64            # 每次按领取顺序取这么多候选，逐个判卷期能否放行
     _CLAIM_SCAN_MAX = 4096       # 最多看这么多候选；都被卷期限流挡住就返回 None，稍后再领
 
-    def claim(self, worker: str) -> Optional[Task]:
+    def claim(self, worker: str, host: Optional[str] = None) -> Optional[Task]:
         """
-        按 (challenge_count, id) 顺序领一条。卷期还没下到过 PDF 时，在途 + 已判"没有 PDF"的不超过
-        volume_stop_after 篇才放行，其余线程去领别的卷期。
-        候选在 Python 里逐个判：写成一条 SQL 时 SQLite 会把 70 万条 pending 全排一遍再逐条跑子查询，每次领取要几秒。
+        按 (challenge_count, id) 顺序领一条。若指定 host 则只领该主机的任务。
+        卷期还没下到过 PDF 时，在途 + 已判"没有 PDF"的不超过 volume_stop_after 篇才放行，其余线程去领别的卷期。
         """
         n = self.volume_stop_after
+        where_host = " AND real_host = ?" if host else ""
         with self._lock:
             c = self._conn
             allowed: dict[str, bool] = {}
             after_cc, after_id = -1, -1
             scanned = 0
             while scanned < self._CLAIM_SCAN_MAX:
-                rows = c.execute(
-                    "SELECT id, volume, challenge_count FROM paper_pdf_resources INDEXED BY idx_claim "
-                    "WHERE status = 'pending' AND flag IS NULL AND (challenge_count, id) > (?, ?) "
-                    "ORDER BY challenge_count, id LIMIT ?",
-                    (after_cc, after_id, self._CLAIM_BATCH)).fetchall()
+                sql = (
+                    f"SELECT id, volume, challenge_count FROM paper_pdf_resources "
+                    f"WHERE status = 'pending' AND flag IS NULL{where_host} AND (challenge_count, id) > (?, ?) "
+                    f"ORDER BY challenge_count, id LIMIT ?"
+                )
+                args = (host, after_cc, after_id, self._CLAIM_BATCH) if host else (after_cc, after_id, self._CLAIM_BATCH)
+                rows = c.execute(sql, args).fetchall()
                 if not rows:
                     return None
                 for task_id, volume, cc in rows:
@@ -406,29 +412,29 @@ class TaskDB:
                 scanned += len(rows)
             return None
 
-    def claim_chunk(self, worker: str, limit: int = 50) -> list[Task]:
+    def claim_chunk(self, worker: str, limit: int = 50, host: Optional[str] = None) -> list[Task]:
         """
-        批量原子认领连续任务切片。
+        批量原子认领连续任务切片。若指定 host 则只认领该主机的任务。
         按 (challenge_count, id) 顺序提取，在单个 SQLite 事务中直接置为 running 并绑定 worker。
         """
         if limit <= 0:
             return []
+        where_host = " AND real_host = ?" if host else ""
         with self._lock:
             c = self._conn
-            rows = c.execute(
-                """
+            sql = f"""
                 UPDATE paper_pdf_resources 
                 SET status = 'running', claimed_by = ?, updated_at = ?
                 WHERE id IN (
-                    SELECT id FROM paper_pdf_resources INDEXED BY idx_claim
-                    WHERE status = 'pending' AND flag IS NULL
+                    SELECT id FROM paper_pdf_resources
+                    WHERE status = 'pending' AND flag IS NULL{where_host}
                     ORDER BY challenge_count, id
                     LIMIT ?
                 )
                 RETURNING id, doi, url, retry_count, challenge_count, url_type
-                """,
-                (worker, now_text(), limit),
-            ).fetchall()
+            """
+            args = (worker, now_text(), host, limit) if host else (worker, now_text(), limit)
+            rows = c.execute(sql, args).fetchall()
             return [
                 Task(r["id"], r["doi"], r["url"], r["retry_count"], r["challenge_count"], r["url_type"])
                 for r in rows
@@ -554,19 +560,78 @@ class TaskDB:
             rows = self._conn.execute("SELECT status, count(*) FROM paper_pdf_resources GROUP BY status").fetchall()
         return {s: 0 for s in Status.ALL} | {r[0]: r[1] for r in rows}
 
-    def has_claimable(self) -> bool:
-        """是否存在 status='pending' 且未被标记 (flag IS NULL) 的可认领任务。"""
+    def has_claimable(self, host: Optional[str] = None) -> bool:
+        """是否存在指定主机 (未传则全库) status='pending' 且未被标记的可认领任务。"""
+        where_host = " AND real_host = ?" if host else ""
+        args = (host,) if host else ()
         with self._lock:
             return bool(self._conn.execute(
-                "SELECT 1 FROM paper_pdf_resources WHERE status = 'pending' AND flag IS NULL LIMIT 1"
+                f"SELECT 1 FROM paper_pdf_resources WHERE status = 'pending' AND flag IS NULL{where_host} LIMIT 1",
+                args
             ).fetchone())
 
-    def running_count(self) -> int:
-        """当前处于 running 状态的任务数。"""
+    def count_pending_host(self, host: Optional[str] = None) -> int:
+        """指定主机待下载任务数。"""
+        where_host = " AND real_host = ?" if host else ""
+        args = (host,) if host else ()
         with self._lock:
             return self._conn.execute(
-                "SELECT count(*) FROM paper_pdf_resources WHERE status = 'running'"
+                f"SELECT count(*) FROM paper_pdf_resources WHERE status = 'pending' AND flag IS NULL{where_host}",
+                args
             ).fetchone()[0]
+
+    def running_count(self, host: Optional[str] = None) -> int:
+        """当前处于 running 状态的任务数。"""
+        where_host = " AND real_host = ?" if host else ""
+        args = (host,) if host else ()
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT count(*) FROM paper_pdf_resources WHERE status = 'running'{where_host}",
+                args
+            ).fetchone()[0]
+
+    def pending_by_host(self) -> dict[str, int]:
+        """按 real_host 统计 pending 待办任务数。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT coalesce(real_host, 'unknown'), count(*) FROM paper_pdf_resources "
+                "WHERE status = 'pending' AND flag IS NULL GROUP BY 1"
+            ).fetchall()
+            return {r[0]: r[1] for r in rows}
+
+    def backfill_real_hosts(self) -> int:
+        """从 doi_domain_routes 映射表或 URL 回填任务的真实落地域名 real_host。"""
+        with self._lock:
+            has_routes = bool(self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doi_domain_routes'"
+            ).fetchone())
+            updated = 0
+            if has_routes:
+                cur = self._conn.execute("""
+                    UPDATE paper_pdf_resources
+                    SET real_host = (
+                        SELECT r.real_host 
+                        FROM doi_domain_routes r 
+                        WHERE paper_pdf_resources.doi LIKE r.pattern_key || '%'
+                        LIMIT 1
+                    )
+                    WHERE real_host IS NULL AND doi IS NOT NULL
+                """)
+                updated += cur.rowcount
+            self._conn.execute("""
+                UPDATE paper_pdf_resources
+                SET real_host = (
+                    CASE 
+                        WHEN instr(url, '://') > 0 
+                        THEN substr(substr(url, instr(url, '://') + 3), 1, 
+                             instr(substr(url, instr(url, '://') + 3) || '/', '/') - 1)
+                        ELSE NULL 
+                    END
+                )
+                WHERE real_host IS NULL
+            """)
+            self._conn.commit()
+            return updated
 
     def kind_counts(self) -> list[tuple[str, str, int, int]]:
         """[(status, error_kind, 条数, 其中按卷期推断的条数)]"""

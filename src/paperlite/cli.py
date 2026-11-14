@@ -366,6 +366,40 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
                 (time.monotonic() - t0) / 60, s.success, s.failed, s.browsers)
 
 
+def _auto(args, cfg, proxy, no_proxy: bool = False) -> None:
+    """自适应模式：三路动态分流（curl_direct 直下、curl_pool 需求驱动身份池、browser_only 浏览器渲染）。"""
+    from paperlite.scheduler import AutoScheduler
+    db = _open_db(args, create=True)
+    if args.urls:
+        _import(db, args.urls, url_type=args.type)
+    out = _storage_dir(args, _paths(args))
+    try:
+        reclaimed = db.lock_for_download()
+    except RuntimeError as e:
+        raise SystemExit(str(e))
+    if reclaimed:
+        logger.info("上次中断残留的 %d 个 running 任务已放回 pending", reclaimed)
+    store = None
+    try:
+        store = IdentityStore(cfg.redis_url, cfg.key_prefix)
+        store.ping()
+    except Exception:
+        store = None
+    scheduler = AutoScheduler(
+        cfg, proxy, db, out, args.workers,
+        rules_path=getattr(args, "rules", "domain_rules.toml"),
+        store=store, no_proxy=no_proxy
+    )
+    stop = threading.Event()
+    try:
+        scheduler.run(stop)
+    except KeyboardInterrupt:
+        logger.info("中断：在途任务已安全回滚至 pending，可随时继续")
+    finally:
+        stop.set()
+        db.close()
+
+
 def _inspect(args) -> None:
     """巡检：同标题重复到阈值就归纳 doi/url 规则、标记疑似封面的未采任务。"""
     cfg = _limits(args)
@@ -667,6 +701,18 @@ def main() -> None:
             csv_path=args.urls, out_db=args.out_map, out_toml=args.out_rules,
             proxy=args.proxy, concurrency=args.concurrency
         ))
+        return
+
+    if args.cmd == "run" and getattr(args, "auto", False):  # 自适应中间调度模式
+        if args.no_proxy:
+            cfg = _limits(args)
+            proxy = None
+        else:
+            cfg, proxy = _load(args.config)
+        if args.headed:
+            cfg = dataclasses.replace(cfg, headed=True)
+        _require_geoip(cfg)
+        _auto(args, cfg, proxy, no_proxy=args.no_proxy)
         return
 
     if args.cmd == "run" and not args.curl:         # 浏览器模式（默认）

@@ -269,6 +269,20 @@ class IdentityStore:
     def worker_gone(self, host: str, worker: str) -> None:
         self.r.zrem(self._k(host, "workers"), worker)
 
+    # ── 需求反压：下游消费者向生产者公布当前主机的身份需求量 ──────────────
+
+    def set_demand(self, host: str, demand: int, ttl_s: int = 60) -> None:
+        """下游消费者根据任务库剩余待办量与消耗速率，公布该主机的实时身份需求量。"""
+        self.r.set(self._k(host, "demand"), str(max(0, int(demand))), ex=ttl_s)
+
+    def get_demand(self, host: str) -> Optional[int]:
+        """获取下游消费者上报的实时需求量；未显式设置时返回 None（兼容老模式）。"""
+        v = self.r.get(self._k(host, "demand"))
+        return int(v) if v is not None else None
+
+    def clear_demand(self, host: str) -> None:
+        self.r.delete(self._k(host, "demand"))
+
     def _drop(self, host: str, ident_id: str) -> None:
         with self.r.pipeline() as p:
             p.zrem(self._k(host, "ready"), ident_id)

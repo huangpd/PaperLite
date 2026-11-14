@@ -113,9 +113,12 @@ paperlite run config.toml
    [阶段二: audit]   ───双视角反爬体检定级─────► [domain_rules.toml (分流规则)]
          │ 
          ▼ 
-   [自适应执行: paperlite run (mode="auto")]
-     ├─ curl_direct (Springer 等) ──► 0.2s 极速 cURL 直下
-     └─ browser_only (Cell/SD 等)  ──► CloakBrowser 智能过盾渲染
+   [自适应中间调度引擎: AutoScheduler (mode="auto")]
+     ├─ [管线1: curl_direct] (Springer等) ──► 0.2s 极速 cURL 直下（无需浏览器/免Redis）
+     ├─ [管线2: curl_pool]   (ACM/OUP等)   ──► 下游消费拉动生产（Demand-Driven 反压身份池）
+     │                                        • 消费者按待办动态设置 Target
+     │                                        • 生产者严格按需过盾，任务完即停
+     └─ [管线3: browser_only](Cell/AJO等)  ──► CloakBrowser 无头浏览器独占过盾渲染
 ```
 
 ### 1. 运行预处理（一键生成路由快照）
@@ -180,9 +183,16 @@ paperlite run config.toml
 paperlite run --auto --rules domain_rules.toml --workers 3
 ```
 
-### 3. 运行机制：生命周期驱动的切片认领（Chunk Leasing）
+### 3. 运行机制：下游需求拉动生产（Demand-Driven 反压）与切片认领
 
-在自适应与浏览器模式下，PaperLite 采用切片认领机制，彻底解决并发锁争抢与域名穿插问题：
+#### 下游需求驱动生产（Pull-Demand Backpressure）
+在 `curl_pool`（如 ACM、OUP 等）模式下，彻底摒弃了上游盲目提取 IP 开浏览器的无脑生产，改为完全由**下游 cURL 消费者根据待办吞吐动态制导**：
+- **按需拉动**：下游消费者实时感知任务库中该域名的剩余待办量 $P$，动态向 Redis 发布目标需求水位 $\text{Demand} = \min(\text{workers}, \lceil P / 15 \rceil)$。
+- **任务告罄即刻断供**：当待办任务清空（$P \le 0$）或消费者退出时，Demand 瞬间置为 0，上游 Producer 浏览器线程立刻挂起休眠，绝不多消耗 1 个代理 IP。
+- **健康身份放大复用**：单个浏览器过盾产出的 Cookie 寿命通常达 10~30 分钟，由轻量 cURL 消费者在寿命期内连续高并发下载 20~100 篇论文，生产消费比高达 1:50，极致省钱。
+
+#### 浏览器端生命周期切片认领（Chunk Leasing）
+在 `browser_only` 模式下，针对强风控站点：
 - **生命周期动态适配**：根据代理 IP 当前剩余秒数（`lease.left()`）智能计算 Worker 可认领的任务数（`min(20, max(1, left_s / 8))`）。
 - **原子事务与保序**：任务入库严格按 `(pattern_key, doi)` 聚类排序，认领时直接在单个 SQLite 事务中完成状态切换与绑定。
 - **零丢失安全回滚**：当 IP 寿命临近、发生网络异常或进程退出时，Worker 本地未消费的切片任务瞬间释放回待下载池，不丢任务、不卡死。
@@ -202,8 +212,6 @@ proxy    = true         # false 等同于 --no-proxy（直连本机网络）
 workers  = 20           # 浏览器模式为并发浏览器数，curl 模式为下载线程数
 urls     = "mixed.csv"  # 可选，启动时先导入
 url_type = "html"       # pdf | html
-headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调试
-```
 headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调试
 ```
 

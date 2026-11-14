@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Optional
 
 from paperlite.browser import pass_challenge
 from paperlite.config import Limits
@@ -52,7 +53,18 @@ class Producer:
         self._last_pause_log = 0.0
         self.holder = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 
-    def target(self, workers: int) -> int:
+    def target(self, workers: int, demand: Optional[int] = None) -> int:
+        """
+        目标健康身份数：
+        - 若下游消费者通过 Redis 显式上报了需求水位 demand（拉动式/背压模式）：
+          - 若 demand <= 0（待办为空或已做完），目标坚决归零，不生产任何新身份；
+          - 若 demand > 0，目标为 min(demand, workers, max_identities)；
+        - 若未设置 demand（兼容老模式），目标为 clamp(workers, min_identities, max_identities)。
+        """
+        if demand is not None:
+            if demand <= 0:
+                return 0
+            return max(1, min(demand, self.cfg.max_identities, max(1, workers)))
         return max(self.cfg.min_identities, min(self.cfg.max_identities, workers))
 
     async def run(self, stop: threading.Event | None = None) -> None:
@@ -78,23 +90,27 @@ class Producer:
                 if await asyncio.to_thread(self._breaker_open):
                     await asyncio.sleep(_TICK_S * 5)
                     continue
+                demand = await asyncio.to_thread(self.store.get_demand, self.host)
                 st = await asyncio.to_thread(self.store.stats, self.host, self.cfg.refill_before_s)
                 now = time.monotonic()
                 fresh = sum(1 for t0 in self._started.values() if now - t0 < self.cfg.hedge_after_s)
-                want = self.target(st.workers) - st.healthy - fresh
+                tgt = self.target(st.workers, demand)
+                want = tgt - st.healthy - fresh
                 room = self.cfg.max_browsers - len(self._started)
-                for _ in range(max(0, min(want, room))):
-                    self._seq += 1
-                    self._started[self._seq] = now
-                    t = asyncio.create_task(self._produce_one(self._seq))
-                    tasks.add(t)
-                    t.add_done_callback(tasks.discard)
+                if tgt > 0:
+                    for _ in range(max(0, min(want, room))):
+                        self._seq += 1
+                        self._started[self._seq] = now
+                        t = asyncio.create_task(self._produce_one(self._seq))
+                        tasks.add(t)
+                        t.add_done_callback(tasks.discard)
                 if time.monotonic() - last_log > 30:
                     last_log = time.monotonic()
                     stale = sum(1 for t0 in self._started.values() if now - t0 >= self.cfg.hedge_after_s)
-                    logger.info("身份池 %s: 空闲 %d 占用 %d 健康 %d / 目标 %d | 浏览器过盾中 %d（超 %.0fs 的 %d）"
+                    demand_str = f"需求 {demand}" if demand is not None else "无需求限制"
+                    logger.info("身份池 %s: 空闲 %d 占用 %d 健康 %d / 目标 %d (%s) | 浏览器过盾中 %d（超 %.0fs 的 %d）"
                                 "| 累计过盾成功 %d 次、失败 %d 次",
-                                self.host, st.ready, st.inuse, st.healthy, self.target(st.workers),
+                                self.host, st.ready, st.inuse, st.healthy, tgt, demand_str,
                                 len(self._started), self.cfg.hedge_after_s, stale,
                                 self.stats.passed, self.stats.failed)
                 await asyncio.sleep(_TICK_S)

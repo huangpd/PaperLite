@@ -176,9 +176,9 @@ class DownloadStats:
 
 class Downloader:
     def __init__(self, cfg: Limits, store: IdentityStore, proxy: ProxySettings, db: TaskDB,
-                 out_dir: Path, workers: int) -> None:
+                 out_dir: Path, workers: int, host: Optional[str] = None) -> None:
         self.cfg, self.store, self.proxy, self.db = cfg, store, proxy, db
-        self.host = db.host()
+        self.host = host or db.host()
         if not self.host:
             raise ValueError("任务库是空的，先 import")
         db.volume_stop_after = cfg.volume_stop_after
@@ -189,8 +189,23 @@ class Downloader:
         self._browser_slots = threading.BoundedSemaphore(max(1, cfg.max_browsers))   # 网页任务的浏览器兜底并发
         self._worker_prefix = f"{socket.gethostname()}-{os.getpid()}"
 
+    def update_demand(self) -> int:
+        """
+        下游消费者向 Redis 宣告当前主机所需要的有效身份数（Target Demand）。
+        - 若任务库中已无待下载任务，Demand 立即置 0；
+        - 若尚有待下载任务，按 (pending / 15) 动态压降所需身份数，上限为 workers。
+        """
+        pending = self.db.count_pending_host(self.host)
+        if pending <= 0:
+            self.store.set_demand(self.host, 0, ttl_s=30)
+            return 0
+        needed = min(self.workers, max(1, (pending + 14) // 15))
+        self.store.set_demand(self.host, needed, ttl_s=30)
+        return needed
+
     def run(self, stop: Optional[threading.Event] = None) -> DownloadStats:
         stop = stop or threading.Event()
+        self.update_demand()
         # 结束用事件判断，不用 Thread.join()：信号打断 join 后 is_alive() 可能误报已结束
         finished = [threading.Event() for _ in range(self.workers)]
         for i, done in enumerate(finished):
@@ -205,6 +220,8 @@ class Downloader:
             for done in finished:
                 done.wait(max(0.0, deadline - time.monotonic()))
             raise
+        finally:
+            self.store.set_demand(self.host, 0, ttl_s=10)
         return self.stats
 
     # ── 下载线程 ──────────────────────────────────────────────
@@ -218,8 +235,9 @@ class Downloader:
         registered = False
         try:
             while not stop.is_set():
-                if not self.db.has_status(Status.PENDING):
-                    if not self.db.has_status(Status.RUNNING):
+                if not self.db.has_claimable(host=self.host):
+                    self.store.set_demand(self.host, 0, ttl_s=15)
+                    if not self.db.running_count(host=self.host):
                         return
                     # 只剩别的线程的在途任务（可能被放回）：不登记需求，身份还回池里，空等
                     if registered:
@@ -232,6 +250,7 @@ class Downloader:
                     stop.wait(_IDLE_WAIT_S)
                     continue
                 self.store.worker_alive(self.host, worker)
+                self.update_demand()
                 registered = True
                 if ident is None:
                     ident = self.store.claim(self.host, worker, self.cfg.min_left_s, self.cfg.lease_ttl_s)
@@ -247,7 +266,7 @@ class Downloader:
                     self.stats.add("identities")
                     session = self._session(ident)
                     uses = 0
-                task = self.db.claim(worker)
+                task = self.db.claim(worker, host=self.host)
                 if task is None:
                     # 被别的线程抢先领走，或剩下的都在"卷期待核实"（同卷期已有 N 篇在途），稍等再看
                     stop.wait(0.5)
