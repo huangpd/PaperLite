@@ -178,6 +178,7 @@ class Task:
     retry_count: int
     challenge_count: int = 0
     url_type: str = UrlType.PDF
+    real_host: Optional[str] = None
 
 
 class TaskDB:
@@ -226,6 +227,8 @@ class TaskDB:
 
     def lock_for_download(self) -> int:
         """独占本库的下载权；拿不到抛 RuntimeError。返回放回 pending 的残留 running 数。"""
+        if self._lock_file is not None:
+            return 0
         f = open(self.path.with_name(self.path.name + ".lock"), "w")
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -350,7 +353,7 @@ class TaskDB:
             if kind not in UrlType.ALL:
                 raise ValueError(f"url_type 只能是 {' / '.join(UrlType.ALL)}，不是 {kind!r}: {url}")
             batch.append((url_key(url), doi, url, kind, r.get("source") or None, r.get("batch_no") or None,
-                          derive_volume(doi), ts, ts))
+                          derive_volume(doi), (r.get("real_host") or h).lower(), ts, ts))
             seen += 1
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -358,8 +361,8 @@ class TaskDB:
                 self._conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('host', ?)", (host,))
                 before = self._conn.total_changes
                 self._conn.executemany(
-                    "INSERT INTO paper_pdf_resources (url_key, doi, url, url_type, source, batch_no, volume, "
-                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (url_key) DO NOTHING", batch)
+                    "INSERT INTO paper_pdf_resources (url_key, doi, url, url_type, source, batch_no, volume, real_host, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (url_key) DO NOTHING", batch)
                 added = self._conn.total_changes - before
                 self._conn.execute("COMMIT")
             except BaseException:
@@ -378,7 +381,7 @@ class TaskDB:
         卷期还没下到过 PDF 时，在途 + 已判"没有 PDF"的不超过 volume_stop_after 篇才放行，其余线程去领别的卷期。
         """
         n = self.volume_stop_after
-        where_host = " AND real_host = ?" if host else ""
+        where_host = " AND (real_host = ? OR real_host IS NULL)" if host else ""
         with self._lock:
             c = self._conn
             allowed: dict[str, bool] = {}
@@ -403,11 +406,11 @@ class TaskDB:
                     row = c.execute(
                         "UPDATE paper_pdf_resources SET status = 'running', claimed_by = ?, updated_at = ? "
                         "WHERE id = ? AND status = 'pending' "
-                        "RETURNING id, doi, url, retry_count, challenge_count, url_type",
+                        "RETURNING id, doi, url, retry_count, challenge_count, url_type, real_host",
                         (worker, now_text(), task_id)).fetchone()
                     if row:
                         return Task(row["id"], row["doi"], row["url"], row["retry_count"],
-                                    row["challenge_count"], row["url_type"])
+                                    row["challenge_count"], row["url_type"], row["real_host"])
                 after_id, _, after_cc = rows[-1]
                 scanned += len(rows)
             return None
@@ -419,7 +422,7 @@ class TaskDB:
         """
         if limit <= 0:
             return []
-        where_host = " AND real_host = ?" if host else ""
+        where_host = " AND (real_host = ? OR real_host IS NULL)" if host else ""
         with self._lock:
             c = self._conn
             sql = f"""
@@ -431,12 +434,12 @@ class TaskDB:
                     ORDER BY challenge_count, id
                     LIMIT ?
                 )
-                RETURNING id, doi, url, retry_count, challenge_count, url_type
+                RETURNING id, doi, url, retry_count, challenge_count, url_type, real_host
             """
             args = (worker, now_text(), host, limit) if host else (worker, now_text(), limit)
             rows = c.execute(sql, args).fetchall()
             return [
-                Task(r["id"], r["doi"], r["url"], r["retry_count"], r["challenge_count"], r["url_type"])
+                Task(r["id"], r["doi"], r["url"], r["retry_count"], r["challenge_count"], r["url_type"], r["real_host"])
                 for r in rows
             ]
 
@@ -562,7 +565,7 @@ class TaskDB:
 
     def has_claimable(self, host: Optional[str] = None) -> bool:
         """是否存在指定主机 (未传则全库) status='pending' 且未被标记的可认领任务。"""
-        where_host = " AND real_host = ?" if host else ""
+        where_host = " AND (real_host = ? OR real_host IS NULL)" if host else ""
         args = (host,) if host else ()
         with self._lock:
             return bool(self._conn.execute(
@@ -572,7 +575,7 @@ class TaskDB:
 
     def count_pending_host(self, host: Optional[str] = None) -> int:
         """指定主机待下载任务数。"""
-        where_host = " AND real_host = ?" if host else ""
+        where_host = " AND (real_host = ? OR real_host IS NULL)" if host else ""
         args = (host,) if host else ()
         with self._lock:
             return self._conn.execute(
@@ -582,7 +585,7 @@ class TaskDB:
 
     def running_count(self, host: Optional[str] = None) -> int:
         """当前处于 running 状态的任务数。"""
-        where_host = " AND real_host = ?" if host else ""
+        where_host = " AND (real_host = ? OR real_host IS NULL)" if host else ""
         args = (host,) if host else ()
         with self._lock:
             return self._conn.execute(
@@ -602,36 +605,41 @@ class TaskDB:
     def backfill_real_hosts(self) -> int:
         """从 doi_domain_routes 映射表或 URL 回填任务的真实落地域名 real_host。"""
         with self._lock:
-            has_routes = bool(self._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doi_domain_routes'"
-            ).fetchone())
-            updated = 0
-            if has_routes:
-                cur = self._conn.execute("""
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                has_routes = bool(self._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doi_domain_routes'"
+                ).fetchone())
+                updated = 0
+                if has_routes:
+                    cur = self._conn.execute("""
+                        UPDATE paper_pdf_resources
+                        SET real_host = (
+                            SELECT r.real_host 
+                            FROM doi_domain_routes r 
+                            WHERE paper_pdf_resources.doi LIKE r.pattern_key || '%'
+                            LIMIT 1
+                        )
+                        WHERE real_host IS NULL AND doi IS NOT NULL
+                    """)
+                    updated += cur.rowcount
+                self._conn.execute("""
                     UPDATE paper_pdf_resources
                     SET real_host = (
-                        SELECT r.real_host 
-                        FROM doi_domain_routes r 
-                        WHERE paper_pdf_resources.doi LIKE r.pattern_key || '%'
-                        LIMIT 1
+                        CASE 
+                            WHEN instr(url, '://') > 0 
+                            THEN substr(substr(url, instr(url, '://') + 3), 1, 
+                                 instr(substr(url, instr(url, '://') + 3) || '/', '/') - 1)
+                            ELSE NULL 
+                        END
                     )
-                    WHERE real_host IS NULL AND doi IS NOT NULL
+                    WHERE real_host IS NULL
                 """)
-                updated += cur.rowcount
-            self._conn.execute("""
-                UPDATE paper_pdf_resources
-                SET real_host = (
-                    CASE 
-                        WHEN instr(url, '://') > 0 
-                        THEN substr(substr(url, instr(url, '://') + 3), 1, 
-                             instr(substr(url, instr(url, '://') + 3) || '/', '/') - 1)
-                        ELSE NULL 
-                    END
-                )
-                WHERE real_host IS NULL
-            """)
-            self._conn.commit()
-            return updated
+                self._conn.execute("COMMIT")
+                return updated
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def kind_counts(self) -> list[tuple[str, str, int, int]]:
         """[(status, error_kind, 条数, 其中按卷期推断的条数)]"""

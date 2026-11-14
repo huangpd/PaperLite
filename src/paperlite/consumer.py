@@ -198,6 +198,8 @@ class Downloader:
         - 若任务库中已无待下载任务，Demand 立即置 0；
         - 若尚有待下载任务，按 (pending / 15) 动态压降所需身份数，上限为 workers。
         """
+        if not hasattr(self.store, "set_demand"):
+            return 0
         pending = self.db.count_pending_host(self.host)
         if pending <= 0:
             self.store.set_demand(self.host, 0, ttl_s=30)
@@ -224,7 +226,8 @@ class Downloader:
                 done.wait(max(0.0, deadline - time.monotonic()))
             raise
         finally:
-            self.store.set_demand(self.host, 0, ttl_s=10)
+            if hasattr(self.store, "set_demand"):
+                self.store.set_demand(self.host, 0, ttl_s=10)
         return self.stats
 
     # ── 下载线程 ──────────────────────────────────────────────
@@ -239,7 +242,8 @@ class Downloader:
         try:
             while not stop.is_set() and not self._circuit_stop.is_set():
                 if not self.db.has_claimable(host=self.host):
-                    self.store.set_demand(self.host, 0, ttl_s=15)
+                    if hasattr(self.store, "set_demand"):
+                        self.store.set_demand(self.host, 0, ttl_s=15)
                     if not self.db.running_count(host=self.host):
                         return
                     # 只剩别的线程的在途任务（可能被放回）：不登记需求，身份还回池里，空等

@@ -19,7 +19,7 @@ import random
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
@@ -52,9 +52,11 @@ class BrowserStats:
     failed: int = 0
     pages: int = 0           # 成功保存的页数（= success）
     browsers: int = 0        # 累计（重新）过盾启动的浏览器数
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def add(self, name: str) -> None:
-        setattr(self, name, getattr(self, name) + 1)
+        with self.lock:
+            setattr(self, name, getattr(self, name) + 1)
 
 
 class BrowserPool:
@@ -256,18 +258,9 @@ class BrowserPool:
             await asyncio.to_thread(self.inspector.observe, task.doi, task.url, r.title)
 
     def _resolve_task_host(self, task: Task) -> str:
-        """从数据库映射表或 URL 提取真实落地域名"""
-        try:
-            from paperlite.preprocess.cluster import PatternExtractor
-            _, pk = PatternExtractor.extract(task.doi)
-            with self.db._lock:
-                row = self.db._conn.execute(
-                    "SELECT real_host FROM doi_domain_routes WHERE pattern_key = ?", (pk,)
-                ).fetchone()
-                if row and row[0]:
-                    return row[0].lower()
-        except Exception:
-            pass
+        """从 Task 或 URL 提取真实落地域名（优先从 Task 对象内存字段直接读取，彻底免除 SQLite 锁阻塞）"""
+        if task.real_host:
+            return task.real_host.lower()
         return (urlsplit(task.url).hostname or "").lower()
 
     async def _fetch_curl_direct(self, url: str, lease: Lease) -> RenderResult:
