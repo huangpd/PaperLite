@@ -145,7 +145,7 @@ def _import(db: TaskDB, path: str, source: str = "", batch: str = "", url_type: 
         added, existed = db.import_urls(rows)
     except ValueError as e:
         raise SystemExit(str(e))
-    logger.info("导入 %s：新增 %d，已存在 %d（已存在的不重置）", path, added, existed)
+    logger.info("导入 %s：新增 %d（任务类型: %s），已存在 %d（已存在的不重置）", path, added, url_type, existed)
 
 
 class _ProducerThread:

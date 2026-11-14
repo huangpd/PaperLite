@@ -334,6 +334,9 @@ class BrowserPool:
             return
 
         dest = pdf_path(self.out, task.doi, ".html")
+        if task.url_type == UrlType.PDF and not getattr(self, "_warned_pdf_type", False):
+            self._warned_pdf_type = True
+            logger.warning("⚠️ 任务 url_type 为 'pdf'，但 BrowserPool 浏览器渲染管线保存的是页面 HTML 快照 (.html)。若需要真实 PDF 二进制文件，请使用 curl 模式或在导入时显式指定 --type html")
         if code >= 400:
             kind = "not_found" if code in (404, 410) else None
             await asyncio.to_thread(self.db.finish, task, Status.FAILED, http_status=code, elapsed_ms=elapsed,

@@ -199,11 +199,32 @@ class AutoScheduler:
                                     return False
                                 elif code < 400:
                                     consecutive_blocks = 0
+                                    content = resp.content
+
+                                    # 1. 若任务期望 PDF，必须校验魔数 %PDF-，防止将 200 HTML 付费墙/摘要页当成 PDF
+                                    from paperlite.consumer import pdf_offset
+                                    if task.url_type == "pdf" and pdf_offset(content[:1024]) is None:
+                                        logger.info("⚠️ [直连] %s 返回 HTTP %d 但非 PDF 二进制内容 (记为 NON_PDF): %s",
+                                                    task.doi, code, title[:30])
+                                        await asyncio.to_thread(
+                                            self.db.finish, task, Status.NON_PDF, http_status=code,
+                                            file_size=len(content), elapsed_ms=elapsed, title=title or None,
+                                            error_kind="not_pdf", final_url=str(resp.url)
+                                        )
+                                        return False
+
+                                    # 2. 原子写入落盘 (.part 临时文件)
                                     dest.parent.mkdir(parents=True, exist_ok=True)
-                                    dest.write_bytes(resp.content)
+                                    tmp = dest.with_name(dest.name + ".part")
+                                    try:
+                                        tmp.write_bytes(content)
+                                        tmp.replace(dest)
+                                    finally:
+                                        tmp.unlink(missing_ok=True)
+
                                     await asyncio.to_thread(
                                         self.db.finish, task, Status.SUCCESS, http_status=code,
-                                        file_path=str(dest), file_size=len(resp.content),
+                                        file_path=str(dest), file_size=len(content),
                                         elapsed_ms=elapsed, title=title or None, final_url=str(resp.url)
                                     )
                                     logger.info("⚡️ [直连秒下] %s (%d ms) %s", task.doi, elapsed, title[:30])
