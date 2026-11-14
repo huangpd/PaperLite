@@ -664,7 +664,8 @@ class ProducerReplayTest(unittest.TestCase):
         producer = Producer(Limits(), mock.Mock(), ips, "dl.acm.org")
         cases = [
             (Resp(200, b"<title>Paper</title>"), True),
-            (Resp(429, b"<title>Access denied | Cloudflare</title>", {"server": "cloudflare"}), None),
+            (Resp(429, b"<title>Access denied | Cloudflare</title>", {"server": "cloudflare"}), False),
+            (Resp(429, b"<title>Too Many Requests</title>"), None),
             (Resp(403, b"<title>Attention Required</title>", {"cf-mitigated": "challenge"}), False),
         ]
         for response, expected in cases:
@@ -684,7 +685,7 @@ class ProducerReplayTest(unittest.TestCase):
         session = mock.MagicMock()
         session.__enter__.return_value = session
         session.get.side_effect = [
-            Resp(429, b"<title>Access denied</title>", {"retry-after": "2", "server": "cloudflare"}),
+            Resp(429, b"<title>Too Many Requests</title>", {"retry-after": "2"}),
             Resp(200, b"<title>ACM Digital Library</title>"),
         ]
         with mock.patch.object(producer_mod, "session_for_identity", return_value=session), \

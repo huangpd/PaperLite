@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 from typing import Dict, List, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 from curl_cffi.requests import AsyncSession
 
@@ -78,6 +78,21 @@ class DomainResolver:
                     if m_red:
                         final_real_url = unquote(m_red.group(1))
                         final_host = urlparse(final_real_url).netloc.lower()
+                        return ResolvedTarget(
+                            pattern_key=sample.pattern_key,
+                            sample_doi=sample.doi,
+                            real_host=final_host,
+                            final_url=final_real_url,
+                            has_meta_refresh=True,
+                        )
+
+                # 检查标准 HTML <meta http-equiv="refresh" content="...; url=..."> 跳转
+                m_meta = _META_REFRESH_URL_RE.search(resp.text)
+                if m_meta:
+                    raw_target = unquote(m_meta.group(1).strip().strip("'\""))
+                    final_real_url = urljoin(curr_url, raw_target)
+                    final_host = urlparse(final_real_url).netloc.lower()
+                    if final_host:
                         return ResolvedTarget(
                             pattern_key=sample.pattern_key,
                             sample_doi=sample.doi,

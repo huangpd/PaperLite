@@ -59,8 +59,8 @@ testpaths = ["tests"]
 # 以下三个文件依赖 experiments/ 目录（未纳入仓库）的模块，
 # 收集时会立即 ImportError，故从常规 pytest 运行中排除。
 # 若将来 experiments/ 模块补齐，可删除此 ignore 列表。
-ignore = [
-    "tests/test_container_prior.py",
-    "tests/test_metadata_features.py",
-    "tests/test_title_risk.py",
+addopts = [
+    "--ignore=tests/test_container_prior.py",
+    "--ignore=tests/test_metadata_features.py",
+    "--ignore=tests/test_title_risk.py",
 ]

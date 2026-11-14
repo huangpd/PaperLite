@@ -374,7 +374,7 @@ class Downloader:
                     got = self._fetch_page(task.url, ident, session, dest)
                 else:
                     got = self._fetch(task.url, ident, session, dest)
-                if got.code == 429:
+                if got.code == 429 and not is_cf_denied(got.code, got.headers, got.body):
                     delay = rate_limit_wait(got.headers, ident.left(), self.cfg.min_left_s)
                     if attempt == 1 and delay is not None:
                         logger.info("HTTP 429 %s，等待 %.0fs 后沿用身份重试: %s", ident.exit_ip, delay, task.url)

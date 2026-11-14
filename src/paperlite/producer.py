@@ -61,10 +61,10 @@ class Producer:
           - 若 demand > 0，目标为 min(demand, workers, max_identities)；
         - 若未设置 demand（兼容老模式），目标为 clamp(workers, min_identities, max_identities)。
         """
-        if demand is not None:
+        if isinstance(demand, (int, float)):
             if demand <= 0:
                 return 0
-            return max(1, min(demand, self.cfg.max_identities, max(1, workers)))
+            return max(1, min(int(demand), self.cfg.max_identities, max(1, workers)))
         return max(self.cfg.min_identities, min(self.cfg.max_identities, workers))
 
     async def run(self, stop: threading.Event | None = None) -> None:

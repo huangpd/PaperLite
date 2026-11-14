@@ -10,10 +10,13 @@ paperlite.preprocess.auditor
 import asyncio
 import logging
 import re
+import time
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 from curl_cffi import requests as cf_requests
+
+from paperlite.browser import browser_env
 
 from paperlite.preprocess.models import DomainAuditResult, GroundTruth, RouteMode
 from paperlite.turnstile import TurnstileClicker
@@ -102,6 +105,7 @@ class DomainAuditor:
                 proxy=browser_proxy,
                 stealth_args=False,
                 args=args + ["--disable-dev-shm-usage", "--window-size=1440,900"],
+                env=browser_env(),
             )
             context = await browser.new_context()
             page = await context.new_page()
@@ -109,8 +113,9 @@ class DomainAuditor:
 
             await page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout_s * 1000))
 
-            # 等待过盾或加载稳定
-            for _ in range(30):
+            # 等待过盾或加载稳定 (遵守配置的超时时间)
+            deadline = time.monotonic() + self.timeout_s
+            while time.monotonic() < deadline:
                 await asyncio.sleep(1)
                 t = (await page.title()).strip()
                 if not any(p in t.lower() for p in GENERIC_PLACEHOLDERS) and t:

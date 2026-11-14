@@ -381,7 +381,7 @@ class TaskDB:
         卷期还没下到过 PDF 时，在途 + 已判"没有 PDF"的不超过 volume_stop_after 篇才放行，其余线程去领别的卷期。
         """
         n = self.volume_stop_after
-        where_host = " AND (real_host = ? OR real_host IS NULL)" if host else ""
+        where_host = " AND real_host = ?" if host else ""
         with self._lock:
             c = self._conn
             allowed: dict[str, bool] = {}
@@ -422,7 +422,7 @@ class TaskDB:
         """
         if limit <= 0:
             return []
-        where_host = " AND (real_host = ? OR real_host IS NULL)" if host else ""
+        where_host = " AND real_host = ?" if host else ""
         with self._lock:
             c = self._conn
             sql = f"""
@@ -565,7 +565,7 @@ class TaskDB:
 
     def has_claimable(self, host: Optional[str] = None) -> bool:
         """是否存在指定主机 (未传则全库) status='pending' 且未被标记的可认领任务。"""
-        where_host = " AND (real_host = ? OR real_host IS NULL)" if host else ""
+        where_host = " AND real_host = ?" if host else ""
         args = (host,) if host else ()
         with self._lock:
             return bool(self._conn.execute(
@@ -575,7 +575,7 @@ class TaskDB:
 
     def count_pending_host(self, host: Optional[str] = None) -> int:
         """指定主机待下载任务数。"""
-        where_host = " AND (real_host = ? OR real_host IS NULL)" if host else ""
+        where_host = " AND real_host = ?" if host else ""
         args = (host,) if host else ()
         with self._lock:
             return self._conn.execute(
@@ -585,7 +585,7 @@ class TaskDB:
 
     def running_count(self, host: Optional[str] = None) -> int:
         """当前处于 running 状态的任务数。"""
-        where_host = " AND (real_host = ? OR real_host IS NULL)" if host else ""
+        where_host = " AND real_host = ?" if host else ""
         args = (host,) if host else ()
         with self._lock:
             return self._conn.execute(

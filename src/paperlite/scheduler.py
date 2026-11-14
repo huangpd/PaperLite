@@ -180,7 +180,7 @@ class AutoScheduler:
                         nonlocal consecutive_blocks
                         async with semaphore:
                             t0 = time.monotonic()
-                            proxy_url = self._get_direct_proxy_url()
+                            proxy_url = await asyncio.to_thread(self._get_direct_proxy_url)
                             proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
                             dest = pdf_path(self.out, task.doi, ".html" if task.url_type == "html" else ".pdf")
                             try:
@@ -194,7 +194,7 @@ class AutoScheduler:
                                     consecutive_blocks += 1
                                     await asyncio.to_thread(
                                         self.db.retry_later, task, count=False,
-                                        error_kind="waf_challenge", error_message=f"HTTP {code} / WAF质询: {title[:60]}"
+                                        error_kind="challenge_failed", error_message=f"HTTP {code} / WAF质询: {title[:60]}"
                                     )
                                     return False
                                 elif code < 400:
@@ -204,12 +204,16 @@ class AutoScheduler:
                                     # 1. 若任务期望 PDF，必须校验魔数 %PDF-，防止将 200 HTML 付费墙/摘要页当成 PDF
                                     from paperlite.consumer import pdf_offset
                                     if task.url_type == "pdf" and pdf_offset(content[:1024]) is None:
-                                        logger.info("⚠️ [直连] %s 返回 HTTP %d 但非 PDF 二进制内容 (记为 NON_PDF): %s",
-                                                    task.doi, code, title[:30])
+                                        from paperlite.classify import classify_html
+                                        kind = classify_html(content.decode("utf-8", "replace")) if content else "landing_page"
+                                        if kind not in ("not_found", "paywall", "landing_page"):
+                                            kind = "landing_page"
+                                        logger.info("⚠️ [直连] %s 返回 HTTP %d 但非 PDF 二进制内容 (记为 %s): %s",
+                                                    task.doi, code, kind, title[:30])
                                         await asyncio.to_thread(
                                             self.db.finish, task, Status.NON_PDF, http_status=code,
                                             file_size=len(content), elapsed_ms=elapsed, title=title or None,
-                                            error_kind="not_pdf", final_url=str(resp.url)
+                                            error_kind=kind, final_url=str(resp.url)
                                         )
                                         return False
 
@@ -252,6 +256,8 @@ class AutoScheduler:
                             host, consecutive_blocks,
                         )
                         self.routes[host] = "browser_only"
+                        with self._lease_lock:
+                            self._direct_lease = None  # 重置可能被封的代理 IP
                         break
 
     def _run_curl_pool_host(self, host: str, stop: threading.Event) -> bool:
