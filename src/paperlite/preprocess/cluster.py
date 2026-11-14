@@ -84,7 +84,7 @@ class DuckDBClusterer:
     def cluster_and_sample(self, out_sqlite: Optional[str] = None) -> Dict[str, DoiSample]:
         """
         利用 DuckDB 向量化 SQL 极速聚合聚类并抽取种子样本。
-        若指定 out_sqlite，则直接原子回写至 SQLite 的 doi_clusters 表。
+        若指定 out_sqlite，则直接原子回写至 SQLite 的 doi_domain_routes 表。
         返回 Dict[pattern_key, DoiSample]。
         """
         import time
@@ -162,31 +162,38 @@ class DuckDBClusterer:
         t1 = time.time()
         logger.info(f"🎉 DuckDB 聚类抽样完成！耗时: {t1 - t0:.2f} 秒，共提炼出 {len(rows)} 个独立族群分类")
 
-        # 3. 若指定了输出 SQLite 库，直接批量写入 doi_clusters 表
+        # 3. 若指定了输出 SQLite 库，直接批量写入 doi_domain_routes 表
         if out_sqlite:
             out_p = str(Path(out_sqlite).resolve())
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 con.execute(f"ATTACH '{out_p}' AS out_sqlite (TYPE SQLITE);")
                 con.execute("""
-                    CREATE TABLE IF NOT EXISTS out_sqlite.doi_clusters (
+                    CREATE TABLE IF NOT EXISTS out_sqlite.doi_domain_routes (
                         pattern_key TEXT PRIMARY KEY,
                         publisher_doi TEXT,
                         paper_count BIGINT,
                         sample_doi TEXT,
                         sample_url TEXT,
+                        real_host TEXT,
+                        final_url TEXT,
                         updated_at TEXT
                     );
                 """)
-                # 写入聚合结果
+                # 写入聚合聚类结果 (若记录已存在则更新统计与样本，保留可能已嗅探出的 real_host/final_url)
                 con.executemany("""
-                    INSERT OR REPLACE INTO out_sqlite.doi_clusters 
+                    INSERT INTO out_sqlite.doi_domain_routes 
                     (pattern_key, publisher_doi, paper_count, sample_doi, sample_url, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?);
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(pattern_key) DO UPDATE SET
+                        paper_count = excluded.paper_count,
+                        sample_doi = excluded.sample_doi,
+                        sample_url = excluded.sample_url,
+                        updated_at = excluded.updated_at;
                 """, [(r[0], r[1], r[2], r[3], r[4], now_str) for r in rows])
                 logger.info(f"✅ 族群分类已成功持久化至 SQLite: {out_p} (共 {len(rows)} 行)")
             except Exception as e:
-                logger.warning(f"写入 SQLite doi_clusters 表时触发警告: {e}")
+                logger.warning(f"写入 SQLite doi_domain_routes 表时触发警告: {e}")
 
         # 4. 组装为高层 DoiSample 对象供下游调度
         samples: Dict[str, DoiSample] = {}

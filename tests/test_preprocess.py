@@ -133,11 +133,36 @@ class TestPreprocess(unittest.TestCase):
             self.assertIn("10.1002/adma", samples)
             self.assertIn("10.1109", samples)
 
-            # 验证回写 SQLite
+            # 验证回写 SQLite 统一表 doi_domain_routes
             store = PreprocessStore(str(out_sqlite))
             clusters = store.get_cluster_samples()
             self.assertEqual(len(clusters), 4)
             self.assertEqual(clusters["10.1016/j.cej"].doi, "10.1016/j.cej.2025.1001")
+
+            # 初始状态下尚未嗅探 real_host，已有 pattern 集合应为空
+            self.assertEqual(len(store.get_existing_patterns()), 0)
+
+            # 嗅探解析后回填真实落地域名
+            target = ResolvedTarget(
+                pattern_key="10.1016/j.cej",
+                sample_doi="10.1016/j.cej.2025.1001",
+                real_host="www.sciencedirect.com",
+                final_url="https://www.sciencedirect.com/science/article/pii/S138589472500001X",
+            )
+            store.save_resolved_targets([target])
+
+            # 验证解析后的集合与字段完整性 (既有聚类 paper_count，又有解析后的 real_host)
+            existing = store.get_existing_patterns()
+            self.assertIn("10.1016/j.cej", existing)
+
+            with store._get_conn() as conn:
+                row = conn.execute(
+                    "SELECT paper_count, real_host, sample_url FROM doi_domain_routes WHERE pattern_key = ?",
+                    ("10.1016/j.cej",),
+                ).fetchone()
+                self.assertEqual(row["paper_count"], 2)  # 2 条 10.1016/j.cej
+                self.assertEqual(row["real_host"], "www.sciencedirect.com")
+                self.assertTrue(row["sample_url"].startswith("https://doi.org/"))
 
 
 if __name__ == "__main__":

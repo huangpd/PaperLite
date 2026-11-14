@@ -40,7 +40,7 @@ flowchart TD
     subgraph 阶段一: 映射建档 (Resolve)
         Step1["DuckDB 向量化聚类<br/>(秒级收敛为数千个代表族群)"] --> Step2["抽取代表性样本 (sample_doi)"]
         Step2 --> Step3["异步并发 302 重定向嗅探<br/>(读取 Location 与 Meta-Refresh)"]
-        Step3 --> Step4[("SQLite 主任务库<br/>· doi_clusters<br/>· doi_domain_routes")]
+        Step3 --> Step4[("SQLite 主任务库<br/>· doi_domain_routes (统一映射表)")]
     end
 
     Step4 --> Step5

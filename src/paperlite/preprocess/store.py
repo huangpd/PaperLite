@@ -35,27 +35,19 @@ class PreprocessStore:
         with self._get_conn() as conn:
             conn.executescript(
                 """
-                -- 0. 经 DuckDB 聚合抽样的 DOI 族群大类与代表样本表
-                CREATE TABLE IF NOT EXISTS doi_clusters (
+                -- 1. DOI 族群模式、代表样本与真实落地域名映射表 (聚类抽样与域名解析统一核心表)
+                CREATE TABLE IF NOT EXISTS doi_domain_routes (
                     pattern_key TEXT PRIMARY KEY,
                     publisher_doi TEXT,
                     paper_count BIGINT,
                     sample_doi TEXT,
                     sample_url TEXT,
-                    updated_at TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_clusters_count ON doi_clusters (paper_count DESC);
-
-                -- 1. DOI 族群模式与真实落地域名映射表
-                CREATE TABLE IF NOT EXISTS doi_domain_routes (
-                    pattern_key TEXT PRIMARY KEY,
-                    publisher_doi TEXT,
-                    sample_doi TEXT,
                     real_host TEXT,
                     final_url TEXT,
                     updated_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_routes_host ON doi_domain_routes (real_host);
+                CREATE INDEX IF NOT EXISTS idx_routes_count ON doi_domain_routes (paper_count DESC);
 
                 -- 2. 独立域名的反爬体检画像与模式裁决表
                 CREATE TABLE IF NOT EXISTS domain_profiles (
@@ -102,21 +94,23 @@ class PreprocessStore:
     def get_existing_patterns(self) -> set[str]:
         """获取已经解析过的 pattern_key 集合 (支持 0 秒跳过)"""
         with self._get_conn() as conn:
-            cur = conn.execute("SELECT pattern_key FROM doi_domain_routes WHERE real_host != 'error'")
+            cur = conn.execute(
+                "SELECT pattern_key FROM doi_domain_routes WHERE real_host IS NOT NULL AND real_host != 'error' AND real_host != ''"
+            )
             return {row["pattern_key"] for row in cur.fetchall()}
 
     def get_cluster_samples(self) -> Dict[str, DoiSample]:
-        """从 doi_clusters 表中读取已持久化的代表性样本"""
+        """从 doi_domain_routes 表中读取已持久化的代表性样本"""
         with self._get_conn() as conn:
             cur = conn.execute(
-                "SELECT pattern_key, publisher_doi, sample_doi, sample_url FROM doi_clusters"
+                "SELECT pattern_key, publisher_doi, sample_doi, sample_url FROM doi_domain_routes ORDER BY paper_count DESC"
             )
             return {
                 row["pattern_key"]: DoiSample(
                     doi=row["sample_doi"],
                     pattern_key=row["pattern_key"],
                     publisher_doi=row["publisher_doi"],
-                    raw_url=row["sample_url"],
+                    raw_url=row["sample_url"] or (f"https://doi.org/{row['sample_doi']}" if row["sample_doi"] else ""),
                 )
                 for row in cur.fetchall()
             }
@@ -131,7 +125,7 @@ class PreprocessStore:
                 """
                 SELECT real_host, final_url 
                 FROM doi_domain_routes 
-                WHERE real_host != 'error' AND real_host != ''
+                WHERE real_host IS NOT NULL AND real_host != 'error' AND real_host != ''
                 GROUP BY real_host
                 ORDER BY COUNT(*) DESC
                 """
