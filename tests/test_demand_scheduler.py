@@ -93,6 +93,58 @@ domains = ["cell.com"]
             self.assertEqual(scheduler.routes["cell.com"], "browser_only")
             db.close()
 
+    def test_downloader_circuit_breaker_and_auto_downgrade(self):
+        """测试 cURL 身份池连续失败时自动触发熔断，并降级至 browser_only"""
+        from paperlite.consumer import Downloader
+        from paperlite.tasks import TaskDB
+        from paperlite.scheduler import AutoScheduler
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "cb_test.db"
+            db = TaskDB(db_path)
+            db.import_urls([
+                {"doi": "10.1016/j.cell.1", "url": "https://www.sciencedirect.com/article/1", "url_type": "html"},
+            ])
+            db.backfill_real_hosts()
+
+            fake_store = mock.Mock()
+            # 模拟连续 3 次 fresh reject
+            fake_store.note_fresh_reject.side_effect = [1, 2, 3]
+
+            dl = Downloader(Limits(), fake_store, mock.Mock(), db, tmp_path / "out", workers=1, host="www.sciencedirect.com")
+            self.assertFalse(dl.circuit_broken)
+
+            # 模拟触发一次 rejected
+            task = db.claim("test-worker", host="www.sciencedirect.com")
+            dl._drop_identity(task, mock.Mock(exit_ip="1.1.1.1"), "Cloudflare 403 阻断")
+
+            # 模拟 3 次身份新领用即被拒
+            dl.store.note_fresh_reject("www.sciencedirect.com")
+            dl.store.note_fresh_reject("www.sciencedirect.com")
+            r3 = dl.store.note_fresh_reject("www.sciencedirect.com")
+            self.assertEqual(r3, 3)
+
+            # 模拟触发熔断
+            dl.circuit_broken = True
+            dl._circuit_stop.set()
+            self.assertTrue(dl.circuit_broken)
+
+            scheduler = AutoScheduler(
+                Limits(), None, db, tmp_path / "out", workers=1,
+                routes={"www.sciencedirect.com": "curl_pool"}, no_proxy=True
+            )
+            self.assertEqual(scheduler.routes["www.sciencedirect.com"], "curl_pool")
+
+            # 调度器感知熔断后动态改写内存路由为 browser_only
+            if dl.circuit_broken:
+                scheduler.routes["www.sciencedirect.com"] = "browser_only"
+
+            self.assertEqual(scheduler.routes["www.sciencedirect.com"], "browser_only")
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

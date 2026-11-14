@@ -125,10 +125,10 @@ class DomainAuditor:
             # 提取正文文本与核心摘要锚点 (前 50 字符)
             clean_text = re.sub(r"<[^>]+>", " ", content)
             clean_text = re.sub(r"\s+", " ", clean_text).strip()
-            
-            # 尝试抓取包含 abstract 的段落
+
+            # 从剥除 HTML 标签后的纯文本中检索 Abstract 真实内容
             anchor = ""
-            m_abs = re.search(r"(?:abstract|summary)[\s:]*([^\n\r<]{30,80})", content, re.I)
+            m_abs = re.search(r"\b(?:abstract|summary)\b[\s:]*([^\n\r]{30,80})", clean_text, re.I)
             if m_abs:
                 anchor = m_abs.group(1).strip()[:50]
 
@@ -230,6 +230,16 @@ class DomainAuditor:
             )
 
         # 3. 如果是遇到反爬质询 (403 / WAF)，测试 clearance 是否可复用 (cURL 池模式)
+        # 注意: ScienceDirect / Cell 等顶级高防学术站具备企业级动态交互式 Turnstile 与动态 PDF 令牌，cURL 无法端到端下载
+        if any(domain.endswith(d) for d in ("sciencedirect.com", "cell.com")):
+            logger.info(f"🛡️ [{domain}] 强制判定为 BROWSER_ONLY (高防大站企业级动态行为风控/动态PDF签名)")
+            return DomainAuditResult(
+                domain=domain,
+                mode=RouteMode.BROWSER_ONLY,
+                sample_url=sample_url,
+                reason="企业级动态行为风控与动态PDF令牌链，必须使用真实浏览器",
+            )
+
         if gt.has_clearance:
             cookie_dict = {c["name"]: c["value"] for c in gt.cookies}
             pool_status, pool_headers, pool_body = await asyncio.to_thread(

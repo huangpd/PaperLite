@@ -188,6 +188,9 @@ class Downloader:
         self.stats = DownloadStats()
         self._browser_slots = threading.BoundedSemaphore(max(1, cfg.max_browsers))   # 网页任务的浏览器兜底并发
         self._worker_prefix = f"{socket.gethostname()}-{os.getpid()}"
+        self.circuit_broken = False
+        self._circuit_stop = threading.Event()
+        self.max_fresh_rejects = 3
 
     def update_demand(self) -> int:
         """
@@ -234,7 +237,7 @@ class Downloader:
         waited_since = None
         registered = False
         try:
-            while not stop.is_set():
+            while not stop.is_set() and not self._circuit_stop.is_set():
                 if not self.db.has_claimable(host=self.host):
                     self.store.set_demand(self.host, 0, ttl_s=15)
                     if not self.db.running_count(host=self.host):
@@ -277,10 +280,17 @@ class Downloader:
                         self.store.note_success(self.host)
                     uses += 1
                 elif outcome == "rejected" and uses == 0:
-                    self.store.note_fresh_reject(self.host)      # 新身份一篇没下成就被拒，计入熔断
+                    fresh_rej = self.store.note_fresh_reject(self.host)      # 新身份一篇没下成就被拒，计入熔断
+                    if fresh_rej >= self.max_fresh_rejects and self.stats.success == 0:
+                        logger.warning(
+                            "🚨 [自愈熔断触发] 域名 %s 新身份连续 %d 次被拒且零成功 (WAF阻断/无法复用)，提前熔断 cURL 身份池管线！",
+                            self.host, fresh_rej,
+                        )
+                        self.circuit_broken = True
+                        self._circuit_stop.set()
                 if keep:
                     self.store.heartbeat(ident, self.cfg.lease_ttl_s)
-                if not keep or ident.left() < self.cfg.min_left_s:
+                if not keep or ident.left() < self.cfg.min_left_s or self._circuit_stop.is_set():
                     self.store.discard(ident)
                     session.close()
                     ident, session = None, None

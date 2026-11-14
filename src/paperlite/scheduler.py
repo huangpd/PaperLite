@@ -70,7 +70,8 @@ class AutoScheduler:
 
     def __init__(self, cfg: Limits, proxy: Optional[ProxySettings], db: TaskDB, out: Path,
                  workers: int, rules_path: str = "domain_rules.toml",
-                 store: Optional[IdentityStore] = None, no_proxy: bool = False) -> None:
+                 store: Optional[IdentityStore] = None, no_proxy: bool = False,
+                 routes: Optional[dict[str, str]] = None) -> None:
         self.cfg = cfg
         self.proxy = proxy
         self.db = db
@@ -79,8 +80,8 @@ class AutoScheduler:
         self.rules_path = rules_path
         self.no_proxy = no_proxy
         self.store = store
-        self.routes: dict[str, str] = {}
-        if Path(self.rules_path).exists():
+        self.routes: dict[str, str] = dict(routes) if routes is not None else {}
+        if not self.routes and Path(self.rules_path).exists():
             self.routes = PreprocessStore.load_route_cache(self.rules_path)
 
     def run(self, stop: Optional[threading.Event] = None) -> None:
@@ -127,6 +128,7 @@ class AutoScheduler:
             logger.info("⚡️ [AUTO 调度] 启动 BrowserPool 浏览器渲染管线 (共 %d 篇待采)", rem_count)
             pool = BrowserPool(self.cfg, self.proxy, self.db, self.out, self.workers,
                                no_proxy=self.no_proxy, rules=self.rules_path)
+            pool.routes.update(self.routes)
             pool.run(stop)
 
         c = self.db.counts()
@@ -145,49 +147,71 @@ class AutoScheduler:
 
         semaphore = asyncio.Semaphore(self.workers * 2)
 
-        async def fetch_one(task: Task, session: AsyncSession) -> None:
-            t0 = time.monotonic()
-            proxy_url = None
-            if not self.no_proxy and self.proxy:
-                # 若需要代理，从配置中提取
-                proxy_url = f"{self.proxy.scheme}://{self.proxy.username}:{self.proxy.password}@{self.proxy.api_url}" if self.proxy.username else None
-            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-            dest = pdf_path(self.out, task.doi, ".html" if task.url_type == "html" else ".pdf")
-            try:
-                resp = await session.get(task.url, proxies=proxies, timeout=20, allow_redirects=True)
-                code = resp.status_code
-                elapsed = int((time.monotonic() - t0) * 1000)
-                m = re.search(r"<title[^>]*>(.*?)</title>", resp.text, re.I | re.S)
-                title = m.group(1).strip() if m else ""
-                if code < 400:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(resp.content)
-                    await asyncio.to_thread(
-                        self.db.finish, task, Status.SUCCESS, http_status=code,
-                        file_path=str(dest), file_size=len(resp.content),
-                        elapsed_ms=elapsed, title=title or None, final_url=str(resp.url)
-                    )
-                    logger.info("⚡️ [直连秒下] %s (%d ms) %s", task.doi, elapsed, title[:30])
-                else:
-                    await asyncio.to_thread(
-                        self.db.finish, task, Status.FAILED, http_status=code,
-                        elapsed_ms=elapsed, error_kind="not_found" if code in (404, 410) else None,
-                        error_message=f"HTTP {code}", title=title or None
-                    )
-            except Exception as e:
-                await asyncio.to_thread(
-                    self.db.retry_later, task, count=True,
-                    error_kind="network", error_message=str(e)[:200]
-                )
-
         async with AsyncSession(impersonate="chrome120") as session:
             for host in hosts:
+                consecutive_blocks = 0
                 while not stop.is_set():
                     chunk = await asyncio.to_thread(self.db.claim_chunk, "curl-direct", limit=20, host=host)
                     if not chunk:
                         break
-                    tasks = [fetch_one(t, session) for t in chunk]
+
+                    async def fetch_one(task: Task) -> bool:
+                        nonlocal consecutive_blocks
+                        t0 = time.monotonic()
+                        proxy_url = None
+                        if not self.no_proxy and self.proxy:
+                            proxy_url = f"{self.proxy.scheme}://{self.proxy.username}:{self.proxy.password}@{self.proxy.api_url}" if self.proxy.username else None
+                        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+                        dest = pdf_path(self.out, task.doi, ".html" if task.url_type == "html" else ".pdf")
+                        try:
+                            resp = await session.get(task.url, proxies=proxies, timeout=20, allow_redirects=True)
+                            code = resp.status_code
+                            elapsed = int((time.monotonic() - t0) * 1000)
+                            m = re.search(r"<title[^>]*>(.*?)</title>", resp.text, re.I | re.S)
+                            title = m.group(1).strip() if m else ""
+                            is_waf = code in (403, 429) or any(p in title.lower() for p in ("just a moment", "attention required", "security check", "cf-mitigated"))
+                            if is_waf:
+                                consecutive_blocks += 1
+                                await asyncio.to_thread(
+                                    self.db.retry_later, task, count=False,
+                                    error_kind="waf_challenge", error_message=f"HTTP {code} / WAF质询: {title[:60]}"
+                                )
+                                return False
+                            elif code < 400:
+                                consecutive_blocks = 0
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                dest.write_bytes(resp.content)
+                                await asyncio.to_thread(
+                                    self.db.finish, task, Status.SUCCESS, http_status=code,
+                                    file_path=str(dest), file_size=len(resp.content),
+                                    elapsed_ms=elapsed, title=title or None, final_url=str(resp.url)
+                                )
+                                logger.info("⚡️ [直连秒下] %s (%d ms) %s", task.doi, elapsed, title[:30])
+                                return True
+                            else:
+                                await asyncio.to_thread(
+                                    self.db.finish, task, Status.FAILED, http_status=code,
+                                    elapsed_ms=elapsed, error_kind="not_found" if code in (404, 410) else None,
+                                    error_message=f"HTTP {code}", title=title or None
+                                )
+                                return False
+                        except Exception as e:
+                            await asyncio.to_thread(
+                                self.db.retry_later, task, count=True,
+                                error_kind="network", error_message=str(e)[:200]
+                            )
+                            return False
+
+                    tasks = [fetch_one(t) for t in chunk]
                     await asyncio.gather(*tasks)
+
+                    if consecutive_blocks >= 3:
+                        logger.warning(
+                            "🚨 [自愈降级] %s 在 curl_direct 连续触发 %d 次 WAF 拦截/质询，提前熔断并动态降级为 browser_only！",
+                            host, consecutive_blocks,
+                        )
+                        self.routes[host] = "browser_only"
+                        break
 
     def _run_curl_pool_host(self, host: str, stop: threading.Event) -> bool:
         """针对单个 curl_pool 域名，启动 demand-driven 的 Producer + Downloader 对。"""
@@ -197,6 +221,7 @@ class AutoScheduler:
                 self.store.ping()
             except Exception as e:
                 logger.warning("Redis 未连接 (%s)，域名 %s 降级至浏览器池渲染", e, host)
+                self.routes[host] = "browser_only"
                 return False
 
         pending = self.db.count_pending_host(host)
@@ -207,6 +232,13 @@ class AutoScheduler:
         try:
             dl = Downloader(self.cfg, self.store, self.proxy, self.db, self.out, self.workers, host=host)
             dl.run(stop)
+            if dl.circuit_broken:
+                logger.warning(
+                    "🚨 [自愈降级] %s 触发 cURL 身份池熔断，动态改写为 browser_only 并移交真实浏览器接管",
+                    host,
+                )
+                self.routes[host] = "browser_only"
+                return False
         finally:
             producer.shutdown(timeout_s=self.cfg.pass_timeout_s + 10)
             self.store.clear_demand(host)
