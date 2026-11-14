@@ -21,7 +21,7 @@ storage = "/obs"              # 输出目录（PDF/HTML）。可放对象存储�
 log_dir = "log"               # 日志目录；非空时同时打印到终端并写入 .jsonl；留空则只打终端
 
 [limits]                      # 并发与行为（不含存储路径）
-# redis_url = "redis://127.0.0.1:6379/0"   # 仅 curl 模式用（浏览器模式不用 Redis）
+redis_url = "redis://127.0.0.1:6379/0"   # curl 模式与 auto 模式的 curl_pool 管线使用（纯浏览器模式不用）
 max_browsers = 20             # 同时运行的浏览器上限
 max_identities = 20           # curl 模式健康身份上限；实际按在线下载线程数生产
 min_identities = 0            # curl 模式没有下载线程时也保持的预热身份数
@@ -46,11 +46,12 @@ rule_min_support = 10         # 规则在已采数据上的最低命中数
 
 [run]                         # 配置后一行启动：paperlite run config.toml
 command = "run"               # 填 "run"：裸 paperlite（不带子命令）也按此启动；留空则裸 paperlite 只打印帮助
-mode = "browser"              # browser（各种主机混着跑，默认）/ curl（单主机 cookie 池）
-proxy = true                  # false 等价于 --no-proxy（仅 browser）
+mode = "auto"                 # auto（自适应推荐）/ browser（各种主机混跑纯浏览器）/ curl（单主机 cookie 池）
+rules = "domain_rules.toml"   # auto 模式下的路由规则快照
+proxy = true                  # false 等价于 --no-proxy（直连本机网络，无需代理）
 workers = 20                  # browser=同时打开的浏览器数；curl=下载线程数
 urls = ""                     # 可选：启动时先导入这个 URL 文件
-url_type = "html"              # pdf / html
+url_type = "html"             # pdf / html
 headed = false                # 仅 browser：有界面（调试）
 
 [monitor]                     # 可选：监控上报。各终端发到同一个 RabbitMQ，paperlite-monitor serve 出大屏

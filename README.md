@@ -39,11 +39,11 @@ PaperLite offers three execution modes sharing the same task database, storage l
 
 | | Adaptive mode (`auto`, recommended) | Browser mode (`browser`, default) | curl mode (`--curl`) |
 |---|---|---|---|
-| Model | Auto-routes: cURL direct for static sites, real headless browsers for WAF sites | N workers, each with its own browser and IP | Browsers solve challenges and pool the cookies; `curl_cffi` threads download with them |
-| Hosts per batch | Any mix (dynamically dispatched) | Any mix | Exactly one |
+| Model | 3-way dynamic dispatch: cURL direct for static, demand-driven cURL pool for ACM/Wiley, headless browser for WAF | N workers, each with its own browser and IP | Browsers solve challenges and pool the cookies; `curl_cffi` threads download with them |
+| Hosts per batch | Any mix (per-domain isolated dispatch) | Any mix | Exactly one |
 | Redirects / HTML pages | Followed; saved as `.html` / `.pdf` | Followed; pages saved as `.html` | PDF-oriented |
-| External services | None (Zero Redis required) | None | Redis (identity pool) |
-| Throughput | Peak efficiency: 0.2s for direct, 100% bypass for WAF | High bypass, 2–20 concurrent browsers | Very large single-site jobs where throughput per IP matters |
+| External services | **Redis as needed** (`curl_pool` pipeline uses Redis for identity storage and downstream demand backpressure; falls back to browser if Redis is unavailable; direct/browser pipelines need no Redis) | None (No Redis required) | Redis required (identity pool) |
+| Throughput | Peak efficiency: 0.2s for direct, 50x Cookie reuse for pooled, 100% bypass for WAF | High bypass, 2–20 concurrent browsers | Very large single-site jobs where throughput per IP matters |
 
 Two storage locations are configured independently under `[paths]`:
 
@@ -54,7 +54,7 @@ Two storage locations are configured independently under `[paths]`:
 
 - Python 3.11 or later; Linux or macOS.
 - A short-lived proxy extraction API that returns a fresh `ip:port` per call (JSON or plain text), plus proxy credentials. `--no-proxy` runs without one for local testing.
-- Redis, only for curl mode.
+- Redis: required for curl mode, and used by the `curl_pool` pipeline in adaptive mode. If Redis is not available, adaptive mode gracefully falls back to browser pool rendering.
 - RabbitMQ, only if you enable monitoring.
 
 ## Installation
