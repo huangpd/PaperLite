@@ -54,8 +54,9 @@ class UrlType:
 
 
 # 与 paper_downloader monitor/classify.py 同名类别
+# rate_limited: HTTP 429 未在 Retry-After 等待后恢复（站点对该 URL 临时限流，非 Cloudflare 封禁）
 ERROR_KINDS = ("not_found", "paywall", "landing_page", "blocked", "network", "server_error", "challenge_failed",
-               "extract_failed")
+               "extract_failed", "rate_limited")
 # 计入卷期停止的"没有 PDF"类别（实测 ACM 的订阅页和摘要页都没有 PDF 入口，只差一条横幅）
 NO_PDF_KINDS = ("not_found", "paywall", "landing_page")
 

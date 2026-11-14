@@ -27,6 +27,8 @@ paperlite/consumer.py
 """
 
 import asyncio
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import html as html_lib
 import logging
 import os
@@ -57,6 +59,7 @@ _PDF_HEADER_WINDOW = 1024                      # %PDF- 须在前 1024 字节内�
 _PDF_LEADING_JUNK = b" \t\r\n\x00\x0c\xef\xbb\xbf"  # 之前只允许这些（有的 PHP 下载脚本会输出前导换行）
 _HTML_LIMIT = 256 * 1024                       # 非 PDF 响应最多读这么多
 _RESET_RETRY_WAIT_S = 2.0      # curl (56) 后同一身份重试前的等待
+_MAX_RATE_LIMIT_WAIT_S = 60.0
 _MAX_REFRESH_HOPS = 5          # 网页任务最多跟这么多次 meta refresh
 _MAX_REFRESH_DELAY_S = 10      # 延迟更长的 meta refresh 当作页面定时刷新，不跟
 _META_RE = re.compile(rb"<meta\b[^>]*>", re.IGNORECASE)
@@ -79,6 +82,13 @@ def impersonate_for(user_agent: str) -> str:
     return "chrome"
 
 
+def session_for_identity(ident: Identity):
+    session = curl_requests.Session(trust_env=False, verify=certifi.where(),
+                                    impersonate=impersonate_for(ident.user_agent), cookies=ident.cookies)
+    session.headers["user-agent"] = ident.user_agent
+    return session
+
+
 def meta_refresh_target(body: bytes, base_url: str) -> Optional[str]:
     """中转页（如 linkinghub 的 Redirecting）里短延迟 meta refresh 的目标绝对地址；没有则 None。"""
     for tag in _META_RE.findall(body[:_HTML_LIMIT]):
@@ -95,6 +105,30 @@ def meta_refresh_target(body: bytes, base_url: str) -> Optional[str]:
 def is_challenge(headers, body: bytes) -> bool:
     # 挑战页引用 /cdn-cgi/challenge-platform/h/<x>/orchestrate/…；正常页面里的 …/scripts/jsd、…/scripts/precursor 探针不算
     return bool(headers.get("cf-mitigated")) or b"/challenge-platform/h/" in body[:20000]
+
+
+def is_cf_denied(code: int, headers, body: bytes) -> bool:
+    if code not in (403, 429):
+        return False
+    if "cloudflare" not in headers.get("server", "").lower() and not headers.get("cf-ray"):
+        return False
+    return bool(re.search(
+        rb"<title[^>]*>\s*(?:access denied|attention required)", body[:20000], re.IGNORECASE))
+
+
+def rate_limit_wait(headers, identity_left: float, min_left: float) -> Optional[float]:
+    """返回可安全等待的 Retry-After 秒数；缺失或超出身份寿命时不等待。"""
+    value = headers.get("retry-after", "").strip()
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            delay = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not 0 <= delay <= _MAX_RATE_LIMIT_WAIT_S or identity_left - delay < min_left:
+        return None
+    return delay
 
 
 def pdf_offset(head: bytes) -> Optional[int]:
@@ -243,12 +277,7 @@ class Downloader:
                 finished.set()
 
     def _session(self, ident: Identity):
-        s = curl_requests.Session(trust_env=False, verify=certifi.where(),
-                                  impersonate=impersonate_for(ident.user_agent))
-        for c in ident.cookies:
-            s.cookies.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
-        s.headers["user-agent"] = ident.user_agent
-        return s
+        return session_for_identity(ident)
 
     def _fetch(self, url: str, ident: Identity, session, dest: Path, full_html: bool = False) -> Fetched:
         """
@@ -312,6 +341,12 @@ class Downloader:
                     got = self._fetch_page(task.url, ident, session, dest)
                 else:
                     got = self._fetch(task.url, ident, session, dest)
+                if got.code == 429:
+                    delay = rate_limit_wait(got.headers, ident.left(), self.cfg.min_left_s)
+                    if attempt == 1 and delay is not None:
+                        logger.info("HTTP 429 %s，等待 %.0fs 后沿用身份重试: %s", ident.exit_ip, delay, task.url)
+                        time.sleep(delay)
+                        continue
                 break
             except BadPdf as e:
                 if e.retry:
@@ -332,6 +367,13 @@ class Downloader:
                 return "(28)" in err, "other"       # 超时保留身份；连接再次被断/被拒多半是 IP 掉线，换身份
 
         code = got.code
+        # is_cf_denied 先于普通 429 检查：Cloudflare Access denied / Attention Required
+        # 同时可由 403 或 429 触发，需要丢弃身份而非重试，不能被下面的 429 分支提前拦截
+        if is_cf_denied(code, got.headers, got.body):
+            return self._drop_identity(task, ident, f"Cloudflare 拒绝 HTTP {code}"), "rejected"
+        if code == 429:
+            self._retry_or_fail(task, ident, "rate_limited", "HTTP 429", http_status=code)
+            return True, "other"
         if got.saved is not None:
             self.db.finish(task, Status.SUCCESS, http_status=code, file_path=str(got.saved), file_size=got.size,
                            elapsed_ms=elapsed_ms(), exit_ip=ident.exit_ip)

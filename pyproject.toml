@@ -1,6 +1,6 @@
 [project]
 name = "paperlite"
-version = "0.2.3"
+version = "0.2.4"
 description = "High-volume PDF and web page downloader for bot-protected sites: real browsers, rotating proxies, resumable SQLite task queue."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -55,3 +55,11 @@ only-include = ["src/paperlite", "tests", "deploy", "docs", "README.md", "README
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 以下三个文件依赖 experiments/ 目录（未纳入仓库）的模块，
+# 收集时会立即 ImportError，故从常规 pytest 运行中排除。
+# 若将来 experiments/ 模块补齐，可删除此 ignore 列表。
+ignore = [
+    "tests/test_container_prior.py",
+    "tests/test_metadata_features.py",
+    "tests/test_title_risk.py",
+]

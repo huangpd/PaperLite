@@ -29,7 +29,7 @@ pass_timeout_s = 90           # 单次过盾等待上限
 hedge_after_s = 45            # 过盾超过此时长还没成功，就另开一个浏览器补位（成功的多在 30s 内）
 webrtc_spoof = true           # 加 --fingerprint-webrtc-ip=auto：把 WebRTC 出口伪造成代理出口 IP，防泄露真实 IP。不需要 GeoIP 库、不下载任何东西（推荐开）
 geoip = true                  # 按出口 IP 对齐浏览器时区/语言（指纹一致性，重要）。需 ~70MB GeoIP 库：首次启动限时下载，连不上会报错给手动预置指引（放到 ~/.cloakbrowser/geoip/GeoLite2-City.mmdb）。不想用设 false，WebRTC 伪造仍由 webrtc_spoof 保留
-request_gap_s = [3, 5]        # 同一 IP 两次请求的随机间隔（秒）curl模式
+request_gap_s = [10, 30]      # 同一 IP 两次请求的随机间隔（秒）curl模式
 page_interval_s = [10, 30]    # 浏览器模式：同一浏览器两篇之间的随机间隔（秒），避开同域名频率限制
 download_timeout_s = 120      # 流式下载卡顿超时：连续这么久收不到数据才算超时（不限总时长）
 max_file_size_mb = 200        # 单个 PDF 上限，超过中止

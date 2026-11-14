@@ -182,9 +182,11 @@ storage = "/mnt/obs/papers"     # object-storage mount
 - Before taking tasks, each new browser warms up by solving the challenge on the first imported host, at `https://{host}/` by default.
 - Pages on other hosts solve their own challenge the first time they are rendered.
 - If that host's home page is unsuitable (for example, it does not trigger the challenge or redirects elsewhere), override the warm-up URL in `[landing]`, e.g. `"www.example.org" = "https://www.example.org/journal/abc"`.
-- curl mode uses the same host and warm-up URL for identity production. Also review the non-PDF heuristics in `classify.py`, which were written for ACM.
+- After the browser solves a challenge, curl mode checks the warm-up URL with `curl_cffi` using the same IP, user agent, and Cookie Jar before storing the identity in Redis. Set `[landing]` to a representative article page: a successful home-page check does not prove article pages are accessible. Also review the non-PDF heuristics in `classify.py`, which were written for ACM.
 
 **Cold start in curl mode.** The first identity takes about 20 seconds to solve. `produce --keep 20` pre-warms the pool, at the cost of consuming IPs while no downloader is running.
+
+Curl mode converts browser cookies into a `CookieJar`, retaining duplicate names with distinct domains/paths, host-only scope, secure, expires, HttpOnly and SameSite attributes. Redis keeps a JSON list in `cookies` with a `cookies_format=cookiejar-v1` marker; existing browser-cookie lists remain readable without clearing Redis. Admission checks and downloads use the identity's live jar, so response cookie updates and deletions are saved on insertion, consumer heartbeats and release. Saving never extends the identity or proxy lifetime. Restart both producers and consumers when upgrading.
 
 > When running from a source checkout installed through a mirror, call `.venv/bin/paperlite` directly. `uv run` re-syncs against `uv.lock` and the default index, which can stall on restricted networks.
 
@@ -281,6 +283,7 @@ sqlite3 tasks.db "SELECT status, error_kind, count(*) FROM paper_pdf_resources G
 These behaviours are deliberate. See [`POSTMORTEMS.md`](POSTMORTEMS.md) for the incidents behind them.
 
 - **An identity is IP + cookie + user agent.** `cf_clearance` is bound to both the IP and the user agent, so all three are stored and used together; changing any one yields 403. An identity expires with whichever comes first, the IP lease or the cookie, so identities are produced continuously.
+- **Curl identity acceptance.** A browser pass does not guarantee that `curl_cffi` can access the site. The producer checks `[landing]` with the same identity before adding it to Redis. A later Cloudflare `Access denied` / `Attention Required` response (403/429) discards the identity and returns the task to `pending` instead of permanently failing the paper.
 - **Challenges either pass quickly or hang.** Successful solves typically take 12–30 s, while failures stall on "Verifying…" until timeout. A backup browser is launched after `hedge_after_s` (45 s), and the original runs until `pass_timeout_s` (90 s). Datacenter IPs are often given an interactive challenge, so a proxy is effectively required.
 - **A challenged URL does not imply a bad identity.** Sites flag individual URLs, often in contiguous runs. On a challenge, PaperLite re-tests the identity against the landing page:
   - If the landing page loads, only that URL is deprioritised (`challenge_count + 1`).
@@ -320,6 +323,7 @@ src/paperlite/
   browser.py          one challenge solve (isolated CloakBrowser process via proxy)
   turnstile.py        Turnstile detection, clicking, token service
   producer.py         curl mode: on-demand identity production, solve concurrency
+  cookies.py          CookieJar conversion for browser/Redis cookie records
   store.py            curl mode: Redis identity pool (atomic Lua claims, leases, producer lock)
   consumer.py         curl mode: download threads, streaming, identity health
   tasks.py            SQLite task store, volume stopping

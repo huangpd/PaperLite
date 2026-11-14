@@ -24,10 +24,13 @@ Redis 里不存代理密码，只存 ip:port；消费者用本地配置补鉴权
 import json
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields
+from http.cookiejar import CookieJar
 from typing import Optional
 
 import redis
+
+from paperlite.cookies import jar_from_records, jar_to_records
 
 WORKER_STALE_S = 60   # 下载线程超过此时长无心跳即视为离线
 
@@ -60,6 +63,26 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) 
 return 0
 """
 
+_CHECKPOINT_LUA = """
+if redis.call('GET', KEYS[2]) ~= ARGV[1] or redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+redis.call('HSET', KEYS[1], 'cookies', ARGV[2], 'cookies_format', 'cookiejar-v1')
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+return 1
+"""
+
+_RELEASE_LUA = """
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+redis.call('DEL', KEYS[2])
+redis.call('ZREM', KEYS[4], ARGV[2])
+if redis.call('EXISTS', KEYS[1]) == 0 or tonumber(ARGV[4]) <= tonumber(ARGV[5]) then
+  redis.call('ZREM', KEYS[3], ARGV[2])
+  return 0
+end
+redis.call('HSET', KEYS[1], 'cookies', ARGV[3], 'cookies_format', 'cookiejar-v1')
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[2])
+return 1
+"""
+
 
 @dataclass
 class Identity:
@@ -67,26 +90,33 @@ class Identity:
     exit_ip: str
     proxy_server: str                 # ip:port，不含鉴权
     user_agent: str
-    cookies: list[dict]
+    cookies: CookieJar
     expires_at: float
     created_at: float = field(default_factory=time.time)
     fingerprint: str = ""
     pass_s: float = 0.0
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    _holder: str = field(default="", init=False, repr=False, compare=False)
 
     def left(self, now: Optional[float] = None) -> float:
         return self.expires_at - (time.time() if now is None else now)
 
     def to_redis(self) -> dict[str, str]:
-        d = asdict(self)
-        d["cookies"] = json.dumps(self.cookies, ensure_ascii=False)
-        return {k: str(v) for k, v in d.items()}
+        data = {item.name: str(getattr(self, item.name)) for item in fields(self)
+                if item.name not in ("cookies", "_holder")}
+        data.update(cookies=self.cookies_json(), cookies_format="cookiejar-v1")
+        return data
+
+    def cookies_json(self) -> str:
+        return json.dumps(jar_to_records(self.cookies), ensure_ascii=False)
 
     @classmethod
     def from_redis(cls, d: dict[str, str]) -> "Identity":
+        if d.get("cookies_format") not in (None, "cookiejar-v1"):
+            raise ValueError("不支持的 Redis cookie 格式")
         return cls(
             host=d["host"], exit_ip=d["exit_ip"], proxy_server=d["proxy_server"],
-            user_agent=d["user_agent"], cookies=json.loads(d["cookies"]),
+            user_agent=d["user_agent"], cookies=jar_from_records(json.loads(d["cookies"])),
             expires_at=float(d["expires_at"]), created_at=float(d["created_at"]),
             fingerprint=d.get("fingerprint", ""), pass_s=float(d.get("pass_s", 0)), id=d["id"],
         )
@@ -107,6 +137,8 @@ class IdentityStore:
         self._claim = self.r.register_script(_CLAIM_LUA)
         self._hold = self.r.register_script(_HOLD_LUA)
         self._unhold = self.r.register_script(_UNHOLD_LUA)
+        self._checkpoint = self.r.register_script(_CHECKPOINT_LUA)
+        self._release = self.r.register_script(_RELEASE_LUA)
 
     def _k(self, host: str, *parts: str) -> str:
         return ":".join((self.prefix, host) + parts)
@@ -186,20 +218,24 @@ class IdentityStore:
                 return None
             raw = self.r.hgetall(self._k(host, "id", ident_id))
             if raw:
-                return Identity.from_redis(raw)
+                ident = Identity.from_redis(raw)
+                ident._holder = holder
+                return ident
             self._drop(host, ident_id)   # hash 已过期而 zset 残留，丢掉再取
 
     def heartbeat(self, ident: Identity, lease_ttl_s: float) -> None:
-        self.r.expire(self._k(ident.host, "lease", ident.id), int(lease_ttl_s))
+        self._checkpoint(
+            keys=[self._k(ident.host, "id", ident.id), self._k(ident.host, "lease", ident.id)],
+            args=[ident._holder, ident.cookies_json(), int(lease_ttl_s)],
+        )
 
     def release(self, ident: Identity) -> None:
-        """身份仍可用，还回 ready 给别的线程。"""
-        with self.r.pipeline() as p:
-            p.zrem(self._k(ident.host, "inuse"), ident.id)
-            p.delete(self._k(ident.host, "lease", ident.id))
-            if ident.left() > 0:
-                p.zadd(self._k(ident.host, "ready"), {ident.id: ident.expires_at})
-            p.execute()
+        """原子保存最新 Cookie Jar，再将仍可用的身份还回 ready。"""
+        self._release(
+            keys=[self._k(ident.host, "id", ident.id), self._k(ident.host, "lease", ident.id),
+                  self._k(ident.host, "ready"), self._k(ident.host, "inuse")],
+            args=[ident._holder, ident.id, ident.cookies_json(), ident.expires_at, time.time()],
+        )
 
     # ── 熔断：新身份接连一用就被拒时暂停生产，别把代理配额烧光 ──────────────
 

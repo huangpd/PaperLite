@@ -13,7 +13,8 @@ from unittest import mock
 from paperlite.browser_pool import BrowserPool
 from paperlite.classify import classify_html
 from paperlite.config import Limits, RunConfig, proxy_settings
-from paperlite.consumer import Downloader, impersonate_for
+from paperlite.consumer import Downloader, impersonate_for, rate_limit_wait
+from paperlite.cookies import jar_from_records, jar_to_records
 from paperlite.inspect import WindowInspector
 from paperlite.logutil import JsonFormatter
 from paperlite.producer import Producer
@@ -30,6 +31,7 @@ def ident(**kw) -> Identity:
              cookies=[{"name": "cf_clearance", "value": "v", "domain": ".acm.org", "path": "/"}],
              expires_at=time.time() + 600)
     d.update(kw)
+    d["cookies"] = jar_from_records(d["cookies"])
     return Identity(**d)
 
 
@@ -647,6 +649,90 @@ class ProducerTargetTest(unittest.TestCase):
         self.assertEqual(p.target(50), 20)
 
 
+class ProducerReplayTest(unittest.TestCase):
+    def test_rate_limit_wait_respects_identity_lifetime_and_cap(self):
+        self.assertEqual(rate_limit_wait({"retry-after": "38"}, 100, 20), 38)
+        self.assertIsNone(rate_limit_wait({"retry-after": "38"}, 50, 20))
+        self.assertIsNone(rate_limit_wait({"retry-after": "120"}, 300, 20))
+        self.assertIsNone(rate_limit_wait({}, 300, 20))
+
+    def test_curl_acceptance_checks_page_and_denial(self):
+        from paperlite import producer as producer_mod
+
+        ips = mock.Mock()
+        ips.s = PROXY
+        producer = Producer(Limits(), mock.Mock(), ips, "dl.acm.org")
+        cases = [
+            (Resp(200, b"<title>Paper</title>"), True),
+            (Resp(429, b"<title>Access denied | Cloudflare</title>", {"server": "cloudflare"}), None),
+            (Resp(403, b"<title>Attention Required</title>", {"cf-mitigated": "challenge"}), False),
+        ]
+        for response, expected in cases:
+            with self.subTest(status=response.status_code):
+                session = mock.MagicMock()
+                session.__enter__.return_value = session
+                session.get.return_value = response
+                with mock.patch.object(producer_mod, "session_for_identity", return_value=session):
+                    self.assertEqual(producer._curl_usable(ident()), expected)
+
+    def test_curl_429_waits_and_reuses_session(self):
+        from paperlite import producer as producer_mod
+
+        ips = mock.Mock()
+        ips.s = PROXY
+        producer = Producer(Limits(), mock.Mock(), ips, "dl.acm.org")
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.get.side_effect = [
+            Resp(429, b"<title>Access denied</title>", {"retry-after": "2", "server": "cloudflare"}),
+            Resp(200, b"<title>ACM Digital Library</title>"),
+        ]
+        with mock.patch.object(producer_mod, "session_for_identity", return_value=session), \
+                mock.patch.object(producer_mod.time, "sleep") as sleep:
+            self.assertTrue(producer._curl_usable(ident()))
+        sleep.assert_called_once_with(2.0)
+        self.assertEqual(session.get.call_count, 2)
+
+    def test_no_clearance_still_reaches_curl_acceptance(self):
+        import asyncio
+        from paperlite import producer as producer_mod
+        from paperlite.browser import PassResult
+
+        store, ips = mock.Mock(), mock.Mock()
+        ips.s = PROXY
+        lease = Lease("1.2.3.4:80", "1.2.3.4", "", time.time() + 300)
+        ips.extract_checked.return_value = lease
+        producer = Producer(Limits(pass_timeout_s=30, refill_before_s=30), store, ips, "www.sciencedirect.com")
+        passed = PassResult(ok=True, seconds=12, user_agent="Mozilla/5.0 Chrome/145.0.0.0",
+                            cookies=[{"name": "JSESSIONID", "value": "test", "domain": "www.sciencedirect.com",
+                                      "path": "/"}])
+        with mock.patch.object(producer_mod, "pass_challenge", new=mock.AsyncMock(return_value=passed)), \
+                mock.patch.object(producer, "_curl_usable", return_value=True):
+            asyncio.run(producer._produce_one(1))
+        store.add.assert_called_once()
+        self.assertEqual(store.add.call_args.args[0].expires_at, lease.expires_at)
+
+    def test_rejected_replay_never_enters_redis(self):
+        import asyncio
+        from paperlite import producer as producer_mod
+        from paperlite.browser import PassResult
+
+        store = mock.Mock()
+        ips = mock.Mock()
+        ips.s = PROXY
+        ips.extract_checked.return_value = Lease("1.2.3.4:80", "1.2.3.4", "", time.time() + 300)
+        producer = Producer(Limits(pass_timeout_s=30, refill_before_s=30), store, ips, "dl.acm.org")
+        passed = PassResult(ok=True, seconds=12, user_agent="Mozilla/5.0 Chrome/145.0.0.0",
+                            cookies=[{"name": "cf_clearance", "value": "test", "domain": "dl.acm.org",
+                                      "path": "/", "expires": time.time() + 240}])
+        with mock.patch.object(producer_mod, "pass_challenge", new=mock.AsyncMock(return_value=passed)), \
+                mock.patch.object(producer, "_curl_usable", return_value=False):
+            asyncio.run(producer._produce_one(1))
+        store.add.assert_not_called()
+        store.note_fresh_reject.assert_called_once_with("dl.acm.org")
+        self.assertEqual(producer.stats.failed, 1)
+
+
 class ProducerHedgeTest(unittest.TestCase):
     def test_stuck_passes_get_hedged_within_browser_cap(self):
         import asyncio
@@ -794,6 +880,53 @@ class DownloaderTest(unittest.TestCase):
         self.assertEqual((r["status"], r["retry_count"], r["exit_ip"]), ("success", 0, "2.2.2.2"))
         self.assertTrue(Path(r["file_path"]).exists())
         self.assertEqual(Path(r["file_path"]), pdf_path(self.out, "10.1145/1"))
+
+    def test_non_cf_429_retries_with_same_identity(self):
+        """普通站点（非 Cloudflare 封禁）的 429 限流：遵守 Retry-After 等待后沿用身份重试。"""
+        store = FakeStore([ident(exit_ip="1.1.1.1")])
+        url = "https://dl.acm.org/doi/10.1145/100348.100354"
+        # 注意：body 不包含 "Access denied" 标题，所以不触发 is_cf_denied
+        calls = iter([Resp(429, b"<title>Too Many Requests</title>", {"retry-after": "2"}),
+                      Resp(200, b"<title>Distributed multicasting</title>")])
+        with mock.patch("paperlite.consumer.time.sleep") as sleep:
+            dl = self.run_with(store, {"1.1.1.1": lambda u: next(calls)}, [url], url_type="html")
+        row = self.row(url)
+        self.assertEqual((row["status"], row["retry_count"], dl.stats.failed), ("success", 0, 0))
+        self.assertEqual((dl.stats.rejected, store.discarded), (0, []))
+        sleep.assert_called_once_with(2.0)
+
+    def test_cf_429_access_denied_drops_identity(self):
+        """Cloudflare Access denied (HTTP 429 + server=cloudflare + 匹配标题)：
+        is_cf_denied 先于 429 检查，直接丢弃身份、任务放回，不等待 Retry-After。"""
+        store = FakeStore([ident(exit_ip="1.1.1.1"), ident(exit_ip="2.2.2.2")])
+        url = "https://dl.acm.org/doi/10.1145/100348.100354"
+        calls = {
+            "1.1.1.1": lambda u: Resp(429, b"<title>Access denied | Cloudflare</title>",
+                                      {"server": "cloudflare", "retry-after": "30"}),
+            "2.2.2.2": lambda u: Resp(200, b"<title>Distributed multicasting</title>"),
+        }
+        with mock.patch("paperlite.consumer.time.sleep") as sleep:
+            dl = self.run_with(store, calls, [url], url_type="html")
+        row = self.row(url)
+        # CF 封禁身份被丢弃：换身份后由第二个身份成功下载
+        self.assertEqual((row["status"], dl.stats.success, dl.stats.rejected), ("success", 1, 1))
+        self.assertEqual(store.discarded, ["1.1.1.1"])
+        # CF 封禁识别走 is_cf_denied 分支，不调用 time.sleep 等待 Retry-After
+        sleep.assert_not_called()
+
+    def test_session_preserves_scoped_cookies_after_serialization(self):
+        original = ident(cookies=[
+            {"name": "cf_clearance", "value": "first", "domain": ".acm.org", "path": "/", "secure": True},
+            {"name": "cf_clearance", "value": "second", "domain": "dl.acm.org", "path": "/doi", "secure": True},
+        ])
+        restored = Identity.from_redis(original.to_redis())
+        session = Downloader._session(None, restored)
+        try:
+            cookies = list(session.cookies.jar)
+            self.assertEqual([(c.domain, c.path, c.secure) for c in cookies],
+                             [(".acm.org", "/", True), ("dl.acm.org", "/doi", True)])
+        finally:
+            session.close()
 
     def test_non_pdf_classified_and_saved(self):
         url = "https://dl.acm.org/doi/pdf/10.1145/404"
@@ -1102,7 +1235,7 @@ class RedisStoreTest(unittest.TestCase):
         b = self.store.claim(self.host, "w2", min_left_s=20, lease_ttl_s=60)
         self.assertEqual((a.exit_ip, b.exit_ip), ("1.2.3.4", "9.9.9.9"))
         self.assertIsNone(self.store.claim(self.host, "w3", 20, 60))
-        self.assertEqual(a.cookies, soon.cookies)
+        self.assertEqual(jar_to_records(a.cookies), jar_to_records(soon.cookies))
 
     def test_min_left_skips_dying_identity(self):
         self.store.add(ident(expires_at=time.time() + 10))
@@ -1203,13 +1336,17 @@ def test_meta_refresh_target():
 
 
 def test_cf_probe_scripts_are_not_challenge():
-    from paperlite.consumer import is_challenge
+    from paperlite.consumer import is_cf_denied, is_challenge
     normal = b'<html><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>' \
              b'<script src="/cdn-cgi/challenge-platform/scripts/precursor"></script></html>'
     assert not is_challenge({}, normal)
     page = b'<html><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=1"></script></html>'
     assert is_challenge({}, page)
     assert is_challenge({"cf-mitigated": "challenge"}, b"")
+    assert is_cf_denied(429, {"server": "cloudflare"}, b"<title>Access denied | Cloudflare</title>")
+    assert is_cf_denied(403, {"cf-ray": "test"}, b"<title>Attention Required! | Cloudflare</title>")
+    assert not is_cf_denied(429, {}, b"<title>Access denied</title>")
+    assert not is_cf_denied(200, {"server": "cloudflare"}, b"<title>Access denied</title>")
 
 
 # ──────────────────────────────────────────────────────────────────────────

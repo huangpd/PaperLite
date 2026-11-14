@@ -182,9 +182,11 @@ storage = "/mnt/obs/papers"     # 对象存储挂载
 - 每个新浏览器领任务前，先在第一个导入的主机上热身过盾，默认地址为 `https://{host}/`。
 - 其他主机的页面在首次渲染时各自过盾。
 - 若该主机首页不适合热身（例如不触发挑战或会跳转到别处），可在 `[landing]` 中覆盖热身地址，例如 `"www.example.org" = "https://www.example.org/journal/abc"`。
-- curl 模式的身份生产使用同一主机和热身地址；另需检查 `classify.py` 中的 non-PDF 判定规则（按 ACM 编写）是否适用。
+- curl 模式的身份生产在浏览器过盾后，还会用同一 IP、UA 和 Cookie Jar 通过 `curl_cffi` 请求热身地址；失败的身份不入 Redis。建议将 `[landing]` 配成有代表性的真实文章页：只验证首页 200，不能保证文章页可用。另需检查 `classify.py` 中的 non-PDF 判定规则（按 ACM 编写）是否适用。
 
 **curl 模式冷启动**：第一个身份过盾约需 20 秒。可先运行 `produce --keep 20` 预热身份池，代价是没有下载线程时也会消耗 IP。
+
+curl 模式将浏览器导出的 cookie 转为 `CookieJar`，保留同名 cookie 的 domain/path、host-only、secure、expires、HttpOnly 和 SameSite 属性。Redis 中的 `cookies` 仍是 JSON 列表，新增 `cookies_format=cookiejar-v1` 标记；旧版浏览器 cookie 列表可直接读取，无需清空 Redis。生产者验收和消费者下载共用身份的 Jar，响应更新或删除 cookie 后，验收入池、消费者续租和归还都会保存最新状态；保存不会延长身份或代理的有效期。升级时请同时重启生产者和消费者。
 
 > 通过镜像源安装的源码环境，请直接调用 `.venv/bin/paperlite`。`uv run` 会按 `uv.lock` 从默认源重新同步，在受限网络下可能卡住。
 
@@ -281,6 +283,7 @@ sqlite3 tasks.db "SELECT status, error_kind, count(*) FROM paper_pdf_resources G
 以下行为都是有意为之，相关事故记录见 [`POSTMORTEMS.md`](POSTMORTEMS.md)。
 
 - **身份 = IP + cookie + UA**：`cf_clearance` 同时绑定 IP 和 UA，因此三者一起保存、一起使用，更换其中任何一个都会得到 403。身份的有效期取 IP 租期与 cookie 有效期中较早者，所以需要持续生产身份。
+- **curl 身份验收**：浏览器过盾不等于 `curl_cffi` 一定能访问。生产者在入 Redis 前用同一身份请求 `[landing]`；下载时若遇到 Cloudflare 的 `Access denied` / `Attention Required`（403/429），丢弃该身份、任务放回 `pending`，不把这次拒绝当作论文永久失败。
 - **过盾要么很快，要么卡死**：成功的过盾通常耗时 12–30 秒，失败的则停在 “Verifying…” 直至超时。超过 `hedge_after_s`（45 秒）仍未通过时另开一个浏览器补位，原浏览器继续运行到 `pass_timeout_s`（90 秒）。机房 IP 常被要求人工勾选，因此实际上必须使用代理。
 - **URL 被挑战不等于身份失效**：站点会单独盯上某些 URL，而且往往是连续的一批。遇到挑战时，先用落地页复验身份：
   - 落地页正常，说明只是这条 URL 被盯上，将其降低优先级（`challenge_count + 1`）。
@@ -320,6 +323,7 @@ src/paperlite/
   browser.py          单次过盾（经代理启动独立的 CloakBrowser 进程）
   turnstile.py        Turnstile 定位、点击与 token 服务
   producer.py         curl 模式：按需生产身份，控制过盾并发
+  cookies.py          CookieJar 与浏览器/Redis cookie 记录转换
   store.py            curl 模式：Redis 身份池（Lua 原子领用、租约、生产者锁）
   consumer.py         curl 模式：下载线程、流式下载、身份健康判定
   tasks.py            SQLite 任务库、卷期停止

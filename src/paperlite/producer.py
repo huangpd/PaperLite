@@ -24,6 +24,8 @@ from dataclasses import dataclass
 
 from paperlite.browser import pass_challenge
 from paperlite.config import Limits
+from paperlite.consumer import is_cf_denied, is_challenge, rate_limit_wait, session_for_identity
+from paperlite.cookies import jar_from_records
 from paperlite.proxy import IpSource, ProxyUnavailable
 from paperlite.store import Identity, IdentityStore
 
@@ -131,15 +133,31 @@ class Producer:
             r = await pass_challenge(self.landing, lease, self.ips.s, self.cfg.pass_timeout_s,
                                      self.cfg.headed, self.cfg.debug_dir, geoip=self.cfg.geoip,
                                      webrtc_spoof=self.cfg.webrtc_spoof)
-            if not r.ok or r.clearance_expires() is None:
+            if not r.ok:
                 self.stats.failed += 1
-                logger.info("过盾失败 %s %.0fs: %s", lease.exit_ip, r.seconds, r.error or "未拿到 cf_clearance")
+                logger.info("过盾失败 %s %.0fs: %s", lease.exit_ip, r.seconds, r.error)
                 return
+            clearance_expiry = r.clearance_expires()
             ident = Identity(
                 host=self.host, exit_ip=lease.exit_ip, proxy_server=lease.server,
-                user_agent=r.user_agent, cookies=r.cookies, fingerprint=r.fingerprint, pass_s=r.seconds,
-                expires_at=min(r.clearance_expires(), lease.expires_at),
+                user_agent=r.user_agent, cookies=jar_from_records(r.cookies),
+                fingerprint=r.fingerprint, pass_s=r.seconds,
+                expires_at=min(clearance_expiry, lease.expires_at) if clearance_expiry else lease.expires_at,
             )
+            if ident.left() < self.cfg.min_left_s:
+                self.stats.failed += 1
+                logger.info("过盾后身份 %s 剩余寿命不足，不入池", lease.exit_ip)
+                return
+            usable = await asyncio.to_thread(self._curl_usable, ident)
+            if usable is not True:
+                self.stats.failed += 1
+                if usable is False:
+                    await asyncio.to_thread(self.store.note_fresh_reject, self.host)
+                return
+            if ident.left() < self.cfg.min_left_s:
+                self.stats.failed += 1
+                logger.info("curl 验收后身份 %s 剩余寿命不足，不入池", lease.exit_ip)
+                return
             await asyncio.to_thread(self.store.add, ident)
             self.stats.passed += 1
             logger.info("过盾成功 %s %.0fs，身份寿命 %.0fs", lease.exit_ip, r.seconds, ident.left())
@@ -150,3 +168,41 @@ class Producer:
             logger.exception("生产身份异常")
         finally:
             self._started.pop(seq, None)
+
+    def _curl_usable(self, ident: Identity) -> bool | None:
+        try:
+            with session_for_identity(ident) as session:
+                for attempt in (1, 2):
+                    response = session.get(self.landing, proxy=self.ips.s.url_for(ident.proxy_server),
+                                           allow_redirects=True, stream=True,
+                                           timeout=(self.cfg.connect_timeout_s, min(self.cfg.download_timeout_s, 30)))
+                    try:
+                        body = bytearray()
+                        for chunk in response.iter_content(chunk_size=8192):
+                            body.extend(chunk)
+                            if len(body) >= 20000:
+                                break
+                        code, headers = response.status_code, response.headers
+                    finally:
+                        response.close()
+                    # Cloudflare Access denied / Attention Required（403 或 429 触发）：
+                    # 该 IP 被 CF 封禁，身份不可用（计入新身份拒绝），应 return False 而非 None
+                    if is_cf_denied(code, headers, bytes(body)):
+                        logger.info("curl 身份验收 %s HTTP %d Cloudflare 封禁", ident.exit_ip, code)
+                        return False
+                    if code == 429:
+                        delay = rate_limit_wait(headers, ident.left(), self.cfg.min_left_s)
+                        if attempt == 1 and delay is not None:
+                            logger.info("curl 身份验收 %s HTTP 429，等待 %.0fs 重试", ident.exit_ip, delay)
+                            time.sleep(delay)
+                            continue
+                        # 等待后仍 429（非 CF 封禁），视为临时限流，不计入拒绝（return None）
+                        logger.info("curl 身份验收 %s HTTP 429，限流未恢复", ident.exit_ip)
+                        return None
+                    accepted = code < 400 and not is_challenge(headers, bytes(body))
+                    logger.info("curl 身份验收 %s HTTP %d %s", ident.exit_ip, code,
+                                "通过" if accepted else "拒绝")
+                    return accepted
+        except Exception as error:
+            logger.info("curl 身份验收 %s 出错: %s", ident.exit_ip, type(error).__name__)
+            return None
