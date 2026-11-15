@@ -87,61 +87,89 @@ flowchart TD
 每条论文资源从导入、调度分发、多分支执行到最终落盘的全链路状态流转：
 
 ```mermaid
-stateDiagram-v2
-    [*] --> PENDING : 导入 (import_urls / backfill_real_hosts)
+flowchart TD
+    Start(["📥 任务导入 (import_urls / backfill_real_hosts)"]) --> PENDING
 
-    state PENDING {
-        [*] --> Idle
-        Idle --> VolumeChecked : 卷期限流探测 (_volume_open)
-        VolumeChecked --> BlockedByVolume : 卷期连续无PDF超限
-        VolumeChecked --> Claimable : 卷期健康 / 新卷期
-    }
-
-    Claimable --> RUNNING : 调度器认领 (claim / claim_chunk)
-    note right of RUNNING : 写入 claimed_by 与 updated_at 租约锁
-
-    state RUNNING {
-        state "模式裁决分流" as RouteFork <<choice>>
-        [*] --> RouteFork
+    subgraph SubPending ["一、待办阶段 (PENDING)"]
+        PENDING["待下载任务 (status = 'pending')"]
+        VolCheck{"卷期阈值探测\n(_volume_open)"}
+        VolBlocked["卷期超限熔断\n(批量标记 inferred=1)"]
+        Claimable["可认领任务\n(idx_host_claim 复合索引快速寻址)"]
         
-        RouteFork --> DirectExec : real_host 属于 curl_direct
-        RouteFork --> PoolExec : real_host 属于 curl_pool
-        RouteFork --> BrowserExec : real_host 属于 browser_only
+        PENDING --> VolCheck
+        VolCheck -->|"连续无 PDF 达到上限"| VolBlocked
+        VolCheck -->|"放行"| Claimable
+    end
 
-        state DirectExec {
-            D_Fetch: curl_cffi 异步 GET
-            D_Check: 校验 HTTP 状态码 + PDF 魔数 (%PDF-)
-            D_Fetch --> D_Check
-        }
+    VolBlocked --> FinalNonPdf
 
-        state PoolExec {
-            P_Claim: Redis 认领有效 Identity
-            P_Fetch: 携带 cf_clearance 下载
-            P_Check: 检查 WAF / 429 Retry-After
-            P_Claim --> P_Fetch --> P_Check
-        }
+    Claimable -->|"claim_chunk 批量切片认领\n(status = 'running', 写入 claimed_by)"| RouteFork
 
-        state BrowserExec {
-            B_Launch: CloakBrowser 打开落地页
-            B_Solve: TurnstileClicker 自动过盾
-            B_Wait: 等待 DOM 水合与稳定
-            B_Launch --> B_Solve --> B_Wait
-        }
-    }
+    subgraph SubRunning ["二、运行与三态执行阶段 (RUNNING)"]
+        RouteFork{"根据 real_host\n三态路由分流"}
+        
+        subgraph ExecDirect ["curl_direct 直连执行"]
+            D1["curl_cffi 异步并发 GET"] --> D2{"校验 %PDF- 魔数\n与 HTTP 状态码"}
+        end
 
-    BlockedByVolume --> NON_PDF : 卷期熔断批量推断 (inferred=1)
+        subgraph ExecPool ["curl_pool 身份池执行"]
+            P1["认领 Redis Identity\n上报 demand 水位"] --> P2["携带 cf_clearance 下载\n处理 429 Retry-After"]
+        end
 
-    RUNNING --> SUCCESS : 下载成功 (HTTP 200 + 真实 PDF/HTML)
-    RUNNING --> NON_PDF : HTTP 200 但属于付费墙/摘要页/404 (classify_html 判定)
-    RUNNING --> FAILED : 超过最大挑战次数 / 致命错误 (404/410/5xx)
-    RUNNING --> PENDING : 遇到临时 WAF / 网络抖动 / 代理失效 (retry_later)
+        subgraph ExecBrowser ["browser_only 浏览器执行"]
+            B1["CloakBrowser 打开落地页"] --> B2["TurnstileClicker 过盾\n等待 DOM 水合渲染"]
+        end
 
-    note left of SUCCESS : 写入 .part 临时文件，校验通过后原子 replace，更新 TaskDB 状态
-    note right of PENDING : challenge_count 或 retry_count 累加，释放 claimed_by
+        RouteFork -->|"无盾/纯静态"| D1
+        RouteFork -->|"有盾/可复用 clearance"| P1
+        RouteFork -->|"高防/SPA/动态风控"| B1
+    end
 
-    SUCCESS --> [*]
-    FAILED --> [*]
-    NON_PDF --> [*]
+    subgraph ErrorHandling ["三、重试与自愈降级分支 (RETRY & HEAL)"]
+        RetryLater["retry_later 放回队列\n(释放 claimed_by, count=True/False)"]
+        Downgrade["自愈降级为 browser_only\n(连续质询/拒绝触发熔断)"]
+    end
+
+    subgraph SubFinal ["四、终态归宿 (TERMINAL STATUS)"]
+        FinalSuccess(["✅ SUCCESS\n.part 原子落盘，保存 PDF / HTML"])
+        FinalNonPdf(["⚠️ NON_PDF\n付费墙/摘要页/404/卷期推断 (inferred=1)"])
+        FinalFailed(["❌ FAILED\n超过最大挑战次数 / 致命 4xx/5xx"])
+    end
+
+    %% 成功路径
+    D2 -->|"HTTP 200 + 真实 PDF"| FinalSuccess
+    P2 -->|"下载成功"| FinalSuccess
+    B2 -->|"渲染完成"| FinalSuccess
+
+    %% Non-PDF 路径
+    D2 -->|"HTTP 200 但非 PDF (classify_html)"| FinalNonPdf
+    B2 -->|"无全文 / 付费摘要页"| FinalNonPdf
+
+    %% 异常重试与降级
+    D2 -->|"连续遇到 WAF 质询 (403/429)"| Downgrade
+    P2 -->|"cf_clearance 失效 / 封禁"| Downgrade
+    Downgrade --> RetryLater
+    RetryLater -->|"重新排队等待"| PENDING
+
+    D2 -->|"网络抖动 / 临时超时"| RetryLater
+    P2 -->|"网络断开 (code 56)"| RetryLater
+    B2 -->|"渲染超时 / 临时异常"| RetryLater
+
+    %% 失败路径
+    D2 -->|"HTTP 404 / 410"| FinalFailed
+    P2 -->|"挑战次数耗尽"| FinalFailed
+    B2 -->|"达到 max_challenges 上限"| FinalFailed
+
+    %% 样式美化
+    classDef success fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20;
+    classDef warning fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:#e65100;
+    classDef danger fill:#ffebee,stroke:#c62828,stroke-width:2px,color:#b71c1c;
+    classDef pending fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#0d47a1;
+
+    class FinalSuccess success;
+    class FinalNonPdf warning;
+    class FinalFailed danger;
+    class PENDING,Claimable pending;
 ```
 
 ---
@@ -208,7 +236,7 @@ sequenceDiagram
         WAF-->>DL: HTTP 403/429 + Access Denied 页面
         DL->>RD: discard(ident) 永久销毁被拉黑身份
         DL->>DB: retry_later(task) 任务放回队列
-        opt 连续被拒超限 (fresh_rejects >= 3 且 success == 0)
+        opt 连续被拒超限 (fresh_rejects 达到阈值且无成功)
             DL->>DL: 触发回路熔断 (circuit_broken = True)
             DL-->>DB: 动态将该 host 标记并降级为 browser_only
         end
@@ -217,7 +245,7 @@ sequenceDiagram
     Note over DL,PR: 阶段四：任务收尾与自动停机 (Graceful Quiescence)
     DL->>DB: count_pending_host(host) == 0 (所有任务完结)
     DL->>RD: set_demand(host, 0) (需求归零)
-    PR->>RD: 探测到 demand <= 0
+    PR->>RD: 探测到 demand 归零
     PR->>PR: target 归零，立刻停止新开浏览器，平滑挂起，资源完全释放
 ```
 
