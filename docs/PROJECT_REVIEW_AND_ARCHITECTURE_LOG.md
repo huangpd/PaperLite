@@ -114,23 +114,23 @@
 ## 五、完整落地执行 TODO 清单
 
 ### 阶段 1：映射建档工具链 (Stage 1: Resolve)
-- [ ] **TODO 1.1**: 实现 DOI 族群特征提取器（覆盖 `10.xxxx/j.xxx`、ISSN、系列前缀等通用签名）。
-- [ ] **TODO 1.2**: 实现异步并发 HTTP 302 重定向嗅探器（只跟 Location 头，不拉取 Body）。
-- [ ] **TODO 1.3**: 实现 `paperlite resolve` CLI 子命令，产出 SQLite 映射文件 `doi_routes.db`。
+- [x] **TODO 1.1**: 实现 DOI 族群特征提取器（覆盖 `10.xxxx/j.xxx`、ISSN、系列前缀等通用签名）。
+- [x] **TODO 1.2**: 实现异步并发 HTTP 302 重定向嗅探器（只跟 Location 头，不拉取 Body）。
+- [x] **TODO 1.3**: 实现 `paperlite resolve` CLI 子命令，产出 SQLite 映射文件 `doi_routes.db`。
 
 ### 阶段 2：体检与模式裁决引擎 (Stage 2: Audit)
-- [ ] **TODO 2.1**: 从映射表中提取去重后的独立真实域名清单。
-- [ ] **TODO 2.2**: 研发双视角差分核验模块（Browser 提取真值基准 vs cURL 语义保真度比对）。
-- [ ] **TODO 2.3**: 研发 SPA 假空壳识别器（Title 泛化拦截、正文可见字符阈值）。
-- [ ] **TODO 2.4**: 实现三级漏斗定级算法（`curl-direct` / `curl-pool` / `browser-only`）。
-- [ ] **TODO 2.5**: 实现 `paperlite audit` CLI 子命令，终端输出汇总报表并导出 `domain_rules.toml`。
+- [x] **TODO 2.1**: 从映射表中提取去重后的独立真实域名清单。
+- [x] **TODO 2.2**: 研发双视角差分核验模块（Browser 提取真值基准 vs cURL 语义保真度比对）。
+- [x] **TODO 2.3**: 研发 SPA 假空壳识别器（Title 泛化拦截、正文可见字符阈值）。
+- [x] **TODO 2.4**: 实现三级漏斗定级算法（`curl-direct` / `curl-pool` / `browser-only`）。
+- [x] **TODO 2.5**: 实现 `paperlite audit` CLI 子命令，终端输出汇总报表并导出 `domain_rules.toml`。
 
 ### 阶段 3：自适应分流调度器与大生产优化 (Stage 3: Run)
-- [ ] **TODO 3.1**: 在 SQLite `tasks.db` 建立 `idx_tasks_host_pending` 虚拟分桶索引。
-- [ ] **TODO 3.2**: 在 `paperlite run` 中接入 `--rules domain_rules.toml` 参数。
-- [ ] **TODO 3.3**: 改造下载分配器：基于只读映射表实现每篇任务 0 微秒精准路由。
+- [x] **TODO 3.1**: 在 SQLite `tasks.db` 建立 `idx_host_claim (real_host, challenge_count, id)` 复合索引。
+- [x] **TODO 3.2**: 在 `paperlite run` 中接入 `--rules domain_rules.toml` 参数。
+- [x] **TODO 3.3**: 改造下载分配器：基于只读映射表实现每篇任务 0 微秒精准路由。
 - [x] **TODO 3.4**: 浏览器工作线程实现“生命周期驱动的切片包工（Lifecycle Chunk Lease）”认领算法，杜绝数据库单篇锁竞争与域名横跳。
-- [ ] **TODO 3.5**: 增加运行时内容安全熔断守卫（Content Guard），防范逃逸空壳，自动触发浏览器兜底。
+- [x] **TODO 3.5**: 增加运行时内容安全熔断守卫与动态自愈降级（连续质询/拒绝自动降级为 browser_only）。
 
 ---
 
@@ -139,7 +139,7 @@
 ### 1. DuckDB 向量化预处理引擎重构
 * **背景**：在面对千万至亿级 DOI 输入时，Python 单线程遍历 CSV 或 SQLite 聚合扫描慢、易锁表。
 * **重构**：采用 DuckDB 向量化 OLAP 引擎实现 `DuckDBClusterer`，利用 C++ 向量化 SIMD 算子完成正则分类聚合。
-* **实测性能**：扫描并聚合 195 万条 DOI 数据仅需 **0.22 ~ 0.43 秒**，直接将 3,547 个独立期刊族群及抽样代表回写至 SQLite 主库的 `doi_clusters` 表。
+* **实测性能**：扫描并聚合 195 万条 DOI 数据仅需 **0.22 ~ 0.43 秒**，直接将 3,547 个独立期刊族群及抽样代表回写至 SQLite 主库的 `doi_domain_routes` 表。
 
 ### 2. 生命周期驱动的切片包工（Lifecycle-Driven Chunk Claiming）
 * **痛点**：原有 `claim()` 为单篇原子领取，当单机启动 25~30 个高并发无头浏览器时，所有 Worker 频繁争抢 SQLite 排它写锁，且容易在期刊族群交界处发生频繁横跳（跨域名穿插）。
@@ -147,3 +147,10 @@
   1. **原子切片包工 (`TaskDB.claim_chunk`)**：单次事务原子提取并锁定多条任务切片，SQLite 锁竞争降低 95% 以上。
   2. **以 IP/浏览器生命周期为绝对基准**：切片批次大小不固定写死，而是由 `lease.left()`（当前代理 IP 剩余秒数）动态裁决；单篇预估 8s，10 分钟满寿命自动领满 50 篇同族群任务闭门吞吐。
   3. **干净换 IP 交接 (`TaskDB.release_tasks`)**：当 IP 到期、网络异常或 Worker 退出时，未消费的本地任务瞬间归还 `pending`，杜绝丢单与死锁。
+
+---
+
+## 七、系统全景架构与数据流转拓扑（固化文档）
+
+详见专项架构文档：[docs/ARCHITECTURE.md](ARCHITECTURE.md)
+* 包含完整 Mermaid 拓扑图：系统五层架构、数据全生命周期状态机、三态路由横向对比、需求驱动反压生产时序图。
