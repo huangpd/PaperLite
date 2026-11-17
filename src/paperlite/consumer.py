@@ -3,7 +3,7 @@
 """
 paperlite/consumer.py
 ───────────────────────
-消费者：从 SQLite 任务库领任务、从 Redis 领身份，用 curl_cffi 带 cookie、经同一出口 IP 下载 PDF。
+消费者：从 SQLite 任务库领任务、从 Redis 领身份，用 curl_cffi 带 cookie、经同一出口 IP 下载 PDF 或网页（url_type=html 存 .html）。
 
 - 每个下载线程独占一个身份（IP+cookie），同一 IP 两次请求随机间隔 request_gap_s；
 - 线程只在有活可干（有 pending 任务）时登记心跳，生产者据此决定要多少身份；只剩别的线程的在途任务时

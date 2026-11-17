@@ -38,7 +38,7 @@ PaperLite has two execution modes. Both share the same task database, storage la
 |---|---|---|
 | Model | N workers, each with its own browser and IP | Browsers solve challenges and pool the cookies; `curl_cffi` threads download with them |
 | Hosts per batch | Any mix | Exactly one |
-| Redirects / HTML pages | Followed; pages saved as `.html` | PDF-oriented |
+| Redirects / HTML pages | Followed; pages saved as `.html` | HTTP redirects and meta-refresh hops are followed; `--type html` tasks are saved whole as `.html`, falling back to a browser when a redirect to another host is challenged |
 | External services | None | Redis (identity pool) |
 | Best for | Heterogeneous URL lists | Very large single-site jobs where throughput per IP matters |
 

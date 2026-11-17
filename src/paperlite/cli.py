@@ -275,7 +275,8 @@ def _snapshot(mode: str, db: TaskDB, stats, online: int, workers: int) -> dict:
 
 
 def _report(dl: Downloader, store: IdentityStore, cfg: Limits, stop: threading.Event) -> None:
-    """每 30s 一行。速度按"已处理"（PDF + non_pdf + failed）算：non_pdf 成片时只看 PDF 数会误以为变慢。"""
+    """每 30s 一行。速度按"已处理"（成功 + non_pdf + failed）算：non_pdf 成片时只看成功数会误以为变慢。
+    成功含 PDF 任务和网页任务（url_type=html 存 .html），文案不写 PDF。"""
     s = dl.stats
     last_done, last_pdf, last_t = 0, 0, time.monotonic()
     while not stop.wait(30):
@@ -284,8 +285,8 @@ def _report(dl: Downloader, store: IdentityStore, cfg: Limits, stop: threading.E
         now = time.monotonic()
         done = s.success + s.non_pdf + s.failed
         minutes = (now - last_t) / 60
-        logger.info("进度: 已处理 %d（PDF %d，non_pdf %d，失败 %d），待下载 %d | 身份 空闲 %d 占用 %d "
-                    "| 近 30s 处理 %.0f 条/分钟，其中 PDF %.0f 篇/分钟",
+        logger.info("进度: 已处理 %d（成功 %d，non_pdf %d，失败 %d），待下载 %d | 身份 空闲 %d 占用 %d "
+                    "| 近 30s 处理 %.0f 条/分钟，其中成功 %.0f 篇/分钟",
                     done, s.success, s.non_pdf, s.failed, c[Status.PENDING] + c[Status.RUNNING],
                     st.ready, st.inuse, (done - last_done) / minutes, (s.success - last_pdf) / minutes)
         last_done, last_pdf, last_t = done, s.success, now
