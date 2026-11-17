@@ -603,15 +603,20 @@ class TaskDB:
                 args
             ).fetchone())
 
-    def count_pending_host(self, host: Optional[str] = None) -> int:
-        """指定主机待下载任务数。"""
+    def count_pending_host(self, host: Optional[str] = None, cap: Optional[int] = None) -> int:
+        """
+        指定主机待下载任务数。给 cap 时最多数到 cap 就停（返回 min(实际数, cap)）：
+        只关心"够不够"的调用方（如 curl_pool 的需求计算）不必扫完百万级大域名。
+        """
         where_host = " AND real_host = ?" if host else ""
-        args = (host,) if host else ()
+        args: tuple = (host,) if host else ()
+        sql = f"SELECT 1 FROM paper_pdf_resources WHERE status = 'pending' AND flag IS NULL{where_host}"
+        if cap is not None:
+            sql, args = f"SELECT count(*) FROM ({sql} LIMIT ?)", (*args, max(0, cap))
+        else:
+            sql = f"SELECT count(*) FROM ({sql})"
         with self._lock:
-            return self._conn.execute(
-                f"SELECT count(*) FROM paper_pdf_resources WHERE status = 'pending' AND flag IS NULL{where_host}",
-                args
-            ).fetchone()[0]
+            return self._conn.execute(sql, args).fetchone()[0]
 
     def running_count(self, host: Optional[str] = None) -> int:
         """当前处于 running 状态的任务数。"""

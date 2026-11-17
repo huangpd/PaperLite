@@ -54,6 +54,8 @@ from paperlite.tasks import Status, Task, TaskDB, UrlType, pdf_path, url_host
 logger = logging.getLogger(__name__)
 
 _IDLE_WAIT_S = 2.0
+_DEMAND_REFRESH_S = 5.0                        # curl_pool 需求水位最多每 5 秒重算一次（Redis 里 TTL 30 秒）
+_TASKS_PER_IDENTITY = 15                       # 需求 = ceil(待下载数 / 15)，上限 workers
 _CHUNK = 256 * 1024
 _PDF_HEADER_WINDOW = 1024                      # %PDF- 须在前 1024 字节内（PDF 规范）
 _PDF_LEADING_JUNK = b" \t\r\n\x00\x0c\xef\xbb\xbf"  # 之前只允许这些（有的 PHP 下载脚本会输出前导换行）
@@ -191,26 +193,33 @@ class Downloader:
         self.circuit_broken = False
         self._circuit_stop = threading.Event()
         self.max_fresh_rejects = 3
+        self._demand = 0
+        self._demand_at = float("-inf")
+        self._demand_lock = threading.Lock()
 
-    def update_demand(self) -> int:
+    def update_demand(self, force: bool = False) -> int:
         """
-        下游消费者向 Redis 宣告当前主机所需要的有效身份数（Target Demand）。
-        - 若任务库中已无待下载任务，Demand 立即置 0；
-        - 若尚有待下载任务，按 (pending / 15) 动态压降所需身份数，上限为 workers。
+        下游消费者向 Redis 宣告当前主机所需要的有效身份数（Target Demand）：
+        没有待下载任务为 0，否则 ceil(待下载数 / 15)，上限 workers。
+        所有下载线程共用一个节流：force=False 时距上次重算不到 _DEMAND_REFRESH_S 秒直接返回上次的值；
+        计数最多数到 workers × 15（再多需求也封顶），百万级大域名也不用全表计数。
         """
         if not hasattr(self.store, "set_demand"):
             return 0
-        pending = self.db.count_pending_host(self.host)
-        if pending <= 0:
-            self.store.set_demand(self.host, 0, ttl_s=30)
-            return 0
-        needed = min(self.workers, max(1, (pending + 14) // 15))
+        with self._demand_lock:
+            now = time.monotonic()
+            if not force and now - self._demand_at < _DEMAND_REFRESH_S:
+                return self._demand
+            self._demand_at = now                  # 先占住本轮，其它线程在计数期间直接用旧值
+        pending = self.db.count_pending_host(self.host, cap=self.workers * _TASKS_PER_IDENTITY)
+        needed = min(self.workers, -(-pending // _TASKS_PER_IDENTITY)) if pending > 0 else 0
+        self._demand = needed
         self.store.set_demand(self.host, needed, ttl_s=30)
         return needed
 
     def run(self, stop: Optional[threading.Event] = None) -> DownloadStats:
         stop = stop or threading.Event()
-        self.update_demand()
+        self.update_demand(force=True)
         # 结束用事件判断，不用 Thread.join()：信号打断 join 后 is_alive() 可能误报已结束
         finished = [threading.Event() for _ in range(self.workers)]
         for i, done in enumerate(finished):

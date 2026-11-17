@@ -145,6 +145,53 @@ domains = ["cell.com"]
             self.assertEqual(scheduler.routes["www.sciencedirect.com"], "browser_only")
             db.close()
 
+    def test_count_pending_host_cap(self):
+        import tempfile
+        from pathlib import Path
+        from paperlite.tasks import TaskDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = TaskDB(Path(tmp) / "t.db")
+            db.import_urls([{"url": f"https://a.example/{i}"} for i in range(7)]
+                           + [{"url": "https://b.example/1"}])
+            self.assertEqual(db.count_pending_host("a.example"), 7)
+            self.assertEqual(db.count_pending_host("a.example", cap=5), 5)
+            self.assertEqual(db.count_pending_host("a.example", cap=100), 7)
+            self.assertEqual(db.count_pending_host("b.example", cap=5), 1)
+            self.assertEqual(db.count_pending_host(), 8)
+            self.assertEqual(db.count_pending_host(cap=3), 3)
+            db.close()
+
+    def test_update_demand_bounded_and_throttled(self):
+        """需求计数最多数到 workers×15；所有线程共用 5 秒节流；公式与原来一致"""
+        import paperlite.consumer as consumer
+        from paperlite.consumer import Downloader
+
+        db = mock.Mock()
+        db.host.return_value = "dl.acm.org"
+        store = mock.Mock()
+        dl = Downloader(Limits(), store, mock.Mock(), db, "/tmp/out", workers=20)
+
+        def demand_for(pending):
+            db.count_pending_host.side_effect = lambda host, cap=None: min(pending, cap)
+            return dl.update_demand(force=True)
+
+        # 公式：0 → 0；1..15 → 1；16 → 2；海量 → 封顶 workers
+        self.assertEqual([demand_for(p) for p in (0, 1, 15, 16, 299, 300, 1_560_000)], [0, 1, 1, 2, 20, 20, 20])
+        self.assertEqual(db.count_pending_host.call_args.kwargs["cap"], 20 * 15)
+        store.set_demand.assert_called_with("dl.acm.org", 20, ttl_s=30)
+
+        db.count_pending_host.reset_mock()
+        clock = [1000.0]
+        with mock.patch.object(consumer.time, "monotonic", lambda: clock[0]):
+            dl.update_demand(force=True)
+            for _ in range(50):                      # 5 秒内的调用都用缓存，不再查库
+                self.assertEqual(dl.update_demand(), 20)
+            self.assertEqual(db.count_pending_host.call_count, 1)
+            clock[0] += consumer._DEMAND_REFRESH_S
+            dl.update_demand()
+            self.assertEqual(db.count_pending_host.call_count, 2)
+
     def test_curl_direct_network_error_capped_by_max_tries(self):
         """curl_direct 网络错误达到 max_tries 判 failed，管线能正常退出而不是无限重领死链"""
         import asyncio
