@@ -664,11 +664,12 @@ class ProducerReplayTest(unittest.TestCase):
         producer = Producer(Limits(), mock.Mock(), ips, "dl.acm.org")
         cases = [
             (Resp(200, b"<title>Paper</title>"), True),
-            (Resp(429, b"<title>Access denied | Cloudflare</title>", {"server": "cloudflare"}), None),
+            (Resp(429, b"<title>Access denied | Cloudflare</title>", {"server": "cloudflare"}), False),
+            (Resp(429, b"<title>Too Many Requests</title>"), None),
             (Resp(403, b"<title>Attention Required</title>", {"cf-mitigated": "challenge"}), False),
         ]
         for response, expected in cases:
-            with self.subTest(status=response.status_code):
+            with self.subTest(status=response.status_code, body=response.content[:30]):
                 session = mock.MagicMock()
                 session.__enter__.return_value = session
                 session.get.return_value = response
@@ -684,7 +685,7 @@ class ProducerReplayTest(unittest.TestCase):
         session = mock.MagicMock()
         session.__enter__.return_value = session
         session.get.side_effect = [
-            Resp(429, b"<title>Access denied</title>", {"retry-after": "2", "server": "cloudflare"}),
+            Resp(429, b"<title>Too Many Requests</title>", {"retry-after": "2"}),
             Resp(200, b"<title>ACM Digital Library</title>"),
         ]
         with mock.patch.object(producer_mod, "session_for_identity", return_value=session), \
@@ -692,6 +693,23 @@ class ProducerReplayTest(unittest.TestCase):
             self.assertTrue(producer._curl_usable(ident()))
         sleep.assert_called_once_with(2.0)
         self.assertEqual(session.get.call_count, 2)
+
+    def test_curl_cf_429_rejects_without_waiting(self):
+        """验收遇到 Cloudflare 封禁的 429：直接判不可用（计入熔断），不等 Retry-After、不重试"""
+        from paperlite import producer as producer_mod
+
+        ips = mock.Mock()
+        ips.s = PROXY
+        producer = Producer(Limits(), mock.Mock(), ips, "dl.acm.org")
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.get.return_value = Resp(429, b"<title>Access denied | Cloudflare</title>",
+                                        {"retry-after": "2", "server": "cloudflare"})
+        with mock.patch.object(producer_mod, "session_for_identity", return_value=session), \
+                mock.patch.object(producer_mod.time, "sleep") as sleep:
+            self.assertIs(producer._curl_usable(ident()), False)
+        sleep.assert_not_called()
+        self.assertEqual(session.get.call_count, 1)
 
     def test_no_clearance_still_reaches_curl_acceptance(self):
         import asyncio
