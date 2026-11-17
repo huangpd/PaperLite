@@ -244,10 +244,20 @@ class AutoScheduler:
                                     )
                                     return False
                             except Exception as e:
-                                await asyncio.to_thread(
-                                    self.db.retry_later, task, count=True,
-                                    error_kind="network", error_message=str(e)[:200]
-                                )
+                                err = str(e)[:200]
+                                if task.retry_count + 1 >= self.cfg.max_tries:
+                                    # 与 Downloader 一致：网络错误达到 max_tries 判失败，避免死链被无限重领
+                                    logger.info("⚡️ [直连] %s 第 %d 次网络错误，判失败: %s",
+                                                task.doi, task.retry_count + 1, err)
+                                    await asyncio.to_thread(
+                                        self.db.finish, task, Status.FAILED,
+                                        error_kind="network", error_message=err
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        self.db.retry_later, task, count=True,
+                                        error_kind="network", error_message=err
+                                    )
                                 return False
 
                     tasks = [fetch_one(t) for t in chunk]
@@ -267,6 +277,12 @@ class AutoScheduler:
 
     def _run_curl_pool_host(self, host: str, stop: threading.Event) -> bool:
         """针对单个 curl_pool 域名，启动 demand-driven 的 Producer + Downloader 对。"""
+        if self.no_proxy or self.proxy is None:
+            # Producer 过盾需要 IpSource 取 IP、Downloader 需要代理鉴权；无代理时二者都跑不起来，
+            # 生产者线程崩溃后下载线程会无限等待身份，故直接交给浏览器池
+            logger.warning("未配置代理（--no-proxy / proxy=false），curl_pool 域名 %s 降级至浏览器池渲染", host)
+            self.routes[host] = "browser_only"
+            return False
         if not self.store:
             try:
                 store = IdentityStore(self.cfg.redis_url, self.cfg.key_prefix)

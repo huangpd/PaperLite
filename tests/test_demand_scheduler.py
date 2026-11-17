@@ -145,6 +145,77 @@ domains = ["cell.com"]
             self.assertEqual(scheduler.routes["www.sciencedirect.com"], "browser_only")
             db.close()
 
+    def test_curl_direct_network_error_capped_by_max_tries(self):
+        """curl_direct 网络错误达到 max_tries 判 failed，管线能正常退出而不是无限重领死链"""
+        import asyncio
+        import tempfile
+        import threading
+        from pathlib import Path
+        from paperlite.scheduler import AutoScheduler
+        from paperlite.tasks import Status, TaskDB
+
+        class DeadSession:
+            calls = 0
+
+            def __init__(self, *a, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, *a, **kw):
+                DeadSession.calls += 1
+                raise ConnectionError("Could not resolve host")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = TaskDB(tmp_path / "t.db")
+            db.import_urls([{"doi": f"10.1007/dead{i}", "url": f"https://link.springer.com/dead/{i}",
+                             "url_type": "html"} for i in range(3)])
+            db.backfill_real_hosts()
+            cfg = Limits(max_tries=3)
+            scheduler = AutoScheduler(cfg, None, db, tmp_path / "out", workers=2,
+                                      routes={"link.springer.com": "curl_direct"}, no_proxy=True)
+            with mock.patch("curl_cffi.requests.AsyncSession", DeadSession):
+                asyncio.run(asyncio.wait_for(
+                    scheduler._direct_worker_pool(["link.springer.com"], threading.Event()), timeout=10))
+
+            c = db.counts()
+            self.assertEqual(c[Status.FAILED], 3)
+            self.assertEqual(c[Status.PENDING], 0)
+            self.assertEqual(DeadSession.calls, 3 * cfg.max_tries)   # 每条恰好请求 max_tries 次
+            db.close()
+
+    def test_curl_pool_without_proxy_downgrades_to_browser(self):
+        """--no-proxy 时 curl_pool 域名直接降级 browser_only，不启动无法取 IP 的生产者"""
+        import tempfile
+        import threading
+        from pathlib import Path
+        from paperlite.scheduler import AutoScheduler
+        from paperlite.tasks import TaskDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = TaskDB(tmp_path / "t.db")
+            db.import_urls([{"doi": "10.1093/x1", "url": "https://academic.oup.com/a/1", "url_type": "html"}])
+            db.backfill_real_hosts()
+            for kwargs in ({"proxy": None, "no_proxy": True}, {"proxy": mock.Mock(), "no_proxy": True},
+                           {"proxy": None, "no_proxy": False}):
+                scheduler = AutoScheduler(Limits(), kwargs["proxy"], db, tmp_path / "out", workers=1,
+                                          store=mock.Mock(), no_proxy=kwargs["no_proxy"],
+                                          routes={"academic.oup.com": "curl_pool"})
+                with mock.patch("paperlite.scheduler._ProducerThread") as producer, \
+                        mock.patch("paperlite.scheduler.Downloader") as downloader:
+                    ok = scheduler._run_curl_pool_host("academic.oup.com", threading.Event())
+                self.assertFalse(ok)
+                self.assertEqual(scheduler.routes["academic.oup.com"], "browser_only")
+                producer.assert_not_called()
+                downloader.assert_not_called()
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
