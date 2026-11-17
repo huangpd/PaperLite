@@ -125,26 +125,56 @@ def _require_geoip(cfg) -> None:
         f"  2) 不用 geoip（WebRTC 伪造仍由 webrtc_spoof 保留）：在 config.toml 的 [limits] 设 geoip = false")
 
 
-def _read_url_file(path: str):
-    """txt：一行一个链接；CSV：表头含 url（或旧名 pdf_url），可选 doi / source / batch_no / url_type。"""
+def _url_file_kind(path: str) -> str:
+    """url_csv：表头含 url（或旧名 pdf_url）；doi_csv：表头含 doi 列但没有 url 列；doi_lines：一行一个裸 DOI；lines：一行一个链接。"""
     with open(path, encoding="utf-8-sig", newline="") as f:
         first = f.readline()
-        f.seek(0)
-        if "url" in first or "pdf_url" in first:
+    if "url" in first or "pdf_url" in first:
+        return "url_csv"
+    header = [h.strip().lower() for h in next(csv.reader([first]), [])]
+    if "doi" in header:
+        return "doi_csv"
+    with open(path, encoding="utf-8-sig") as f:
+        for line in f:
+            s = line.strip().lower()
+            if s:
+                return "doi_lines" if s.startswith("10.") else "lines"
+    return "lines"
+
+
+def _read_url_file(path: str, kind: str):
+    """txt：一行一个链接；CSV：表头含 url（或旧名 pdf_url），可选 doi / source / batch_no / url_type。"""
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        if kind == "url_csv":
             yield from (r for r in csv.DictReader(f) if (r.get("url") or r.get("pdf_url") or "").strip())
         else:
             yield from ({"url": line.strip()} for line in f if line.strip().startswith("http"))
 
 
 def _import(db: TaskDB, path: str, source: str = "", batch: str = "", url_type: str = UrlType.PDF) -> None:
-    """url_type 是整批的默认类型；CSV 里的 url_type 列逐行覆盖。"""
+    """
+    url_type 是整批的默认类型；CSV 里的 url_type 列逐行覆盖。
+    只有 DOI（CSV 的 doi 列，或一行一个 DOI）时链接拼成 https://doi.org/{doi}，按 DOI 族群排序入库，
+    real_host 留空交给 run --auto 按 DOI 映射回填；之后可用 paperlite handles 换成出版商登记的落地 URL。
+    """
+    kind = _url_file_kind(path)
+    if kind in ("doi_csv", "doi_lines"):
+        from paperlite.preprocess.cluster import read_doi_file
+        dois, skipped = read_doi_file(path, header=kind == "doi_csv")
+        if skipped:
+            logger.warning("%s 有 %d 行不是 DOI（应以 10. 开头或为 doi.org 链接），已跳过", path, skipped)
+        src = ({"doi": d, "url": f"https://doi.org/{d}"} for d in dois)
+    else:
+        src = _read_url_file(path, kind)
     rows = ({**r, "source": r.get("source") or source, "batch_no": r.get("batch_no") or batch,
              "url_type": (r.get("url_type") or "").strip() or url_type}
-            for r in _read_url_file(path))
+            for r in src)
     try:
         added, existed = db.import_urls(rows)
     except ValueError as e:
         raise SystemExit(str(e))
+    if added + existed == 0:
+        raise SystemExit(f"{path} 里没有可导入的行：需要 url 列或 doi 列的 CSV，或一行一个链接 / DOI 的文本")
     logger.info("导入 %s：新增 %d（任务类型: %s），已存在 %d（已存在的不重置）", path, added, url_type, existed)
 
 
@@ -302,6 +332,32 @@ def _export(args) -> None:
         db.close()
 
 
+def _handles(args) -> None:
+    """doi.org Handle API：查询（可断点续跑）→ 就地替换 pending 任务链接 / 未注册 DOI 标 failed。"""
+    from paperlite.handles import resolve_handles
+    if args.concurrency < 1 or args.interval < 0:
+        raise SystemExit("--concurrency 须大于 0，--interval 不能为负")
+    db = _open_db(args)
+    try:
+        try:
+            reclaimed = db.lock_for_download()      # 与 run 互斥：下载进行中不改任务链接
+        except RuntimeError as e:
+            raise SystemExit(str(e))
+        if reclaimed:
+            logger.info("上次中断残留的 %d 个 running 任务已放回 pending", reclaimed)
+        if not args.apply_only:
+            try:
+                asyncio.run(resolve_handles(db, concurrency=args.concurrency, interval_s=args.interval,
+                                            proxy=args.proxy, limit=args.limit))
+            except KeyboardInterrupt:
+                logger.info("中断：已拿到的查询结果已保存，重跑会跳过已查的 DOI；先把已有结果落到任务上")
+        r = db.apply_handles()
+        logger.info("任务链接已更新 %d 条；DOI 失效标 failed %d 条（paperlite export --status failed 可导出）；"
+                    "新链接与已有任务重复、保持原样 %d 条", r["updated"], r["invalid"], r["conflict"])
+    finally:
+        db.close()
+
+
 def _turnstile(args, parser) -> None:
     from paperlite import turnstile
 
@@ -452,7 +508,7 @@ def _raise_interrupt(signum, frame):
 # 顶层帮助里的命令清单（按常用顺序）
 _COMMANDS = {
     "init": "在当前目录生成配置模板 config.toml",
-    "import": "导入任务（txt 一行一个链接，或带 url 列的 CSV）",
+    "import": "导入任务（txt 一行一个链接 / DOI，或带 url 列 / doi 列的 CSV）",
     "run": "下载，下载完退出。默认浏览器模式（各种主机混着跑、跟跳转）；--curl 走单主机 cookie 池",
     "produce": "只生产身份（curl 模式），常驻",
     "download": "只下载（curl 模式），需有生产者在跑",
@@ -460,6 +516,7 @@ _COMMANDS = {
     "inspect": "巡检：同标题重复到阈值就归纳 doi/url 规则，标记疑似失效/封面的未采任务（不再采）",
     "retry": "把 failed / non_pdf 的任务重置为 pending",
     "export": "导出任务为 CSV",
+    "handles": "查 doi.org Handle API：doi.org 拼接链接换成出版商登记的落地 URL，未注册 DOI 标 failed",
     "turnstile": "按 URL + sitekey 取 Cloudflare Turnstile token（--serve 起 HTTP 服务）",
     "preprocess": "预处理：基于 DuckDB 极速聚类大类小类、嗅探落地域名、双视角体检定级并导出 domain_rules.toml",
     "resolve": "预处理阶段一：基于 DuckDB 聚类族群并嗅探真实落地域名，建档至 SQLite 库",
@@ -528,7 +585,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p = cmd("init")
     p.add_argument("--force", action="store_true", help="已存在也覆盖")
     p = cmd("import")
-    p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 url 列的 CSV；多主机可混")
+    p.add_argument("--urls", required=True, help="txt 一行一个链接或 DOI，或带 url 列 / doi 列的 CSV；多主机可混。只有 DOI 时拼成 doi.org 链接、按族群排序入库")
     site_args(p)
     p.add_argument("--source", default="", help="写入 source")
     p.add_argument("--batch", default="", help="写入 batch_no")
@@ -579,6 +636,13 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     site_args(p)
     p.add_argument("--status", choices=Status.ALL, help="只导出该状态")
     p.add_argument("--file", default="-", help="输出文件，默认标准输出")
+    p = cmd("handles")
+    site_args(p)
+    p.add_argument("--concurrency", type=int, default=50, help="并发协程数，默认 50")
+    p.add_argument("--interval", type=float, default=0.2, help="每个协程两次请求的间隔秒数，默认 0.2")
+    p.add_argument("--proxy", help="查询走的代理地址（如 http://127.0.0.1:7897），默认直连")
+    p.add_argument("--limit", type=int, help="本次最多查询 N 个 DOI（试跑用）")
+    p.add_argument("--apply-only", action="store_true", help="不发请求，只把已有查询结果落到任务上")
     p = cmd("turnstile")
     p.add_argument("--url", help="目标页 URL（token 绑定其 hostname）")
     p.add_argument("--sitekey", help="目标站 Turnstile sitekey（0x4AAAA…）")
@@ -685,6 +749,9 @@ def main() -> None:
         return
     if args.cmd == "turnstile":
         _turnstile(args, parsers["turnstile"])
+        return
+    if args.cmd == "handles":
+        _handles(args)
         return
     if args.cmd == "resolve":
         from paperlite.preprocess import PreprocessManager

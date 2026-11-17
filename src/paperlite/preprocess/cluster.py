@@ -70,6 +70,60 @@ class PatternExtractor:
         return m.group(1) if m else raw
 
 
+def pattern_key_sql(col: str) -> str:
+    """
+    DOI 族群键的 DuckDB 表达式（col 须为小写 DOI）。聚类（resolve）与导入排序（paperlite import）共用这一份，
+    保证任务库里同族群的任务连号、与 doi_domain_routes 的 pattern_key 一致。
+    """
+    return f"""CASE
+        -- 1. Elsevier (10.1016) 二级期刊/ISSN 细粒度归纳
+        WHEN {col} LIKE '10.1016/%' THEN
+            regexp_extract({col}, '^(10\\.1016/(?:j\\.[a-z0-9_-]+|s[0-9a-z_-]+|[a-z0-9_-]+))', 1)
+        -- 2. Wiley (10.1002) 二级期刊归纳
+        WHEN {col} LIKE '10.1002/%' THEN
+            coalesce(nullif(regexp_extract({col}, '^(10\\.1002/[a-z0-9_-]+)\\.', 1), ''), regexp_extract({col}, '^(10\\.1002/[^/]+)', 1))
+        -- 3. 其他所有标准出版商 (10.1109, 10.1038, 10.1145 等)
+        ELSE
+            regexp_extract({col}, '^(10\\.[0-9]+)', 1)
+    END"""
+
+
+def read_doi_file(path: str, header: bool):
+    """
+    读只有 DOI 的文件（paperlite import 用）：header=True 时取 CSV 的 doi 列，否则一行一个 DOI。
+    值可以是裸 DOI 或 doi.org 链接；按 (族群键, doi) 排序产出小写 DOI，便于浏览器按 id 领取时同族群连续。
+    返回 (DOI 生成器, 认不出 DOI 而跳过的行数)。
+    """
+    safe = str(Path(path).resolve()).replace("'", "''")
+    if header:
+        src = f"read_csv('{safe}', header=true, all_varchar=true)"
+        con = duckdb.connect()
+        cols = {r[0].lower(): r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()}
+        raw = '"' + cols["doi"].replace('"', '""') + '"'
+    else:   # 一行一个 DOI：用制表符作分隔、不认引号，整行即一个值（DOI 里可能有逗号）
+        src = f"read_csv('{safe}', header=false, delim='\\t', quote='', escape='', columns={{'v': 'VARCHAR'}})"
+        con = duckdb.connect()
+        raw = "v"
+    norm = f"""(SELECT CASE WHEN v LIKE '10.%' THEN v
+                         ELSE nullif(regexp_extract(v, 'doi\\.org/(10\\..+)$', 1), '') END AS doi
+               FROM (SELECT lower(trim({raw})) AS v FROM {src}) WHERE v IS NOT NULL AND v != '')"""
+    skipped = con.execute(f"SELECT count(*) FROM {norm} WHERE doi IS NULL").fetchone()[0]
+    cur = con.execute(f"SELECT doi FROM {norm} WHERE doi IS NOT NULL ORDER BY {pattern_key_sql('doi')}, doi")
+
+    def gen():
+        try:
+            while True:
+                chunk = cur.fetchmany(50000)
+                if not chunk:
+                    return
+                for (doi,) in chunk:
+                    yield doi
+        finally:
+            con.close()
+
+    return gen(), skipped
+
+
 class DuckDBClusterer:
     """
     DuckDB 极速向量化聚类抽样器。
@@ -130,19 +184,9 @@ class DuckDBClusterer:
                 WHERE {col_expr} IS NOT NULL AND {col_expr} != ''
             ),
             classified AS (
-                SELECT 
+                SELECT
                     doi,
-                    CASE
-                        -- 1. Elsevier (10.1016) 二级期刊/ISSN 细粒度归纳
-                        WHEN doi LIKE '10.1016/%' THEN
-                            regexp_extract(doi, '^(10\\.1016/(?:j\\.[a-z0-9_-]+|s[0-9a-z_-]+|[a-z0-9_-]+))', 1)
-                        -- 2. Wiley (10.1002) 二级期刊归纳
-                        WHEN doi LIKE '10.1002/%' THEN
-                            coalesce(nullif(regexp_extract(doi, '^(10\\.1002/[a-z0-9_-]+)\\.', 1), ''), regexp_extract(doi, '^(10\\.1002/[^/]+)', 1))
-                        -- 3. 其他所有标准出版商 (10.1109, 10.1038, 10.1145 等)
-                        ELSE
-                            regexp_extract(doi, '^(10\\.[0-9]+)', 1)
-                    END AS pattern_key,
+                    {pattern_key_sql('doi')} AS pattern_key,
                     split_part(doi, '/', 1) AS publisher_doi
                 FROM cleaned
                 WHERE doi LIKE '10.%'

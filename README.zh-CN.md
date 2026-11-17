@@ -247,7 +247,7 @@ headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调
 | 命令 | 说明 |
 |---|---|
 | `init [--force]` | 生成 `config.toml` 模板 |
-| `import --urls FILE [--type pdf\|html]` | 导入任务。支持一行一个 URL 的文本文件，或含 `url` 列的 CSV（可选 `doi`、`source`、`batch_no`、`url_type` 列）。重复导入不会重置已有任务 |
+| `import --urls FILE [--type pdf\|html]` | 导入任务。支持一行一个 URL 的文本文件，或含 `url` 列的 CSV（可选 `doi`、`source`、`batch_no`、`url_type` 列）。**只有 DOI 时**（一行一个 DOI，或只有 `doi` 列的 CSV）链接拼成 `https://doi.org/{doi}`、按 DOI 族群排序入库，`real_host` 留空交给 `run --auto` 按 DOI 映射回填，之后可用 `handles` 换成落地 URL。没有可导入的行会报错退出。重复导入不会重置已有任务 |
 | `run [CONFIG] [--urls FILE] [--workers N]` | 下载直至队列清空。默认浏览器模式；`--auto` 开启自适应混合路由；`--curl` 切换到 curl 模式；`--no-proxy` 使用本机 IP |
 | `preprocess --urls FILE [--out-rules TOML]` | 全流程预处理：DuckDB 极速聚类、并发跳转嗅探真实域名、双视角反爬体检定级并导出分流规则 |
 | `resolve --urls FILE [--out-map DB]` | 预处理阶段一：聚类代表族群并嗅探落地域名，建档至 SQLite 映射库 |
@@ -258,6 +258,7 @@ headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调
 | `retry --status failed [--kind KIND]` | 将失败（或 `non_pdf`）任务重置为 `pending` |
 | `retry --stopped-volumes` | 让被卷期规则停止的卷期重新抽样核实 |
 | `export [--status S] [--file out.csv]` | 将任务表导出为 CSV |
+| `handles [--concurrency 50] [--interval 0.2] [--proxy URL] [--limit N] [--apply-only]` | 只给 DOI 时：查 doi.org Handle API，把 pending 任务的 `doi.org/{doi}` 链接就地换成出版商登记的落地 URL（少一跳）；未注册的 DOI 标 `failed`/`not_found`（不删，可 `export --status failed` 导出）。查询结果存 `doi_handles` 表，可断点续跑；限流/网络错误只重试、不判失效 |
 | `inspect [--list] [--reset]` | 查看、重建或清除重复标题跳过规则 |
 | `turnstile --url URL --sitekey KEY` | 获取 Cloudflare Turnstile token（见[下文](#turnstile-token)） |
 

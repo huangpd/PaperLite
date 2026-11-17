@@ -122,7 +122,22 @@ CREATE TABLE IF NOT EXISTS skip_rules (
     created_at TEXT    NOT NULL,
     PRIMARY KEY (doi_prefix, url_prefix)
 );
+CREATE TABLE IF NOT EXISTS doi_handles (   -- doi.org Handle API 查询结果（paperlite handles），只存确定结果
+    doi        TEXT PRIMARY KEY,
+    status     TEXT NOT NULL CHECK (status IN ('ok', 'not_found', 'no_url')),
+    url        TEXT,                       -- ok 时为登记的落地 URL
+    checked_at TEXT NOT NULL
+);
 """
+
+# 仍是 doi.org 拼接链接的任务（paperlite handles 只处理这些，已是出版商直链的不动）
+# DOI 解析入口（不是出版商落地站）：导入时这些主机不写 real_host
+DOI_RESOLVER_HOSTS = frozenset({"doi.org", "dx.doi.org"})
+
+_DOI_ORG_URL = ("(p.url LIKE 'https://doi.org/%' OR p.url LIKE 'http://doi.org/%' "
+                "OR p.url LIKE 'https://dx.doi.org/%' OR p.url LIKE 'http://dx.doi.org/%')")   # 表别名须为 p
+_HANDLE_INVALID_MSG = {"not_found": "DOI 未注册（doi.org Handle API 404）",
+                       "no_url": "DOI 已注册但未登记落地 URL（doi.org Handle API）"}
 
 
 # ── 任务身份（与 paper_downloader downloader/identity.py、paths.py 规则一致）──────────────
@@ -334,39 +349,54 @@ class TaskDB:
 
     # ── 导入 ──────────────────────────────────────────────────
 
+    _IMPORT_CHUNK = 50000        # import_urls 每块写入的行数
+
     def import_urls(self, rows: Iterable[dict]) -> tuple[int, int]:
         """
         rows: {"url"（或旧名 "pdf_url"）, 可选 "doi"（或旧名 "paper_uid"）/ "source" / "batch_no" / "url_type"}。返回 (新增, 已存在)。
         doi 来自导入列，没给则从 URL 回退推导（纯 URL 列表照样能用）。允许混合多个主机（browse 模式按每条 URL 各自过盾）。
         """
         host = self.host()
-        batch, seen = [], 0
+        batch, seen, added = [], 0, 0
         ts = now_text()
-        for r in rows:
-            url = (r.get("url") or r.get("pdf_url") or "").strip()
-            h = url_host(url)
-            if not h:
-                raise ValueError(f"不是有效链接: {url}")
-            host = host or h          # meta 只记第一个主机（curl 模式的落地页/身份池用）；允许再导入别的主机
-            doi = (r.get("doi") or r.get("paper_uid") or "").strip().lower() or derive_doi(url)
-            kind = (r.get("url_type") or UrlType.PDF).strip().lower()
-            if kind not in UrlType.ALL:
-                raise ValueError(f"url_type 只能是 {' / '.join(UrlType.ALL)}，不是 {kind!r}: {url}")
-            batch.append((url_key(url), doi, url, kind, r.get("source") or None, r.get("batch_no") or None,
-                          derive_volume(doi), (r.get("real_host") or h).lower(), ts, ts))
-            seen += 1
+        sql = ("INSERT INTO paper_pdf_resources (url_key, doi, url, url_type, source, batch_no, volume, real_host, "
+               "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (url_key) DO NOTHING")
+        # 一个事务内分块写入：百万级 DOI 导入时内存只留一块；任一行出错整批回滚
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            c = self._conn
+
+            def flush() -> int:
+                b = c.total_changes
+                c.executemany(sql, batch)
+                batch.clear()
+                return c.total_changes - b
+
+            c.execute("BEGIN IMMEDIATE")
             try:
-                self._conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('host', ?)", (host,))
-                before = self._conn.total_changes
-                self._conn.executemany(
-                    "INSERT INTO paper_pdf_resources (url_key, doi, url, url_type, source, batch_no, volume, real_host, "
-                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (url_key) DO NOTHING", batch)
-                added = self._conn.total_changes - before
-                self._conn.execute("COMMIT")
+                for r in rows:
+                    url = (r.get("url") or r.get("pdf_url") or "").strip()
+                    h = url_host(url)
+                    if not h:
+                        raise ValueError(f"不是有效链接: {url}")
+                    host = host or h      # meta 只记第一个主机（curl 模式的落地页/身份池用）；允许再导入别的主机
+                    doi = (r.get("doi") or r.get("paper_uid") or "").strip().lower() or derive_doi(url)
+                    kind = (r.get("url_type") or UrlType.PDF).strip().lower()
+                    if kind not in UrlType.ALL:
+                        raise ValueError(f"url_type 只能是 {' / '.join(UrlType.ALL)}，不是 {kind!r}: {url}")
+                    # doi.org 只是解析入口，不是落地站：real_host 留空，交给 backfill_real_hosts 按 DOI 映射回填
+                    real_host = r.get("real_host") or (None if h in DOI_RESOLVER_HOSTS else h)
+                    batch.append((url_key(url), doi, url, kind, r.get("source") or None, r.get("batch_no") or None,
+                                  derive_volume(doi), real_host.lower() if real_host else None, ts, ts))
+                    seen += 1
+                    if len(batch) >= self._IMPORT_CHUNK:
+                        added += flush()
+                if batch:
+                    added += flush()
+                if host:
+                    c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('host', ?)", (host,))
+                c.execute("COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                c.execute("ROLLBACK")
                 raise
         return added, seen - added
 
@@ -645,6 +675,78 @@ class TaskDB:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    # ── doi.org Handle API（paperlite handles）────────────────────
+
+    def unresolved_doi_tasks(self, after_id: int, limit: int) -> list[tuple[int, str]]:
+        """id > after_id 的 pending 任务里，链接仍是 doi.org 拼接、且 doi 还没有确定查询结果的 [(id, doi)]。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT p.id, p.doi FROM paper_pdf_resources p "
+                f"WHERE p.id > ? AND p.status = 'pending' AND {_DOI_ORG_URL} "
+                "AND NOT EXISTS (SELECT 1 FROM doi_handles h WHERE h.doi = p.doi) "
+                "ORDER BY p.id LIMIT ?", (after_id, limit)).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def save_handles(self, rows: list[tuple[str, str, Optional[str]]]) -> None:
+        """rows: [(doi, status, url)]，status ∈ ok / not_found / no_url。"""
+        if not rows:
+            return
+        ts = now_text()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.executemany(
+                    "INSERT INTO doi_handles (doi, status, url, checked_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT (doi) DO UPDATE SET status = excluded.status, url = excluded.url, "
+                    "checked_at = excluded.checked_at", [(d, s, u, ts) for d, s, u in rows])
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def apply_handles(self, batch: int = 5000) -> dict[str, int]:
+        """
+        把 doi_handles 的结果落到仍是 doi.org 链接的 pending 任务上（就地改，不新增行，可重复执行）：
+        - ok：url / url_key 换成登记的落地 URL；real_host 若只是旧链接的主机（doi.org）则清空，交给 backfill 按 DOI 映射重填；
+          新 URL 已被别的任务占用（url_key 唯一）则保持原样，计入 conflict；
+        - not_found / no_url：标 failed + not_found，不下载，可用 export --status failed 导出。
+        返回 {"updated", "invalid", "conflict"}。
+        """
+        out = {"updated": 0, "invalid": 0, "conflict": 0}
+        after_id = 0
+        while True:
+            with self._lock:
+                c = self._conn
+                rows = c.execute(
+                    "SELECT p.id, p.url, p.real_host, h.status, h.url FROM paper_pdf_resources p "
+                    "JOIN doi_handles h ON h.doi = p.doi "
+                    f"WHERE p.id > ? AND p.status = 'pending' AND {_DOI_ORG_URL} ORDER BY p.id LIMIT ?",
+                    (after_id, batch)).fetchall()
+                if not rows:
+                    return out
+                ts = now_text()
+                c.execute("BEGIN IMMEDIATE")
+                try:
+                    for task_id, old_url, real_host, status, new_url in rows:
+                        if status == "ok":
+                            host = None if real_host == url_host(old_url) else real_host
+                            n = c.execute(
+                                "UPDATE OR IGNORE paper_pdf_resources SET url = ?, url_key = ?, real_host = ?, "
+                                "updated_at = ? WHERE id = ?",
+                                (new_url, url_key(new_url), host, ts, task_id)).rowcount
+                            out["updated" if n else "conflict"] += 1
+                        else:
+                            c.execute(
+                                "UPDATE paper_pdf_resources SET status = 'failed', error_kind = 'not_found', "
+                                "error_message = ?, http_status = ?, claimed_by = NULL, updated_at = ? WHERE id = ?",
+                                (_HANDLE_INVALID_MSG[status], 404 if status == "not_found" else None, ts, task_id))
+                            out["invalid"] += 1
+                    c.execute("COMMIT")
+                except BaseException:
+                    c.execute("ROLLBACK")
+                    raise
+            after_id = rows[-1][0]
 
     def kind_counts(self) -> list[tuple[str, str, int, int]]:
         """[(status, error_kind, 条数, 其中按卷期推断的条数)]"""

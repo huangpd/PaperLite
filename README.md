@@ -223,7 +223,7 @@ Command-line overrides: `--db` takes precedence over `[paths].db`, and `--storag
 | Command | Description |
 |---|---|
 | `init [--force]` | Generate a `config.toml` template |
-| `import --urls FILE [--type pdf\|html]` | Import tasks from a text file (one URL per line) or a CSV with a `url` column and optional `doi`, `source`, `batch_no` and `url_type` columns. Re-importing never resets existing tasks |
+| `import --urls FILE [--type pdf\|html]` | Import tasks from a text file (one URL per line) or a CSV with a `url` column and optional `doi`, `source`, `batch_no` and `url_type` columns. **DOI-only input** (one DOI per line, or a CSV with only a `doi` column) becomes `https://doi.org/{doi}` links, inserted sorted by DOI pattern with `real_host` left empty for `run --auto` to backfill from the DOI map; run `handles` afterwards to switch to landing URLs. Fails if nothing is importable. Re-importing never resets existing tasks |
 | `run [CONFIG] [--urls FILE] [--workers N]` | Download until the queue is empty. Browser mode by default; `--auto` enables adaptive routing; `--curl` switches to curl mode; `--no-proxy` uses the local IP |
 | `preprocess --urls FILE [--out-rules TOML]` | End-to-end preprocessing: DuckDB pattern clustering, redirect domain probing, differential WAF diagnosis and rule export |
 | `resolve --urls FILE [--out-map DB]` | Stage 1 preprocessor: Cluster patterns and probe landing domains into SQLite map |
@@ -234,6 +234,7 @@ Command-line overrides: `--db` takes precedence over `[paths].db`, and `--storag
 | `retry --status failed [--kind KIND]` | Reset failed (or `non_pdf`) tasks to `pending` |
 | `retry --stopped-volumes` | Re-sample volumes stopped by the volume heuristic |
 | `export [--status S] [--file out.csv]` | Export the task table as CSV |
+| `handles [--concurrency 50] [--interval 0.2] [--proxy URL] [--limit N] [--apply-only]` | DOI-only batches: query the doi.org Handle API and rewrite pending `doi.org/{doi}` links in place to the publisher-registered landing URL (one less redirect); unregistered DOIs are marked `failed`/`not_found` (kept, exportable via `export --status failed`). Results live in `doi_handles`, so runs resume; rate limits / network errors are retried, never treated as invalid |
 | `inspect [--list] [--reset]` | Show, rebuild or clear the duplicate-title skip rules |
 | `turnstile --url URL --sitekey KEY` | Obtain a Cloudflare Turnstile token (see [below](#turnstile-tokens)) |
 
