@@ -9,10 +9,9 @@
 PaperLite 是一个面向大批量场景的 PDF 与网页下载工具，适用于部署在 Cloudflare 等反爬防护之后的站点。它通过轮换的短效代理驱动真实浏览器，将每个任务持久化到本地 SQLite 数据库，中断后可从断点继续。
 
 - **一份配置即一个批次**：任意多个主机的 URL 导入同一个任务库，统一调度。
-- **自适应混合模式（推荐）**：结合体检规则 `domain_rules.toml`，对静态友好域名（Springer等）毫秒级 cURL 直下，对强风控域名无缝切换真实无头浏览器动态解盾。
+- **自适应模式（`auto`）**：按预处理生成的 `domain_rules.toml` 按域名分流：无防护的站点直接用 cURL 下载，cookie 可复用的站点用身份池，强风控站点用浏览器。适合只给 DOI、跨多家出版商的批次，见[自适应模式与 DOI 批次](#自适应模式与-doi-批次)。
 - **默认浏览器模式**：每个 worker 独占一个浏览器和一个 IP，过盾一次后连续下载；自动跟随跳转，可保存 PDF 或完整 HTML 页面。
-- **可续跑、可追溯**：任务状态、错误分类和每次尝试的指标均存于 SQLite；`Ctrl+C` 会把在途任务放回队列。
-- **动态生命周期切片认领**：基于出口 IP 真实剩余寿命（Lease）自适应领取任务切片（Chunk），单事务批量认领，换 IP 或异常中断时 0 延迟安全回滚。
+- **可续跑、可追溯**：任务状态、错误分类和每次尝试的指标均存于 SQLite；`Ctrl+C` 后在途任务回到队列（至迟在下次启动时）。
 - **自我保护**：代理体检、IP 中途失效自动换 IP、代理配额耗尽时熔断，以及跳过失效页或重复内容的启发式规则。
 - **可选的集群监控**：各终端把指标上报到 RabbitMQ，由内置面板跨机器汇总展示。
 
@@ -22,7 +21,7 @@ PaperLite 是一个面向大批量场景的 PDF 与网页下载工具，适用�
 - [环境要求](#环境要求)
 - [安装](#安装)
 - [快速开始](#快速开始)
-- [自适应与预处理流水线](#自适应与预处理流水线)
+- [自适应模式与 DOI 批次](#自适应模式与-doi-批次)
 - [配置](#配置)
 - [命令参考](#命令参考)
 - [运维](#运维)
@@ -39,11 +38,12 @@ PaperLite 提供自适应模式、纯浏览器模式与 curl 模式三种运行�
 
 | | 自适应模式 (`auto`，推荐) | 浏览器模式 (`browser`，默认) | curl 模式 (`--curl`) |
 |---|---|---|---|
-| 工作方式 | 基于 `domain_rules.toml` 动态三路调度：静态秒级直下、ACM等走需求驱动Cookie反压池、Cell等走无头浏览器 | N 个 worker，各自独占浏览器与 IP | 浏览器过盾后把 cookie 存入身份池，`curl_cffi` 线程领用下载 |
-| 每批次主机数 | 任意多主机混合（按域名智能隔离分流） | 任意混合 | 仅限一个 |
-| 跳转 / 网页 | 智能自动嗅探与识别，保存 `.html` / `.pdf` | 自动跟随，网页保存为 `.html` | 以 PDF 为主 |
-| 外部依赖 | **按需依赖 Redis**（`curl_pool` 管线用于存身份与下游 Demand 反压控制；未连通时自动降级至浏览器；纯静态与纯浏览器管线免 Redis） | 无（免 Redis） | 必须依赖 Redis（身份池） |
-| 吞吐表现 | 极致兼顾：静态 0.2s，Cookie 复用 50 倍放大，强盾 100% 成功 | 稳定穿透，单机 2~20 并发 | 单站点海量任务、追求单 IP 吞吐 |
+| 工作方式 | 按 `domain_rules.toml` 把域名分到三条管线：`curl_direct`（cURL 直接下载）、`curl_pool`（同 curl 模式）、`browser_only`（同浏览器模式），依次执行 | N 个 worker，各自独占浏览器与 IP | 浏览器过盾后把 cookie 存入身份池，`curl_cffi` 线程领用下载 |
+| 每批次主机数 | 任意混合 | 任意混合 | 仅限一个 |
+| 跳转 / 网页 | cURL 管线存 PDF 或页面；浏览器管线整页存 `.html` | 自动跟随，网页保存为 `.html` | 以 PDF 为主 |
+| 外部依赖 | 仅 `curl_pool` 需要 Redis；连不上时这些域名改走浏览器 | 无 | Redis（身份池） |
+| 前置步骤 | `resolve` + `audit` 生成规则；DOI 批次可先跑 `handles` | 无 | 无 |
+| 适用场景 | 只给 DOI、跨多家出版商的大批次 | 来源混杂的 URL 列表 | 单站点海量任务、追求单 IP 吞吐 |
 
 `[paths]` 中的两个位置相互独立：
 
@@ -54,7 +54,7 @@ PaperLite 提供自适应模式、纯浏览器模式与 curl 模式三种运行�
 
 - Python 3.11 及以上，Linux 或 macOS。
 - 一个短效代理提取接口，每次调用返回一个新的 `ip:port`（JSON 或纯文本均可），以及代理鉴权账号。本地测试可用 `--no-proxy` 不走代理。
-- Redis：用于 curl 模式，以及自适应模式中的 `curl_pool`（ACM、Wiley 等过盾复用管线）。若自适应模式中未启动 Redis，调度器会自动平滑降级至浏览器池渲染。
+- Redis：curl 模式必需；自适应模式只有 `curl_pool` 管线用到，连不上时这些域名改走浏览器。
 - RabbitMQ：仅启用监控时需要。
 
 ## 安装
@@ -99,61 +99,88 @@ paperlite run config.toml
 
 > **建议**：每次运行都写进配置文件，而不是堆在命令行上。配置文件记录了批次使用的任务库、模式和输出位置，重跑、换机器、交接都可以照着它复现。
 
-## 自适应与预处理流水线
+## 自适应模式与 DOI 批次
 
-面对百万级、跨数十家出版商的混合任务，PaperLite 提供了两阶段预处理子系统与自适应执行引擎：
+客户只给 DOI、论文分散在几十个出版商域名时，用这套流程：先离线摸清每个 DOI 族群落在哪个域名、每个域名该用什么方式下载，再按域名分流运行。
 
 ```
-[原始任务集 (如 195 万 DOI)] 
-         │ 
-         ▼ (DuckDB 向量化聚类: 0.22 秒聚类出代表族群)
-   [阶段一: resolve] ───轻量并发探查落地域名───► [doi_domain_routes (映射库)]
-         │ 
-         ▼ 
-   [阶段二: audit]   ───双视角反爬体检定级─────► [domain_rules.toml (分流规则)]
-         │ 
-         ▼ 
-   [自适应中间调度引擎: AutoScheduler (mode="auto")]
-     ├─ [管线1: curl_direct] (Springer等) ──► 0.2s 极速 cURL 直下（无需浏览器/免Redis）
-     ├─ [管线2: curl_pool]   (ACM/OUP等)   ──► 下游消费拉动生产（Demand-Driven 反压身份池）
-     │                                        • 消费者按待办动态设置 Target
-     │                                        • 生产者严格按需过盾，任务完即停
-     └─ [管线3: browser_only](Cell/AJO等)  ──► CloakBrowser 无头浏览器独占过盾渲染
+DOI 列表
+  │  paperlite import     拼成 https://doi.org/{doi}，按 DOI 族群排序入库（real_host 留空）
+  │  paperlite resolve    DuckDB 聚类出族群，每族抽 1 个样本嗅探落地域名 → doi_domain_routes
+  │  paperlite audit      对去重后的独立域名做"浏览器 vs cURL"体检 → domain_rules.toml
+  │  paperlite handles    （可选）链接换成出版商登记的落地 URL；未注册的 DOI 标 failed
+  ▼  paperlite run --auto  按 DOI 族群回填 real_host，按规则分三条管线下载
 ```
 
-### 1. 运行预处理（一键生成路由快照）
+`resolve` 和 `audit` 都只请求**样本**：195 万个 DOI 收敛成约 3,500 个族群、约 100 个独立域名，几分钟到十几分钟跑完。
+
+### 1. 导入 DOI
 
 ```bash
-# 全流程一键体检生成规则
-paperlite preprocess --urls raw_dois.csv --out-rules domain_rules.toml
-
-# 或拆分为两阶段分别执行：
-# 阶段一：基于 DuckDB 极速聚类并嗅探落地域名（200 万数据几分钟内嗅探完毕）
-paperlite resolve --urls raw_dois.csv --out-map doi_routes.db --concurrency 6
-
-# 阶段二：对嗅探出的独立域名进行双视角反爬体检（无需逐篇排查，仅测独立域名）
-paperlite audit --map doi_routes.db --out-rules domain_rules.toml
+paperlite import --urls new_dois.csv --type html --db db/tasks.db
 ```
 
-生成的 `domain_rules.toml` 结构清晰易读，支持人工自定义覆盖：
+- 输入可以是一行一个 DOI 的文本，或只有 `doi` 列的 CSV；值写成 `https://doi.org/...` 也能识别，认不出的行跳过并告警。
+- DOI 批次建议用 `--type html`：浏览器管线总是整页存 `.html`。
+- 链接里的主机是 `doi.org`，不是真实出版商，所以 `real_host` 留空，运行时按 DOI 族群回填。
+
+### 2. 预处理：`resolve` 与 `audit`
+
+**`--out-map` / `--map` 要指向任务库本身。** 运行时的回填只在任务库里找 `doi_domain_routes` 表，写到别的文件就查不到，所有任务都会被当成 `doi.org` 走浏览器。
+
+```bash
+# 一步完成
+paperlite preprocess --urls new_dois.csv --out-map db/tasks.db --out-rules domain_rules.toml
+
+# 或分两步
+paperlite resolve --urls new_dois.csv --out-map db/tasks.db --concurrency 6
+paperlite audit   --map db/tasks.db --out-rules domain_rules.toml
+```
+
+- `resolve`：已嗅探过的族群会跳过，可反复执行；`--limit N` 只嗅探前 N 个族群，用于试跑；`--proxy` 指定嗅探用的代理。
+- `audit`：对每个独立域名用 CloakBrowser 打开样本页作为真值，再用 cURL 裸请求一次；浏览器拿到了 `cf_clearance` 的，再带上浏览器 cookie 和 UA 请求一次。比较标题、正文长度和摘要片段是否与真值一致，判定下载方式。`--limit N` 只体检前 N 个域名。
+- **先跑预处理，再第一次 `run --auto`。** 回填只填 `real_host` 为空的任务；已经回填过的任务，之后重跑 `resolve` 也不会更新。确实要重新回填时，先清空待下载任务的 `real_host`：
+  ```bash
+  sqlite3 db/tasks.db "UPDATE paper_pdf_resources SET real_host = NULL WHERE status = 'pending'"
+  ```
+
+### 3. 检查并修正 `domain_rules.toml`
+
+体检只看一个样本页，结果要人工过一遍再用。文件结构：
 
 ```toml
-[modes.curl_direct]
-domains = ["link.springer.com", "linkinghub.elsevier.com"]
+[modes.curl_direct]      # 无防护、静态页面：直接用 cURL 下载
+domains = ["link.springer.com"]
 
-[modes.curl_pool]
-domains = ["academic.oup.com", "www.sciencedirect.com"]
+[modes.curl_pool]        # 有 Cloudflare 盾，但浏览器拿到的 cf_clearance 可以给 cURL 复用
+domains = ["academic.oup.com", "dl.acm.org"]
 
-[modes.browser_only]
-domains = ["cell.com", "celltherapyjournal.org", "ajog.org", "ajo.com"]
+[modes.browser_only]     # 强风控、动态签名或前端渲染的空壳页：只能用浏览器
+domains = ["www.sciencedirect.com", "cell.com", "ajog.org"]
 
-[overrides]
-# 支持用户随时手动覆盖："my-site.com" = "browser_only"
+[overrides]              # 人工覆盖，优先级最高
+"linkinghub.elsevier.com" = "browser_only"
 ```
 
-### 2. 配置与启动自适应批次
+- **规则里没有的域名一律走浏览器。**
+- **中转站一律设为 `browser_only`**，例如 `linkinghub.elsevier.com`、`doi.org`、`doi.wiley.com`。它们靠页面内跳转（Meta-Refresh）到达真实站点，浏览器会跟这个跳转，cURL 不会；判成 `curl_direct` 时，会把中转页当成功结果存下来。
+- **和实测不符的以实测为准。** 比如 ScienceDirect 实测必须用浏览器，体检却可能判成 `curl_pool`，就在 `[overrides]` 里改掉。
+- 规则在启动时读取一次，改了要重启 `run` 才生效。
 
-在批次配置文件中指定 `mode = "auto"` 即可自动启用混合调度：
+### 4. 换成落地 URL：`handles`（可选）
+
+```bash
+paperlite handles --db db/tasks.db --limit 5000   # 先试跑，观察速度与 429
+paperlite handles --db db/tasks.db                # 全量；中断后重跑会跳过已查过的 DOI
+```
+
+- 逐个 DOI 查询 `https://doi.org/api/handles/{doi}`，把待下载任务的 `doi.org/{doi}` 链接就地换成出版商登记的 URL，浏览器少跳一次 doi.org。Elsevier 登记的是 `linkinghub.elsevier.com/retrieve/pii/...`，所以仍要经过 linkinghub 中转（见上一节）。
+- 返回 404（未注册）或没有登记 URL 的 DOI，任务标为 `failed`，`error_kind = not_found`。不会删除，可用 `paperlite export --status failed` 导出给客户。
+- 限流（429）、5xx、超时只会退避重试，**不会判为失效**；重试用尽的下次运行再查。查询结果存在任务库的 `doi_handles` 表里。
+- 默认并发 50、每个协程两次请求间隔 0.2 秒（`--concurrency`、`--interval`），理论峰值约 250 次/秒；`--proxy` 指定代理；`--apply-only` 不发请求，只把已有结果落到任务上。
+- 只改链接仍是 doi.org 的待下载任务，已下载、已失败、本来就是出版商直链的不动。和 `run` 互斥，下载进行中不能执行。
+
+### 5. 运行
 
 ```toml
 [paths]
@@ -161,41 +188,47 @@ db      = "db/tasks.db"
 storage = "file/tasks"
 log_dir = "log"
 
-[limits]
-max_browsers = 3
-page_interval_s = [2, 5]
-pass_timeout_s = 45
-
 [run]
-command = "run"
-mode    = "auto"                # 启用自适应模式
-rules   = "domain_rules.toml"   # 加载体检导出的规则快照
-proxy   = false                 # 直连本机网络（生产环境填 true）
-workers = 3
+command  = "run"
+mode     = "auto"
+rules    = "domain_rules.toml"
+proxy    = true
+workers  = 20
 url_type = "html"
 ```
 
-启动命令：
-
 ```bash
 paperlite run config.toml
-# 或通过命令行临时覆盖：
-paperlite run --auto --rules domain_rules.toml --workers 3
+# 或
+paperlite run --auto --rules domain_rules.toml --workers 20
 ```
 
-### 3. 运行机制：下游需求拉动生产（Demand-Driven 反压）与切片认领
+启动时按以下顺序执行：
 
-#### 下游需求驱动生产（Pull-Demand Backpressure）
-在 `curl_pool`（如 ACM、OUP 等）模式下，彻底摒弃了上游盲目提取 IP 开浏览器的无脑生产，改为完全由**下游 cURL 消费者根据待办吞吐动态制导**：
-- **按需拉动**：下游消费者实时感知任务库中该域名的剩余待办量 $P$，动态向 Redis 发布目标需求水位 $\text{Demand} = \min(\text{workers}, \lceil P / 15 \rceil)$。
-- **任务告罄即刻断供**：当待办任务清空（$P \le 0$）或消费者退出时，Demand 瞬间置为 0，上游 Producer 浏览器线程立刻挂起休眠，绝不多消耗 1 个代理 IP。
-- **健康身份放大复用**：单个浏览器过盾产出的 Cookie 寿命通常达 10~30 分钟，由轻量 cURL 消费者在寿命期内连续高并发下载 20~100 篇论文，生产消费比高达 1:50，极致省钱。
+1. **回填 `real_host`**：`real_host` 为空的任务，先按 DOI 族群查 `doi_domain_routes`，查不到再用链接里的主机名。
+2. **按域名分流，三条管线依次执行**（不是并行）：先跑完全部 `curl_direct` 域名，再逐个跑 `curl_pool` 域名，最后剩下的所有任务交给浏览器。
 
-#### 浏览器端生命周期切片认领（Chunk Leasing）
-在 `browser_only` 模式下，针对强风控站点：
-- **生命周期动态适配**：根据代理 IP 当前剩余秒数（`lease.left()`）智能计算 Worker 可认领的任务数（`min(20, max(1, left_s / 8))`）。
-- **原子事务与保序**：任务入库严格按 `(pattern_key, doi)` 聚类排序，认领时直接在单个 SQLite 事务中完成状态切换与绑定。
-- **零丢失安全回滚**：当 IP 寿命临近、发生网络异常或进程退出时，Worker 本地未消费的切片任务瞬间释放回待下载池，不丢任务、不卡死。
+| 管线 | 怎么下 | 保存 | 依赖 | 什么时候降级为浏览器 |
+|---|---|---|---|---|
+| `curl_direct` | 异步 cURL 并发请求，共用一个代理租约 | `pdf` 任务校验 `%PDF-` 后存 PDF，不是 PDF 的记 `non_pdf`；`html` 任务 HTTP 200 即存页面 | 无 | 某个域名连续 3 次遇到 403/429 或盾页 |
+| `curl_pool` | 浏览器过盾产出身份（IP + cookie + UA）放进 Redis，cURL 线程领用下载；按待下载量调节生产 | 同 curl 模式 | Redis、代理 | 连续 3 个新身份首次使用就被拒，且一篇都没下成功；Redis 连不上；未配置代理 |
+| `browser_only` | 每个 worker 独占一个浏览器和 IP | 整页存 `.html` | 无 | — |
+
+注意：
+
+- **`curl_pool` 中，带有效 cookie 仍被挑战的任务不会触发降级**：它们按 `max_url_challenges` 计次，满了判 `failed/challenge_failed`，要用 `retry` 重置。遇到这种情况，就把该域名在 `[overrides]` 里改成 `browser_only`。
+- **`curl_direct` 不检查 HTML 内容**：`html` 任务只要返回 200 就存。所以只把确认静态直出的站点放进 `curl_direct`。
+- `curl_direct` 网络错误满 `max_tries` 次判 `failed/network`；代理提取失败时，会退回本机直连。
+- `--no-proxy`（`proxy = false`）时，`curl_pool` 域名直接改走浏览器。
+- `Ctrl+C` 后，`curl_direct` 已领取但没下完的任务暂时停在 `running`，下次启动时自动放回 `pending`。
+
+### 6. 浏览器批量领取任务
+
+浏览器 worker 一次领一批任务，批量大小按当前 IP 的剩余寿命估算：`min(20, (剩余秒数 - min_left_s) / 8)`，每篇约 8 秒。换 IP、出错或退出时，没处理的任务立即放回 `pending`。
+
+- **启用重复标题巡检时（`title_dup_trigger > 0`，默认开启），每次只领 1 条**，这样新归纳的跳过规则能立刻生效。
+- 批量领取按 `(challenge_count, id)` 顺序取，不判断卷期停止。
+- DOI 批次导入时已按族群排序，按 id 领取时同一期刊的任务基本是连续的。
 
 ## 配置
 
@@ -248,10 +281,10 @@ headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调
 |---|---|
 | `init [--force]` | 生成 `config.toml` 模板 |
 | `import --urls FILE [--type pdf\|html]` | 导入任务。支持一行一个 URL 的文本文件，或含 `url` 列的 CSV（可选 `doi`、`source`、`batch_no`、`url_type` 列）。**只有 DOI 时**（一行一个 DOI，或只有 `doi` 列的 CSV）链接拼成 `https://doi.org/{doi}`、按 DOI 族群排序入库，`real_host` 留空交给 `run --auto` 按 DOI 映射回填，之后可用 `handles` 换成落地 URL。没有可导入的行会报错退出。重复导入不会重置已有任务 |
-| `run [CONFIG] [--urls FILE] [--workers N]` | 下载直至队列清空。默认浏览器模式；`--auto` 开启自适应混合路由；`--curl` 切换到 curl 模式；`--no-proxy` 使用本机 IP |
-| `preprocess --urls FILE [--out-rules TOML]` | 全流程预处理：DuckDB 极速聚类、并发跳转嗅探真实域名、双视角反爬体检定级并导出分流规则 |
-| `resolve --urls FILE [--out-map DB]` | 预处理阶段一：聚类代表族群并嗅探落地域名，建档至 SQLite 映射库 |
-| `audit [--map DB] [--out-rules TOML]` | 预处理阶段二：仅对已嗅探的独立域名做双视角反爬体检，导出 `domain_rules.toml` |
+| `run [CONFIG] [--urls FILE] [--workers N]` | 下载直至队列清空。默认浏览器模式；`--auto [--rules TOML]` 自适应模式；`--curl` 切换到 curl 模式；`--no-proxy` 使用本机 IP |
+| `preprocess --urls FILE --out-map DB [--out-rules TOML] [--proxy URL]` | 依次执行 `resolve` 和 `audit`。`--out-map` 应指向任务库，见[预处理](#2-预处理resolve-与-audit) |
+| `resolve --urls FILE --out-map DB [--limit N] [--proxy URL]` | 预处理第一步：按 DOI 聚类族群，每族抽 1 个样本嗅探落地域名，写入 `doi_domain_routes`；已嗅探过的族群跳过 |
+| `audit --map DB [--out-rules TOML] [--limit N]` | 预处理第二步：对去重后的独立域名做体检，结果写入 `domain_profiles` 并导出 `domain_rules.toml` |
 | `produce [--keep N]` | curl 模式：只运行身份生产者（常驻） |
 | `download [--workers N]` | curl 模式：只运行下载线程，需另有生产者在运行 |
 | `status` | 各状态计数、按 `error_kind` 分组的失败数、已停卷期，curl 模式下还包括身份池 |
@@ -367,18 +400,19 @@ token 一次性有效，有效期约 300 秒。部分站点会校验提交时的
 | `id` | 自增主键，按此顺序领取任务 |
 | `url_key` | 规范化 URL 的 SHA-256，唯一 |
 | `doi` | 导入值（转小写）或从 URL 推导，决定文件名 |
-| `url`、`source`、`batch_no` | 导入时的原值 |
+| `url`、`source`、`batch_no` | 导入时的原值；`url` 可被 `handles` 换成登记的落地 URL |
+| `real_host` | 真实落地域名，自适应模式按它分流；`doi.org` 链接导入时为空，运行时按 DOI 族群回填 |
 | `url_type` | `pdf`（期望得到 PDF）或 `html`（保存网页本身） |
 | `volume` | DOI 卷期号（`10.1145/1012326.1012328` → `1012326`），用于卷期停止 |
 | `status` | `pending` → `running` → `success` / `non_pdf` / `failed` |
-| `error_kind` | `not_found`、`paywall`、`landing_page`（non-PDF）；`network`、`server_error`、`extract_failed`、`challenge_failed` |
+| `error_kind` | `not_found`、`paywall`、`landing_page`（non-PDF）；`network`、`server_error`、`extract_failed`、`challenge_failed`、`blocked`、`rate_limited`。`handles` 判为未注册的 DOI 也记 `not_found` |
 | `title`、`final_url` | 页面标题；跟随跳转后的最终地址 |
 | `http_status`、`file_size`、`elapsed_ms`、`exit_ip` | 最近一次尝试的指标 |
 | `retry_count`、`challenge_count` | 网络错误或 5xx 的重试次数；持有效 cookie 仍被挑战的次数 |
 | `inferred` | 为 1 表示结果由卷期停止推断得出，未实际请求 |
 | `file_path` | `<storage>/<h[0:2]>/<h[2:4]>/<doi>.pdf`（网页为 `.html`），其中 `h = sha256(doi)` |
 
-辅助表：`meta`、`volume_stops`、`skip_rules`。
+辅助表：`meta`、`volume_stops`、`skip_rules`；DOI 批次还有 `doi_handles`（`handles` 的查询结果）、`doi_domain_routes`（族群 → 落地域名）、`domain_profiles`（域名体检结果）。
 
 ```bash
 sqlite3 tasks.db "SELECT status, error_kind, count(*) FROM paper_pdf_resources GROUP BY 1, 2"
@@ -432,7 +466,10 @@ src/paperlite/
   cookies.py          CookieJar 与浏览器/Redis cookie 记录转换
   store.py            curl 模式：Redis 身份池（Lua 原子领用、租约、生产者锁）
   consumer.py         curl 模式：下载线程、流式下载、身份健康判定
-  tasks.py            SQLite 任务库、卷期停止
+  tasks.py            SQLite 任务库、卷期停止、real_host 回填
+  scheduler.py        自适应模式：按 domain_rules.toml 分流到 curl_direct / curl_pool / 浏览器
+  handles.py          doi.org Handle API 批量查询（paperlite handles）
+  preprocess/         预处理：DuckDB 聚类、落地域名嗅探、域名体检、规则导出
   inspect.py          重复标题规则归纳
   classify.py         non-PDF 分类（not_found、paywall、landing_page）
   proxy.py            代理提取与分层体检（TCP/TLS/TTFB/总耗时）

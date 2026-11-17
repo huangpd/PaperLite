@@ -9,10 +9,9 @@
 PaperLite is a high-volume downloader for PDFs and web pages served behind bot-protection layers such as Cloudflare. It drives real browsers through rotating short-lived proxies, persists every task in a local SQLite database, and resumes cleanly after interruption.
 
 - **One config file, one batch.** URLs from any number of hosts go into a single task database and are processed together.
-- **Adaptive Hybrid Mode (Recommended).** Guided by `domain_rules.toml`, lightweight cURL handles static publisher sites in milliseconds while CloakBrowser seamlessly challenges Cloudflare for protected targets.
+- **Adaptive mode (`auto`).** Routes each domain according to a preprocessed `domain_rules.toml`: unprotected sites are fetched directly with cURL, sites with reusable cookies use the identity pool, heavily protected sites use the browser. Built for DOI-only batches spanning many publishers; see [Adaptive mode and DOI batches](#adaptive-mode-and-doi-batches).
 - **Browser mode by default.** Each worker owns one browser and one IP, solves the challenge once, then downloads continuously, following redirects and saving PDFs or full HTML pages.
-- **Resumable and inspectable.** Task state, error classes and per-attempt metrics live in SQLite; `Ctrl+C` returns in-flight tasks to the queue.
-- **Lifecycle-driven Chunk Leasing.** Workers atomically claim task chunks sized dynamically to the proxy IP's remaining lifespan, rolling back unconsumed items with zero lag upon IP rotation.
+- **Resumable and inspectable.** Task state, error classes and per-attempt metrics live in SQLite; after `Ctrl+C`, in-flight tasks return to the queue (at the latest on the next start).
 - **Self-protecting.** Proxy health checks, IP rotation on mid-lease failure, a circuit breaker for exhausted proxy quotas, and heuristics that skip dead or duplicate content.
 - **Optional fleet monitoring.** Terminals publish metrics to RabbitMQ; a bundled dashboard aggregates them across machines.
 
@@ -22,7 +21,7 @@ PaperLite is a high-volume downloader for PDFs and web pages served behind bot-p
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
-- [Adaptive Mode & Preprocessing Pipeline](#adaptive-mode--preprocessing-pipeline)
+- [Adaptive mode and DOI batches](#adaptive-mode-and-doi-batches)
 - [Configuration](#configuration)
 - [Command reference](#command-reference)
 - [Operations](#operations)
@@ -39,11 +38,12 @@ PaperLite offers three execution modes sharing the same task database, storage l
 
 | | Adaptive mode (`auto`, recommended) | Browser mode (`browser`, default) | curl mode (`--curl`) |
 |---|---|---|---|
-| Model | 3-way dynamic dispatch: cURL direct for static, demand-driven cURL pool for ACM/Wiley, headless browser for WAF | N workers, each with its own browser and IP | Browsers solve challenges and pool the cookies; `curl_cffi` threads download with them |
-| Hosts per batch | Any mix (per-domain isolated dispatch) | Any mix | Exactly one |
-| Redirects / HTML pages | Followed; saved as `.html` / `.pdf` | Followed; pages saved as `.html` | PDF-oriented |
-| External services | **Redis as needed** (`curl_pool` pipeline uses Redis for identity storage and downstream demand backpressure; falls back to browser if Redis is unavailable; direct/browser pipelines need no Redis) | None (No Redis required) | Redis required (identity pool) |
-| Throughput | Peak efficiency: 0.2s for direct, 50x Cookie reuse for pooled, 100% bypass for WAF | High bypass, 2–20 concurrent browsers | Very large single-site jobs where throughput per IP matters |
+| Model | `domain_rules.toml` assigns each domain to one of three pipelines run in sequence: `curl_direct` (plain cURL), `curl_pool` (as curl mode), `browser_only` (as browser mode) | N workers, each with its own browser and IP | Browsers solve challenges and pool the cookies; `curl_cffi` threads download with them |
+| Hosts per batch | Any mix | Any mix | Exactly one |
+| Redirects / HTML pages | cURL pipelines save PDFs or pages; the browser pipeline saves whole pages as `.html` | Followed; pages saved as `.html` | PDF-oriented |
+| External services | Redis for `curl_pool` only; if unreachable those domains use the browser | None | Redis (identity pool) |
+| Prerequisites | `resolve` + `audit` to build the rules; optionally `handles` for DOI batches | None | None |
+| Best for | Large DOI-only batches across many publishers | Mixed URL lists | Very large single-site jobs where throughput per IP matters |
 
 Two storage locations are configured independently under `[paths]`:
 
@@ -54,7 +54,7 @@ Two storage locations are configured independently under `[paths]`:
 
 - Python 3.11 or later; Linux or macOS.
 - A short-lived proxy extraction API that returns a fresh `ip:port` per call (JSON or plain text), plus proxy credentials. `--no-proxy` runs without one for local testing.
-- Redis: required for curl mode, and used by the `curl_pool` pipeline in adaptive mode. If Redis is not available, adaptive mode gracefully falls back to browser pool rendering.
+- Redis: required for curl mode; in adaptive mode only the `curl_pool` pipeline uses it, and those domains fall back to the browser if Redis is unreachable.
 - RabbitMQ, only if you enable monitoring.
 
 ## Installation
@@ -99,42 +99,88 @@ The command imports the URL file, downloads everything, and exits when the queue
 
 > **Tip:** keep every run in a config file rather than on the command line. The file records which database, mode and output location a batch uses, which makes reruns, migrations and hand-overs reproducible.
 
-## Adaptive Mode & Preprocessing Pipeline
+## Adaptive mode and DOI batches
 
-When handling multi-million paper datasets spanning dozens of publisher domains, PaperLite features a two-stage preprocessor and an adaptive execution engine:
+Use this workflow when the client supplies only DOIs and the papers are spread over dozens of publisher domains. First work out offline which domain each DOI pattern lands on and how each domain should be downloaded, then run with per-domain routing.
 
 ```
-[Raw Tasks (e.g. 1.95M DOIs)] 
-             │ 
-             ▼ (DuckDB Vectorized SQL: 0.22s pattern clustering)
-   [Stage 1: resolve]  ───Concurrent redirect probing───► [doi_domain_routes (DB)]
-             │ 
-             ▼ 
-   [Stage 2: audit]    ───Differential WAF diagnosis────► [domain_rules.toml (Rules)]
-             │ 
-             ▼ 
-   [Adaptive Run: paperlite run (mode="auto")]
-     ├─ curl_direct (Springer, etc.) ──► 0.2s lightweight cURL fetch
-     └─ browser_only (Cell, SD, etc.) ──► CloakBrowser auto-solving WAF
+DOI list
+  │  paperlite import     build https://doi.org/{doi} links, insert sorted by DOI pattern (real_host empty)
+  │  paperlite resolve    cluster DOIs into patterns with DuckDB, probe one sample per pattern → doi_domain_routes
+  │  paperlite audit      browser-vs-cURL check of each distinct domain → domain_rules.toml
+  │  paperlite handles    (optional) switch links to publisher-registered URLs; mark unregistered DOIs failed
+  ▼  paperlite run --auto  backfill real_host from the DOI patterns, download through three pipelines
 ```
 
-### 1. Run Preprocessing Pipeline
+`resolve` and `audit` only request **samples**: 1.95M DOIs collapse into about 3,500 patterns and about 100 distinct domains, which takes minutes rather than hours.
+
+### 1. Import DOIs
 
 ```bash
-# End-to-end audit in one command:
-paperlite preprocess --urls raw_dois.csv --out-rules domain_rules.toml
-
-# Or split into individual stages:
-# Stage 1: Fast pattern clustering & redirect domain probing via DuckDB (2M DOIs in minutes)
-paperlite resolve --urls raw_dois.csv --out-map doi_routes.db --concurrency 6
-
-# Stage 2: Audit only the unique target domains
-paperlite audit --map doi_routes.db --out-rules domain_rules.toml
+paperlite import --urls new_dois.csv --type html --db db/tasks.db
 ```
 
-### 2. Configure & Run Adaptive Batch
+- Input is a text file with one DOI per line, or a CSV with only a `doi` column. Values written as `https://doi.org/...` are recognised; anything else is skipped with a warning.
+- Use `--type html` for DOI batches: the browser pipeline always saves the whole page as `.html`.
+- The link host is `doi.org`, not the real publisher, so `real_host` is left empty and filled in from the DOI pattern at run time.
 
-In your `config.toml`, set `mode = "auto"` to activate dynamic hybrid routing:
+### 2. Preprocess: `resolve` and `audit`
+
+**Point `--out-map` / `--map` at the task database itself.** The run-time backfill only looks for `doi_domain_routes` inside the task database. If the map goes to another file it is never found, and every task is treated as `doi.org` and sent to the browser.
+
+```bash
+# in one step
+paperlite preprocess --urls new_dois.csv --out-map db/tasks.db --out-rules domain_rules.toml
+
+# or in two
+paperlite resolve --urls new_dois.csv --out-map db/tasks.db --concurrency 6
+paperlite audit   --map db/tasks.db --out-rules domain_rules.toml
+```
+
+- `resolve` skips patterns it has already probed, so it can be rerun. `--limit N` probes only the first N patterns for a trial; `--proxy` sets the proxy used for probing.
+- `audit` opens a sample page in CloakBrowser as ground truth, then requests it once with bare cURL and, if the browser obtained `cf_clearance`, once more with the browser's cookies and user agent. It compares title, text length and an abstract snippet against the ground truth to pick a mode. `--limit N` audits only the first N domains.
+- **Preprocess before the first `run --auto`.** Backfill only fills tasks whose `real_host` is empty; rerunning `resolve` later does not update tasks that were already filled. To backfill again, clear `real_host` on pending tasks first:
+  ```bash
+  sqlite3 db/tasks.db "UPDATE paper_pdf_resources SET real_host = NULL WHERE status = 'pending'"
+  ```
+
+### 3. Review and correct `domain_rules.toml`
+
+The audit looks at a single sample page per domain, so review its output before using it. The file looks like this:
+
+```toml
+[modes.curl_direct]      # no protection, static pages: download directly with cURL
+domains = ["link.springer.com"]
+
+[modes.curl_pool]        # Cloudflare-protected, but a browser's cf_clearance can be reused by cURL
+domains = ["academic.oup.com", "dl.acm.org"]
+
+[modes.browser_only]     # strong bot protection, signed URLs or client-rendered shells: browser only
+domains = ["www.sciencedirect.com", "cell.com", "ajog.org"]
+
+[overrides]              # manual overrides, highest priority
+"linkinghub.elsevier.com" = "browser_only"
+```
+
+- **Domains missing from the rules always go to the browser.**
+- **Set redirect hops to `browser_only`**, for example `linkinghub.elsevier.com`, `doi.org` and `doi.wiley.com`. They reach the real site through an in-page (meta-refresh) redirect that browsers follow and cURL does not; under `curl_direct` the hop page would be saved as a success.
+- **Field experience beats the audit.** ScienceDirect, for example, needs a browser in practice but may be audited as `curl_pool`; override it.
+- Rules are read once at start-up; restart `run` after editing.
+
+### 4. Switch to landing URLs: `handles` (optional)
+
+```bash
+paperlite handles --db db/tasks.db --limit 5000   # trial: watch the rate and any 429s
+paperlite handles --db db/tasks.db                # full run; reruns skip DOIs already resolved
+```
+
+- Queries `https://doi.org/api/handles/{doi}` per DOI and rewrites pending `doi.org/{doi}` links in place to the publisher-registered URL, saving the browser the doi.org redirect. Elsevier registers `linkinghub.elsevier.com/retrieve/pii/...`, so the linkinghub hop remains (see above).
+- DOIs that return 404 (unregistered) or have no registered URL are marked `failed` with `error_kind = not_found`. They are kept, not deleted; export them with `paperlite export --status failed`.
+- Rate limits (429), 5xx and timeouts are retried with backoff and **never treated as invalid**; DOIs that exhaust their retries are queried again on the next run. Results are stored in the task database's `doi_handles` table.
+- Defaults: 50 concurrent workers, 0.2 s between requests per worker (`--concurrency`, `--interval`), a theoretical peak of about 250 requests/s. `--proxy` sets a proxy; `--apply-only` sends no requests and only applies stored results.
+- Only pending tasks whose link is still a doi.org link are touched. It takes the download lock, so it cannot run while `run` is active.
+
+### 5. Run
 
 ```toml
 [paths]
@@ -142,34 +188,47 @@ db      = "db/tasks.db"
 storage = "file/tasks"
 log_dir = "log"
 
-[limits]
-max_browsers = 3
-page_interval_s = [2, 5]
-pass_timeout_s = 45
-
 [run]
-command = "run"
-mode    = "auto"                # Adaptive hybrid mode
-rules   = "domain_rules.toml"   # Domain rules snapshot
-proxy   = true                  # False for local direct test
-workers = 3
+command  = "run"
+mode     = "auto"
+rules    = "domain_rules.toml"
+proxy    = true
+workers  = 20
 url_type = "html"
 ```
 
-Start the run:
-
 ```bash
 paperlite run config.toml
-# Or override via CLI:
-paperlite run --auto --rules domain_rules.toml --workers 3
+# or
+paperlite run --auto --rules domain_rules.toml --workers 20
 ```
 
-### 3. Lifecycle-Driven Chunk Leasing
+On start-up it:
 
-In adaptive and browser modes, PaperLite adopts a robust chunk lease mechanism:
-- **Dynamic Lease Sizing:** Workers compute batch sizes from remaining proxy lease seconds (`min(20, max(1, left_s / 8))`), eliminating lock contention on large SQLite databases.
-- **Ordered Atomic Claims:** Tasks are pre-ordered by `(pattern_key, doi)` and claimed in single SQLite atomic transactions.
-- **Zero-Drop Safe Rollback:** Unconsumed tasks return immediately to `pending` upon proxy expiration, errors, or graceful shutdown.
+1. **Backfills `real_host`**: for tasks with an empty `real_host`, look up the DOI pattern in `doi_domain_routes`, falling back to the link's host.
+2. **Routes by domain and runs the three pipelines one after another** (not in parallel): all `curl_direct` domains first, then each `curl_pool` domain in turn, then every remaining task in the browser.
+
+| Pipeline | How it downloads | What it saves | Needs | Falls back to the browser when |
+|---|---|---|---|---|
+| `curl_direct` | concurrent async cURL sharing one proxy lease | `pdf` tasks: saved after the `%PDF-` check, otherwise `non_pdf`; `html` tasks: saved on HTTP 200 | nothing | a domain hits 403/429 or a challenge page 3 times in a row |
+| `curl_pool` | browsers produce identities (IP + cookie + UA) into Redis, cURL threads use them; production follows the pending count | as curl mode | Redis, proxy | 3 fresh identities in a row are rejected on first use with no success at all; Redis unreachable; no proxy configured |
+| `browser_only` | each worker owns one browser and one IP | the whole page as `.html` | nothing | — |
+
+Caveats:
+
+- **In `curl_pool`, URLs challenged despite a valid cookie do not trigger the fallback.** They count toward `max_url_challenges` and end as `failed/challenge_failed`, to be reset with `retry`. If you see this, override the domain to `browser_only`.
+- **`curl_direct` does not inspect HTML content**: an `html` task is saved on any 200. Only put sites you know serve static pages in `curl_direct`.
+- `curl_direct` marks a task `failed/network` after `max_tries` network errors. If proxy extraction fails, it falls back to the local IP.
+- With `--no-proxy` (`proxy = false`), `curl_pool` domains go straight to the browser.
+- After `Ctrl+C`, tasks `curl_direct` had claimed but not finished stay `running` until the next start, which returns them to `pending`.
+
+### 6. Batch claiming in the browser
+
+Browser workers claim tasks in batches sized from the current IP's remaining lease: `min(20, (seconds left - min_left_s) / 8)`, assuming about 8 s per page. On IP rotation, errors or shutdown, unprocessed tasks return to `pending` immediately.
+
+- **With duplicate-title inspection enabled (`title_dup_trigger > 0`, the default), a worker claims one task at a time** so that newly induced skip rules apply immediately.
+- Batches are taken in `(challenge_count, id)` order and do not apply volume stopping.
+- DOI batches are imported sorted by pattern, so claiming by id keeps tasks from the same journal mostly together.
 
 ## Configuration
 
@@ -187,8 +246,6 @@ workers  = 20           # browser: concurrent browsers; curl: download threads
 urls     = "mixed.csv"  # optional; imported on start-up
 url_type = "html"       # pdf | html
 headed   = false        # browser/auto mode: display browser window for debugging
-```
-headed   = false        # browser mode only; show browser windows for debugging
 ```
 
 When a config file is passed to `run`, the `[run]` section is authoritative and other `run` flags on the command line are ignored. Other subcommands (`import`, `status`, `retry`, `export`, …) keep their own flags.
@@ -224,10 +281,10 @@ Command-line overrides: `--db` takes precedence over `[paths].db`, and `--storag
 |---|---|
 | `init [--force]` | Generate a `config.toml` template |
 | `import --urls FILE [--type pdf\|html]` | Import tasks from a text file (one URL per line) or a CSV with a `url` column and optional `doi`, `source`, `batch_no` and `url_type` columns. **DOI-only input** (one DOI per line, or a CSV with only a `doi` column) becomes `https://doi.org/{doi}` links, inserted sorted by DOI pattern with `real_host` left empty for `run --auto` to backfill from the DOI map; run `handles` afterwards to switch to landing URLs. Fails if nothing is importable. Re-importing never resets existing tasks |
-| `run [CONFIG] [--urls FILE] [--workers N]` | Download until the queue is empty. Browser mode by default; `--auto` enables adaptive routing; `--curl` switches to curl mode; `--no-proxy` uses the local IP |
-| `preprocess --urls FILE [--out-rules TOML]` | End-to-end preprocessing: DuckDB pattern clustering, redirect domain probing, differential WAF diagnosis and rule export |
-| `resolve --urls FILE [--out-map DB]` | Stage 1 preprocessor: Cluster patterns and probe landing domains into SQLite map |
-| `audit [--map DB] [--out-rules TOML]` | Stage 2 preprocessor: Audit only unique landing domains for WAF resilience and export rules |
+| `run [CONFIG] [--urls FILE] [--workers N]` | Download until the queue is empty. Browser mode by default; `--auto [--rules TOML]` for adaptive mode; `--curl` switches to curl mode; `--no-proxy` uses the local IP |
+| `preprocess --urls FILE --out-map DB [--out-rules TOML] [--proxy URL]` | Run `resolve` then `audit`. `--out-map` should be the task database; see [Preprocess](#2-preprocess-resolve-and-audit) |
+| `resolve --urls FILE --out-map DB [--limit N] [--proxy URL]` | Preprocessing step 1: cluster DOIs into patterns, probe one sample per pattern for its landing domain, write `doi_domain_routes`; already-probed patterns are skipped |
+| `audit --map DB [--out-rules TOML] [--limit N]` | Preprocessing step 2: audit each distinct landing domain, store results in `domain_profiles` and export `domain_rules.toml` |
 | `produce [--keep N]` | curl mode: run only the identity producer (long-running) |
 | `download [--workers N]` | curl mode: run only the downloaders; needs a producer running |
 | `status` | Counts by status, failures by `error_kind`, stopped volumes and, in curl mode, the identity pool |
@@ -343,18 +400,19 @@ Tasks live in the table `paper_pdf_resources`, whose schema mirrors the upstream
 | `id` | Auto-increment key; tasks are claimed in this order |
 | `url_key` | SHA-256 of the normalised URL; unique |
 | `doi` | Imported value (lower-cased) or derived from the URL; determines the file name |
-| `url`, `source`, `batch_no` | Imported values |
+| `url`, `source`, `batch_no` | Imported values; `handles` may replace `url` with the registered landing URL |
+| `real_host` | Real landing domain used for adaptive routing; empty for imported `doi.org` links and backfilled from the DOI pattern at run time |
 | `url_type` | `pdf` (expects a PDF) or `html` (saves the page itself) |
 | `volume` | DOI volume key (`10.1145/1012326.1012328` → `1012326`), used by volume stopping |
 | `status` | `pending` → `running` → `success` / `non_pdf` / `failed` |
-| `error_kind` | `not_found`, `paywall`, `landing_page` (non-PDF); `network`, `server_error`, `extract_failed`, `challenge_failed` |
+| `error_kind` | `not_found`, `paywall`, `landing_page` (non-PDF); `network`, `server_error`, `extract_failed`, `challenge_failed`, `blocked`, `rate_limited`. DOIs found unregistered by `handles` are also `not_found` |
 | `title`, `final_url` | Page title and the final URL after redirects |
 | `http_status`, `file_size`, `elapsed_ms`, `exit_ip` | Metrics from the latest attempt |
 | `retry_count`, `challenge_count` | Network/5xx retries; challenges despite a valid cookie |
 | `inferred` | 1 if the outcome was inferred by volume stopping rather than requested |
 | `file_path` | `<storage>/<h[0:2]>/<h[2:4]>/<doi>.pdf` (or `.html`), where `h = sha256(doi)` |
 
-Auxiliary tables: `meta`, `volume_stops` and `skip_rules`.
+Auxiliary tables: `meta`, `volume_stops` and `skip_rules`; DOI batches add `doi_handles` (`handles` results), `doi_domain_routes` (pattern → landing domain) and `domain_profiles` (domain audit results).
 
 ```bash
 sqlite3 tasks.db "SELECT status, error_kind, count(*) FROM paper_pdf_resources GROUP BY 1, 2"
@@ -408,7 +466,10 @@ src/paperlite/
   cookies.py          CookieJar conversion for browser/Redis cookie records
   store.py            curl mode: Redis identity pool (atomic Lua claims, leases, producer lock)
   consumer.py         curl mode: download threads, streaming, identity health
-  tasks.py            SQLite task store, volume stopping
+  tasks.py            SQLite task store, volume stopping, real_host backfill
+  scheduler.py        adaptive mode: route domains to curl_direct / curl_pool / browser per domain_rules.toml
+  handles.py          batch doi.org Handle API lookups (paperlite handles)
+  preprocess/         preprocessing: DuckDB clustering, landing-domain probing, domain audit, rule export
   inspect.py          duplicate-title rule induction
   classify.py         non-PDF classification (not_found, paywall, landing_page)
   proxy.py            proxy extraction and layered health checks (TCP/TLS/TTFB/total)

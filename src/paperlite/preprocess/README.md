@@ -83,7 +83,7 @@ paperlite preprocess --urls my_dois.csv --out-map db/my_tasks.db --out-rules dom
 ```
 **参数说明**：
 * `--urls`：输入的 CSV 文件路径（含 `doi` 列或 `url` 列）；
-* `--out-map`：输出的目标 SQLite 任务库文件，默认 `doi_routes.db`；
+* `--out-map`：写入 `doi_domain_routes` 的 SQLite 文件，**应指向任务库本身**（如 `db/my_tasks.db`）。`run --auto` 只在任务库里找这张表来回填 `real_host`，写到默认的 `doi_routes.db` 会查不到；
 * `--out-rules`：最终导出的规则配置文件名，默认 `domain_rules.toml`；
 * `--concurrency`：轻量嗅探并发数（直连推荐 4~6，带代理池推荐 30~50）；
 * `--proxy`：可选，HTTP/SOCKS5 代理地址。
@@ -109,6 +109,8 @@ paperlite audit --map db/my_tasks.db --out-rules domain_rules.toml
 * **为什么执行很快**：即使输入有数百万条 DOI、数千个期刊族群，去重后的独立主站通常只有几个到几十个，体检通常在几分钟内即可完成。
 
 ---
+
+> 完整的 DOI 批次流程（`import` → `resolve`/`audit` → `handles` → `run --auto`）、规则人工修正和运行时降级说明，见主 README 的「自适应模式与 DOI 批次」。
 
 ## 五、 `domain_rules.toml` 规范说明
 
