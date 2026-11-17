@@ -489,6 +489,15 @@ class TaskDB:
 
     # ── 查询与运维 ────────────────────────────────────────────
 
+    def count_claimable(self, cap: Optional[int] = None) -> int:
+        """可领取（pending 且未被巡检标记）的任务数；给 cap 时数到 cap 为止，大库也只扫 cap 行。"""
+        sql = "SELECT 1 FROM paper_pdf_resources WHERE status = 'pending' AND flag IS NULL"
+        args: tuple = ()
+        if cap is not None:
+            sql, args = sql + " LIMIT ?", (max(0, cap),)
+        with self._lock:
+            return self._conn.execute(f"SELECT count(*) FROM ({sql})", args).fetchone()[0]
+
     def has_status(self, status: str) -> bool:
         with self._lock:
             return self._conn.execute(

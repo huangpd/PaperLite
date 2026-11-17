@@ -533,8 +533,6 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="链接类型：pdf = 要 PDF 文件（默认）；html = 要网页本身，整页存为 .html。CSV 的 url_type 列逐行覆盖")
     p = cmd("produce")
     site_args(p)
-    p.add_argument("--keep", type=int, help="没有下载线程时也养着这么多身份（覆盖 min_identities），"
-                                            "下载前一两分钟先启动可省掉冷启动的过盾等待")
     p = cmd("download")
     site_args(p)
     p.add_argument("--storage", help="输出目录 PDF/HTML（覆盖 [paths].storage）；可挂载")
@@ -690,8 +688,6 @@ def main() -> None:
         db.close()
         if not host:
             raise SystemExit("任务库是空的，先 import")
-        if args.keep is not None:
-            cfg = dataclasses.replace(cfg, min_identities=args.keep)
         producer = _ProducerThread(cfg, store, proxy, host)
         try:
             while not producer.finished.wait(1):

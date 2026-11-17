@@ -643,10 +643,22 @@ class CliDbOptionTest(unittest.TestCase):
 
 class ProducerTargetTest(unittest.TestCase):
     def test_target_follows_workers(self):
-        p = Producer(Limits(max_identities=20, min_identities=2), mock.Mock(), mock.Mock(), "dl.acm.org")
-        self.assertEqual(p.target(0), 2)      # 没有下载线程：只保预热数
+        p = Producer(Limits(max_identities=20), mock.Mock(), mock.Mock(), "dl.acm.org")
+        self.assertEqual(p.target(0), 0)      # 没有下载线程：不生产
         self.assertEqual(p.target(8), 8)
         self.assertEqual(p.target(50), 20)
+
+    def test_target_is_consumer_driven(self):
+        """目标 = min(身份上限, 在线线程, 可领取任务)；旧配置里的 min_identities 不再保底"""
+        with self.assertLogs("paperlite.producer", "WARNING"):
+            p = Producer(Limits(max_identities=20, min_identities=5), mock.Mock(), mock.Mock(), "dl.acm.org")
+        self.assertEqual(p.target(0), 0)                 # 没有消费者：保底已取消
+        self.assertEqual(p.target(0, pending=100), 0)    # 有活没人下：也不产
+        self.assertEqual(p.target(20, pending=3), 3)     # 只剩 3 篇：最多 3 个身份
+        self.assertEqual(p.target(20, pending=0), 0)     # 活领完了：不产
+        self.assertEqual(p.target(8, pending=100), 8)
+        self.assertEqual(p.target(50, pending=100), 20)
+        self.assertEqual(p.target(8, pending=None), 8)   # 旧版下载进程不上报：只按线程数
 
 
 class ProducerReplayTest(unittest.TestCase):
@@ -855,6 +867,12 @@ class FakeStore:
     def worker_gone(self, host, worker):
         pass
 
+    def report_pending(self, host, consumer, n):
+        self.pending_reports = getattr(self, "pending_reports", []) + [n]
+
+    def clear_pending(self, host, consumer):
+        self.pending_cleared = True
+
 
 class DownloaderTest(unittest.TestCase):
     def setUp(self):
@@ -882,6 +900,26 @@ class DownloaderTest(unittest.TestCase):
 
     def row(self, url):
         return next(r for r in self.db.rows() if r["url"] == url)
+
+    def test_reports_pending_and_clears_on_exit(self):
+        store = FakeStore([ident(exit_ip="1.1.1.1")])
+        urls = [f"https://dl.acm.org/doi/pdf/10.1145/{i}" for i in range(3)]
+        self.run_with(store, {"1.1.1.1": lambda u: Resp(200, FAKE_PDF)}, urls)
+        self.assertEqual(store.pending_reports[0], 1)        # workers=1：数到线程数为止
+        self.assertTrue(store.pending_cleared)               # 退出时撤掉本进程的上报
+
+    def test_flagged_only_pending_does_not_keep_consumer_alive(self):
+        """剩下的 pending 全被巡检标记跳过：线程不登记在线、直接退出，不再拉着生产者过盾"""
+        url = "https://dl.acm.org/doi/pdf/10.1145/9"
+        self.db.import_urls([{"pdf_url": url}])
+        self.db._conn.execute("UPDATE paper_pdf_resources SET flag = 'suspect_cover'")
+        store = FakeStore([ident(exit_ip="1.1.1.1")])
+        dl = Downloader(self.cfg, store, PROXY, self.db, self.out, workers=2)
+        finished = threading.Event()
+        threading.Thread(target=lambda: (dl.run(), finished.set()), daemon=True).start()
+        self.assertTrue(finished.wait(10), "只剩被标记的任务时下载线程应退出")
+        self.assertFalse(getattr(store, "alive_calls", 0))   # 从未登记在线
+        self.assertEqual(store.pending_reports[0], 0)
 
     def test_rejected_cookie_switches_identity_without_counting_retry(self):
         store = FakeStore([ident(exit_ip="1.1.1.1"), ident(exit_ip="2.2.2.2")])
@@ -1245,6 +1283,22 @@ class RedisStoreTest(unittest.TestCase):
         for k in self.store.r.scan_iter(f"{self.store.prefix}:*"):
             self.store.r.delete(k)
 
+    def test_pending_reports_sum_expire_and_clear(self):
+        """可领取任务数：多个下载进程求和；超时未更新的上报作废；进程退出撤掉；无上报为 None"""
+        from paperlite import store as store_mod
+        self.assertIsNone(self.store.pending(self.host))
+        self.store.report_pending(self.host, "m1-100", 3)
+        self.store.report_pending(self.host, "m2-200", 5)
+        self.assertEqual(self.store.pending(self.host), 8)
+        self.assertEqual(self.store.stats(self.host).pending, 8)
+        self.store.r.hset(self.store._k(self.host, "pending"), "dead-1",
+                          f"50:{time.time() - store_mod.PENDING_STALE_S - 5:.0f}")     # 崩溃进程的旧上报
+        self.assertEqual(self.store.pending(self.host), 8)
+        self.assertFalse(self.store.r.hexists(self.store._k(self.host, "pending"), "dead-1"))   # 顺手清掉
+        self.store.clear_pending(self.host, "m1-100")
+        self.store.report_pending(self.host, "m2-200", 0)
+        self.assertEqual(self.store.pending(self.host), 0)   # 有上报但没活：0（不是 None），生产者停产
+
     def test_claim_is_exclusive_and_prefers_soonest_expiry(self):
         late, soon = ident(exit_ip="9.9.9.9", expires_at=time.time() + 500), ident(expires_at=time.time() + 200)
         self.store.add(late)
@@ -1452,10 +1506,10 @@ class CliArgsTest(unittest.TestCase):
                                       RunConfig(command="run"))
         self.assertTrue(mapped.browser and not mapped.curl)   # [run] 省略 mode → browser
 
-    # README：produce 常驻，--keep 覆盖 min_identities
+    # README：produce 常驻，按下载线程与可领取任务生产；--keep 已删除
     def test_produce(self):
-        self.assertIsNone(self.parse("produce").keep)
-        self.assertEqual(self.parse("produce", "--keep", "20").keep, 20)
+        self.parse("produce")
+        self.fails("produce", "--keep", "20")
 
     # README：download 需 --workers（默认 20），可选 --urls
     def test_download(self):

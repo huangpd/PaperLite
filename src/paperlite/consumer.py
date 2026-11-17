@@ -54,6 +54,7 @@ from paperlite.tasks import Status, Task, TaskDB, UrlType, pdf_path, url_host
 logger = logging.getLogger(__name__)
 
 _IDLE_WAIT_S = 2.0
+_PENDING_REPORT_S = 5.0                        # 向 Redis 上报可领取任务数的最短间隔（各线程共用）
 _CHUNK = 256 * 1024
 _PDF_HEADER_WINDOW = 1024                      # %PDF- 须在前 1024 字节内（PDF 规范）
 _PDF_LEADING_JUNK = b" \t\r\n\x00\x0c\xef\xbb\xbf"  # 之前只允许这些（有的 PHP 下载脚本会输出前导换行）
@@ -188,9 +189,27 @@ class Downloader:
         self.stats = DownloadStats()
         self._browser_slots = threading.BoundedSemaphore(max(1, cfg.max_browsers))   # 网页任务的浏览器兜底并发
         self._worker_prefix = f"{socket.gethostname()}-{os.getpid()}"
+        self._pending_lock = threading.Lock()
+        self._pending_at = float("-inf")
+
+    def report_pending(self, force: bool = False) -> None:
+        """
+        向 Redis 上报本进程还有多少可领取任务（数到线程数为止），生产者据此不多产身份；
+        各线程共用 _PENDING_REPORT_S 节流。上报失败只记日志，不影响下载。
+        """
+        with self._pending_lock:
+            now = time.monotonic()
+            if not force and now - self._pending_at < _PENDING_REPORT_S:
+                return
+            self._pending_at = now
+        try:
+            self.store.report_pending(self.host, self._worker_prefix, self.db.count_claimable(cap=self.workers))
+        except Exception as e:
+            logger.debug("上报可领取任务数失败: %s", e)
 
     def run(self, stop: Optional[threading.Event] = None) -> DownloadStats:
         stop = stop or threading.Event()
+        self.report_pending(force=True)
         # 结束用事件判断，不用 Thread.join()：信号打断 join 后 is_alive() 可能误报已结束
         finished = [threading.Event() for _ in range(self.workers)]
         for i, done in enumerate(finished):
@@ -205,6 +224,11 @@ class Downloader:
             for done in finished:
                 done.wait(max(0.0, deadline - time.monotonic()))
             raise
+        finally:
+            try:
+                self.store.clear_pending(self.host, self._worker_prefix)   # 本进程不再需要身份
+            except Exception as e:
+                logger.debug("清除可领取任务数失败: %s", e)
         return self.stats
 
     # ── 下载线程 ──────────────────────────────────────────────
@@ -218,7 +242,9 @@ class Downloader:
         registered = False
         try:
             while not stop.is_set():
-                if not self.db.has_status(Status.PENDING):
+                self.report_pending()
+                # 只看可领取的任务：被巡检标记跳过的 pending 永远领不到，不能让线程因它们一直登记在线、拉着生产者过盾
+                if not self.db.count_claimable(cap=1):
                     if not self.db.has_status(Status.RUNNING):
                         return
                     # 只剩别的线程的在途任务（可能被放回）：不登记需求，身份还回池里，空等

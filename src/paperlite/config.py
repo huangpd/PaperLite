@@ -73,7 +73,7 @@ class Limits:
     # 生产
     max_browsers: int = 20            # 同时运行的浏览器上限
     max_identities: int = 20          # 健康身份（IP+cookie）上限；实际目标 = min(本值, 在线下载线程数)
-    min_identities: int = 0           # 没有下载线程时也保持的预热身份数
+    min_identities: int = 0           # 已废弃、不再生效（生产完全由下载线程驱动）；保留只为兼容旧配置，非 0 时打警告
     refill_before_s: float = 90       # 身份剩余寿命低于此值即不算健康，提前生产替补
     pass_timeout_s: float = 90        # 单次过盾等待上限
     hedge_after_s: float = 45         # 过盾超过此时长未成功即另开一个补位（成功的多在 30s 内）

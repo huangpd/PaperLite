@@ -5,9 +5,11 @@ paperlite/producer.py
 ───────────────────────
 生产者：按需提取新 IP → 浏览器过盾 → 身份写入 Redis。
 
-目标健康身份数 = clamp(在线下载线程数, min_identities, max_identities)。
-健康 = 剩余寿命 > refill_before_s，所以在用身份临近过期前就会开始生产替补；
-下载线程全部退出后目标降为 min_identities，不再白白过盾。
+消费者驱动：目标健康身份数 = min(max_identities, 在线下载线程数, 可领取任务数)。
+一个身份同一时间只给一个下载线程用，所以既不多于线程，也不多于剩下的活；没有在线下载线程、
+或任务已领完时目标为 0，不再过盾（不设"预热保底"：没人消费的身份只会白白耗掉 IP）。
+可领取任务数由各下载进程上报到 Redis（store.report_pending）；没有任何上报（旧版下载进程）时只按线程数。
+健康 = 剩余寿命 > refill_before_s，所以在用身份临近过期前就会开始生产替补。
 过盾失败的 IP 直接丢弃：同一 IP 重试很少能过，换 IP 更快。
 对冲：实测成功的过盾多在 30s 内，卡住的（Turnstile 一直 "Verifying…"）会耗满超时；
 所以过盾超过 hedge_after_s 还没成功就不再算"在路上的替补"，立刻另开一个补位，旧的继续跑到超时。
@@ -21,6 +23,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Optional
 
 from paperlite.browser import pass_challenge
 from paperlite.config import Limits
@@ -51,9 +54,16 @@ class Producer:
         self._seq = 0
         self._last_pause_log = 0.0
         self.holder = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+        if cfg.min_identities:
+            logger.warning("min_identities 已不再生效：生产完全由下载线程驱动，"
+                           "没有在线下载线程时不生产身份")
 
-    def target(self, workers: int) -> int:
-        return max(self.cfg.min_identities, min(self.cfg.max_identities, workers))
+    def target(self, workers: int, pending: Optional[int] = None) -> int:
+        """健康身份目标：不超过身份上限、在线下载线程数和可领取任务数（pending 为 None 时不按任务数限制）。"""
+        n = min(self.cfg.max_identities, workers)
+        if pending is not None:
+            n = min(n, pending)
+        return max(0, n)
 
     async def run(self, stop: threading.Event | None = None) -> None:
         """一直运行到 stop 被置位（或被取消）。"""
@@ -81,7 +91,8 @@ class Producer:
                 st = await asyncio.to_thread(self.store.stats, self.host, self.cfg.refill_before_s)
                 now = time.monotonic()
                 fresh = sum(1 for t0 in self._started.values() if now - t0 < self.cfg.hedge_after_s)
-                want = self.target(st.workers) - st.healthy - fresh
+                target = self.target(st.workers, st.pending)
+                want = target - st.healthy - fresh
                 room = self.cfg.max_browsers - len(self._started)
                 for _ in range(max(0, min(want, room))):
                     self._seq += 1
@@ -92,9 +103,10 @@ class Producer:
                 if time.monotonic() - last_log > 30:
                     last_log = time.monotonic()
                     stale = sum(1 for t0 in self._started.values() if now - t0 >= self.cfg.hedge_after_s)
-                    logger.info("身份池 %s: 空闲 %d 占用 %d 健康 %d / 目标 %d | 浏览器过盾中 %d（超 %.0fs 的 %d）"
-                                "| 累计过盾成功 %d 次、失败 %d 次",
-                                self.host, st.ready, st.inuse, st.healthy, self.target(st.workers),
+                    logger.info("身份池 %s: 空闲 %d 占用 %d 健康 %d / 目标 %d（下载线程 %d，可领取任务 %s）"
+                                "| 浏览器过盾中 %d（超 %.0fs 的 %d）| 累计过盾成功 %d 次、失败 %d 次",
+                                self.host, st.ready, st.inuse, st.healthy, target, st.workers,
+                                "未上报" if st.pending is None else st.pending,
                                 len(self._started), self.cfg.hedge_after_s, stale,
                                 self.stats.passed, self.stats.failed)
                 await asyncio.sleep(_TICK_S)

@@ -23,8 +23,7 @@ log_dir = "log"               # 日志目录；非空时同时打印到终端并
 [limits]                      # 并发与行为（不含存储路径）
 # redis_url = "redis://127.0.0.1:6379/0"   # 仅 curl 模式用（浏览器模式不用 Redis）
 max_browsers = 20             # 同时运行的浏览器上限
-max_identities = 20           # curl 模式健康身份上限；实际按在线下载线程数生产
-min_identities = 0            # curl 模式没有下载线程时也保持的预热身份数
+max_identities = 20           # curl 模式健康身份上限；实际目标 = min(本值, 在线下载线程数, 可领取任务数)
 pass_timeout_s = 90           # 单次过盾等待上限
 hedge_after_s = 45            # 过盾超过此时长还没成功，就另开一个浏览器补位（成功的多在 30s 内）
 webrtc_spoof = true           # 加 --fingerprint-webrtc-ip=auto：把 WebRTC 出口伪造成代理出口 IP，防泄露真实 IP。不需要 GeoIP 库、不下载任何东西（推荐开）

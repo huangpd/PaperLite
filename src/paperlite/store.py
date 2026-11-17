@@ -14,6 +14,8 @@ Redis 里的身份池：生产者和消费者只通过这里交互，可分属�
   {prefix}:{host}:inuse       zset  被下载线程占用的身份，score = 过期时间
   {prefix}:{host}:lease:{id}  str   占用者，带 TTL；心跳续期，进程崩溃后到期由 reap() 归还
   {prefix}:{host}:workers     zset  在线下载线程，score = 最近心跳；生产者据此决定生产多少
+  {prefix}:{host}:pending     hash  各下载进程上报的可领取任务数（数到线程数为止），值 "条数:时间戳"；
+                                    生产目标不超过各进程之和，没有消费者就不生产
   {prefix}:{host}:producer    str   当前生产者，带 TTL；同一主机同时只有一个生产者在干活，其余待命
   {prefix}:{host}:fresh_rejects  int  连续"一篇没下成就被拒"的新身份数；任一身份下载成功即清零
   {prefix}:{host}:paused      str   熔断暂停生产，带 TTL
@@ -33,6 +35,7 @@ import redis
 from paperlite.cookies import jar_from_records, jar_to_records
 
 WORKER_STALE_S = 60   # 下载线程超过此时长无心跳即视为离线
+PENDING_STALE_S = 60  # 下载进程超过此时长未上报可领取任务数即视为离线，其上报作废
 
 # 原子地取出一个剩余寿命 ≥ min_left 的空闲身份（优先最早过期的，先用掉快过期的），转入 inuse 并加占用锁。
 _CLAIM_LUA = """
@@ -128,6 +131,7 @@ class PoolStats:
     inuse: int
     healthy: int          # 剩余寿命 > refill_before_s 的 ready + inuse
     workers: int
+    pending: Optional[int] = None   # 在线下载进程上报的可领取任务数之和；没有任何上报为 None
 
 
 class IdentityStore:
@@ -176,7 +180,7 @@ class IdentityStore:
             p.zcount(self._k(host, "inuse"), healthy_from, "+inf")
             p.zcount(self._k(host, "workers"), now - WORKER_STALE_S, "+inf")
             ready, inuse, h_ready, h_inuse, workers = p.execute()
-        return PoolStats(ready, inuse, h_ready + h_inuse, workers)
+        return PoolStats(ready, inuse, h_ready + h_inuse, workers, self.pending(host))
 
     def list(self, host: str) -> list[Identity]:
         ids = self.r.zrange(self._k(host, "ready"), 0, -1) + self.r.zrange(self._k(host, "inuse"), 0, -1)
@@ -268,6 +272,33 @@ class IdentityStore:
 
     def worker_gone(self, host: str, worker: str) -> None:
         self.r.zrem(self._k(host, "workers"), worker)
+
+    # ── 可领取任务数：消费者驱动生产，没活就不生产 ──────────────
+
+    def report_pending(self, host: str, consumer: str, n: int) -> None:
+        """下载进程上报自己还有多少可领取任务（调用方数到线程数为止即可）。"""
+        self.r.hset(self._k(host, "pending"), consumer, f"{max(0, int(n))}:{time.time():.0f}")
+
+    def clear_pending(self, host: str, consumer: str) -> None:
+        self.r.hdel(self._k(host, "pending"), consumer)
+
+    def pending(self, host: str) -> Optional[int]:
+        """在线下载进程上报之和；超过 PENDING_STALE_S 未更新的上报视为离线并清掉。没有任何有效上报返回 None。"""
+        key, now, total, stale = self._k(host, "pending"), time.time(), None, []
+        for consumer, value in self.r.hgetall(key).items():
+            try:
+                n, ts = value.split(":", 1)
+                n, ts = int(n), float(ts)
+            except ValueError:
+                stale.append(consumer)
+                continue
+            if now - ts > PENDING_STALE_S:
+                stale.append(consumer)
+                continue
+            total = (total or 0) + n
+        if stale:
+            self.r.hdel(key, *stale)
+        return total
 
     def _drop(self, host: str, ident_id: str) -> None:
         with self.r.pipeline() as p:

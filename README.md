@@ -135,7 +135,7 @@ When a config file is passed to `run`, the `[run]` section is authoritative and 
 | `[limits] max_tries` | 3 | Retries for network errors |
 | `[limits] volume_stop_after` | 3 | curl mode: stop a journal volume after this many consecutive non-PDF results; 0 disables |
 | `[limits] title_dup_trigger` | 10 | Duplicate-title count that triggers rule induction; 0 disables |
-| `[limits] max_identities` | 20 | curl mode: healthy identity cap |
+| `[limits] max_identities` | 20 | curl mode: healthy identity cap (the actual target is also capped by online download threads and claimable tasks) |
 | `[limits] max_fresh_rejects` | 5 | curl mode: circuit-breaker threshold |
 
 Command-line overrides: `--db` takes precedence over `[paths].db`, and `--storage` (on `run` and `download`) over `[paths].storage`.
@@ -147,7 +147,7 @@ Command-line overrides: `--db` takes precedence over `[paths].db`, and `--storag
 | `init [--force]` | Generate a `config.toml` template |
 | `import --urls FILE [--type pdf\|html]` | Import tasks from a text file (one URL per line) or a CSV with a `url` column and optional `doi`, `source`, `batch_no` and `url_type` columns. CSV rows are first sorted with DuckDB by DOI (taken from the URL when there is no `doi` column; rows without one go last). DOIs from the same publisher and journal share a string prefix, so sorting groups them and tasks from the same journal get consecutive ids and browsers claiming by id switch sites less often; text files keep their order. A malformed CSV (e.g. an unquoted comma) aborts the import with the offending line number. Re-importing never resets existing tasks |
 | `run [CONFIG] [--urls FILE] [--workers N]` | Download until the queue is empty. Browser mode by default; `--curl` switches modes; `--no-proxy` uses the local IP |
-| `produce [--keep N]` | curl mode: run only the identity producer (long-running) |
+| `produce` | curl mode: run only the identity producer (long-running). It only solves challenges while download threads are online and tasks remain |
 | `download [--workers N]` | curl mode: run only the downloaders; needs a producer running |
 | `status` | Counts by status, failures by `error_kind`, stopped volumes and, in curl mode, the identity pool |
 | `retry --status failed [--kind KIND]` | Reset failed (or `non_pdf`) tasks to `pending` |
@@ -184,7 +184,7 @@ storage = "/mnt/obs/papers"     # object-storage mount
 - If that host's home page is unsuitable (for example, it does not trigger the challenge or redirects elsewhere), override the warm-up URL in `[landing]`, e.g. `"www.example.org" = "https://www.example.org/journal/abc"`.
 - After the browser solves a challenge, curl mode checks the warm-up URL with `curl_cffi` using the same IP, user agent, and Cookie Jar before storing the identity in Redis. Set `[landing]` to a representative article page: a successful home-page check does not prove article pages are accessible. Also review the non-PDF heuristics in `classify.py`, which were written for ACM.
 
-**Cold start in curl mode.** The first identity takes about 20 seconds to solve. `produce --keep 20` pre-warms the pool, at the cost of consuming IPs while no downloader is running.
+**Consumer-driven production in curl mode.** The production target is min(`max_identities`, online download threads, claimable tasks). Every 5 s each download process reports its remaining claimable tasks (counted up to its thread count) to Redis, summed across machines for the same host. Once downloaders exit or the tasks are all claimed, the producer stops solving challenges; a long-running `produce` just idles without spending IPs. The trade-off is cold start: the first identity takes about 20 seconds, and download threads wait for it. The old `produce --keep N` pre-warming kept burning IPs with nobody downloading and has been removed; `min_identities` in old configs is still read but ignored (a non-zero value logs a warning).
 
 Curl mode converts browser cookies into a `CookieJar`, retaining duplicate names with distinct domains/paths, host-only scope, secure, expires, HttpOnly and SameSite attributes. Redis keeps a JSON list in `cookies` with a `cookies_format=cookiejar-v1` marker; existing browser-cookie lists remain readable without clearing Redis. Admission checks and downloads use the identity's live jar, so response cookie updates and deletions are saved on insertion, consumer heartbeats and release. Saving never extends the identity or proxy lifetime. Restart both producers and consumers when upgrading.
 

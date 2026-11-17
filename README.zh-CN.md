@@ -135,7 +135,7 @@ headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调
 | `[limits] max_tries` | 3 | 网络错误的重试次数 |
 | `[limits] volume_stop_after` | 3 | curl 模式：同一卷期连续这么多篇无 PDF 即停止该卷期；0 表示关闭 |
 | `[limits] title_dup_trigger` | 10 | 同一标题重复到该次数时触发规则归纳；0 表示关闭 |
-| `[limits] max_identities` | 20 | curl 模式：健康身份上限 |
+| `[limits] max_identities` | 20 | curl 模式：健康身份上限（实际目标还受在线下载线程数、可领取任务数限制） |
 | `[limits] max_fresh_rejects` | 5 | curl 模式：熔断阈值 |
 
 命令行覆盖规则：`--db` 优先于 `[paths].db`；`--storage`（`run`、`download` 可用）优先于 `[paths].storage`。
@@ -147,7 +147,7 @@ headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调
 | `init [--force]` | 生成 `config.toml` 模板 |
 | `import --urls FILE [--type pdf\|html]` | 导入任务。支持一行一个 URL 的文本文件，或含 `url` 列的 CSV（可选 `doi`、`source`、`batch_no`、`url_type` 列）。CSV 会先用 DuckDB 按 DOI 排序再入库（没有 `doi` 列时从 URL 里认 DOI，认不出的排最后）：同一出版商、同一期刊的 DOI 字符串前缀相同，排序后自然连在一起，任务 id 连号，浏览器按 id 领取时少在站点间来回切换；文本文件保持原顺序。CSV 格式错误（如未加引号的逗号）会报出行号并中止导入。重复导入不会重置已有任务 |
 | `run [CONFIG] [--urls FILE] [--workers N]` | 下载直至队列清空。默认浏览器模式；`--curl` 切换到 curl 模式；`--no-proxy` 使用本机 IP |
-| `produce [--keep N]` | curl 模式：只运行身份生产者（常驻） |
+| `produce` | curl 模式：只运行身份生产者（常驻）。只在有下载线程在线、且还有可领取任务时才过盾 |
 | `download [--workers N]` | curl 模式：只运行下载线程，需另有生产者在运行 |
 | `status` | 各状态计数、按 `error_kind` 分组的失败数、已停卷期，curl 模式下还包括身份池 |
 | `retry --status failed [--kind KIND]` | 将失败（或 `non_pdf`）任务重置为 `pending` |
@@ -184,7 +184,7 @@ storage = "/mnt/obs/papers"     # 对象存储挂载
 - 若该主机首页不适合热身（例如不触发挑战或会跳转到别处），可在 `[landing]` 中覆盖热身地址，例如 `"www.example.org" = "https://www.example.org/journal/abc"`。
 - curl 模式的身份生产在浏览器过盾后，还会用同一 IP、UA 和 Cookie Jar 通过 `curl_cffi` 请求热身地址；失败的身份不入 Redis。建议将 `[landing]` 配成有代表性的真实文章页：只验证首页 200，不能保证文章页可用。另需检查 `classify.py` 中的 non-PDF 判定规则（按 ACM 编写）是否适用。
 
-**curl 模式冷启动**：第一个身份过盾约需 20 秒。可先运行 `produce --keep 20` 预热身份池，代价是没有下载线程时也会消耗 IP。
+**curl 模式按消费生产**：生产目标 = min(`max_identities`, 在线下载线程数, 可领取任务数)。下载进程每 5 秒把自己剩余的可领取任务数（数到线程数为止）上报到 Redis，多台机器下同一主机时求和；下载全部退出或任务领完，生产者就停止过盾，常驻的 `produce` 也只是空转等待，不耗 IP。代价是冷启动：第一个身份过盾约需 20 秒，下载线程先等这一下。原来的 `produce --keep N` 预热会在没人下载时持续耗 IP，已删除；旧配置里的 `min_identities` 仍可读取，但不再生效（非 0 时打警告）。
 
 curl 模式将浏览器导出的 cookie 转为 `CookieJar`，保留同名 cookie 的 domain/path、host-only、secure、expires、HttpOnly 和 SameSite 属性。Redis 中的 `cookies` 仍是 JSON 列表，新增 `cookies_format=cookiejar-v1` 标记；旧版浏览器 cookie 列表可直接读取，无需清空 Redis。生产者验收和消费者下载共用身份的 Jar，响应更新或删除 cookie 后，验收入池、消费者续租和归还都会保存最新状态；保存不会延长身份或代理的有效期。升级时请同时重启生产者和消费者。
 
