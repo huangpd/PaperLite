@@ -130,9 +130,50 @@ def _read_url_file(path: str):
         first = f.readline()
         f.seek(0)
         if "url" in first or "pdf_url" in first:
-            yield from (r for r in csv.DictReader(f) if (r.get("url") or r.get("pdf_url") or "").strip())
+            yield from _read_csv_clustered(path)
         else:
             yield from ({"url": line.strip()} for line in f if line.strip().startswith("http"))
+
+
+def _read_csv_clustered(path: str):
+    """
+    用 DuckDB 读 CSV，按 (DOI, url) 排序后逐行产出，字段与 csv.DictReader 相同（空单元格为 None）。
+    不写任何出版商规则：DOI 是"前缀/后缀"结构，按字符串排序后同一前缀（出版商）、同一后缀开头（期刊代码）
+    的任务自然连在一起（"." "/" 排在字母数字之前，j.ajog.* 与 j.ajogmf.* 不会交错）。任务按 id 领取，
+    同一期刊的任务连号，浏览器少在站点间来回切。
+    没有 doi 列时从 URL 里认 DOI；认不出 DOI 的行排在最后。url（或 pdf_url）为空的行跳过。
+    """
+    import duckdb
+    safe = str(Path(path).resolve()).replace("'", "''")
+    src = f"read_csv('{safe}', header=true, all_varchar=true, delim=',', quote='\"', escape='\"')"
+    con = duckdb.connect()
+    try:
+        try:
+            cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()]
+        except duckdb.Error as e:
+            raise SystemExit(f"读取 CSV 失败 {path}: {e}")
+        quoted = {c: '"' + c.replace('"', '""') + '"' for c in cols}
+        url_cols = [quoted[c] for c in ("url", "pdf_url") if c in quoted]
+        if not url_cols:
+            return
+        url = "coalesce(" + ", ".join(f"nullif(trim({c}), '')" for c in url_cols) + ")"
+        doi = ", ".join(f"nullif(trim({quoted[c]}), '')" for c in ("doi", "paper_uid") if c in quoted)
+        doi_key = (f"lower(coalesce({doi + ', ' if doi else ''}"
+             f"nullif(regexp_extract({url}, '(10\\.[0-9]{{4,9}}/[^\\s?#]+)', 1), '')))")
+        sql = (f"SELECT {', '.join(quoted[c] for c in cols)} FROM (SELECT *, {doi_key} AS __pl_doi FROM {src}) "
+               f"WHERE {url} IS NOT NULL ORDER BY __pl_doi NULLS LAST, {url}")
+        try:
+            cur = con.execute(sql)
+        except duckdb.Error as e:
+            raise SystemExit(f"读取 CSV 失败 {path}: {e}")
+        while True:
+            chunk = cur.fetchmany(50000)
+            if not chunk:
+                return
+            for row in chunk:
+                yield dict(zip(cols, row))
+    finally:
+        con.close()
 
 
 def _import(db: TaskDB, path: str, source: str = "", batch: str = "", url_type: str = UrlType.PDF) -> None:

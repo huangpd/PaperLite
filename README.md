@@ -145,7 +145,7 @@ Command-line overrides: `--db` takes precedence over `[paths].db`, and `--storag
 | Command | Description |
 |---|---|
 | `init [--force]` | Generate a `config.toml` template |
-| `import --urls FILE [--type pdf\|html]` | Import tasks from a text file (one URL per line) or a CSV with a `url` column and optional `doi`, `source`, `batch_no` and `url_type` columns. Re-importing never resets existing tasks |
+| `import --urls FILE [--type pdf\|html]` | Import tasks from a text file (one URL per line) or a CSV with a `url` column and optional `doi`, `source`, `batch_no` and `url_type` columns. CSV rows are first sorted with DuckDB by DOI (taken from the URL when there is no `doi` column; rows without one go last). DOIs from the same publisher and journal share a string prefix, so sorting groups them and tasks from the same journal get consecutive ids and browsers claiming by id switch sites less often; text files keep their order. A malformed CSV (e.g. an unquoted comma) aborts the import with the offending line number. Re-importing never resets existing tasks |
 | `run [CONFIG] [--urls FILE] [--workers N]` | Download until the queue is empty. Browser mode by default; `--curl` switches modes; `--no-proxy` uses the local IP |
 | `produce [--keep N]` | curl mode: run only the identity producer (long-running) |
 | `download [--workers N]` | curl mode: run only the downloaders; needs a producer running |

@@ -145,7 +145,7 @@ headed   = false        # 仅浏览器模式：显示浏览器窗口，用于调
 | 命令 | 说明 |
 |---|---|
 | `init [--force]` | 生成 `config.toml` 模板 |
-| `import --urls FILE [--type pdf\|html]` | 导入任务。支持一行一个 URL 的文本文件，或含 `url` 列的 CSV（可选 `doi`、`source`、`batch_no`、`url_type` 列）。重复导入不会重置已有任务 |
+| `import --urls FILE [--type pdf\|html]` | 导入任务。支持一行一个 URL 的文本文件，或含 `url` 列的 CSV（可选 `doi`、`source`、`batch_no`、`url_type` 列）。CSV 会先用 DuckDB 按 DOI 排序再入库（没有 `doi` 列时从 URL 里认 DOI，认不出的排最后）：同一出版商、同一期刊的 DOI 字符串前缀相同，排序后自然连在一起，任务 id 连号，浏览器按 id 领取时少在站点间来回切换；文本文件保持原顺序。CSV 格式错误（如未加引号的逗号）会报出行号并中止导入。重复导入不会重置已有任务 |
 | `run [CONFIG] [--urls FILE] [--workers N]` | 下载直至队列清空。默认浏览器模式；`--curl` 切换到 curl 模式；`--no-proxy` 使用本机 IP |
 | `produce [--keep N]` | curl 模式：只运行身份生产者（常驻） |
 | `download [--workers N]` | curl 模式：只运行下载线程，需另有生产者在运行 |
