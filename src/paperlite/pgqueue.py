@@ -201,6 +201,8 @@ class PgTaskQueue:
         p = {"size": size, "batch": self.batch, "gen": generation}
         with self._lock, self._conn.transaction():
             c = self._conn
+            # 多台机器同时 import / requeue：串行切块，否则会把同一批任务切进两套块
+            c.execute("SELECT pg_advisory_xact_lock(hashtext('paperlite.pgqueue.chunk:' || %s))", (self.batch,))
             c.execute("CREATE TEMP TABLE pl_cut ON COMMIT DROP AS "
                       "SELECT id, host, doi, (row_number() OVER (PARTITION BY host ORDER BY id) - 1) / %(size)s AS k "
                       "FROM pl_tasks WHERE batch = %(batch)s AND status = 'pending' AND chunk_id IS NULL", p)

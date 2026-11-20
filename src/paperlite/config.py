@@ -137,6 +137,7 @@ class RunConfig:
     urls: str = ""
     url_type: str = "pdf"
     headed: bool = False
+    pg: bool = False                  # 【研究】true = 用 [pg] 段的共享队列（多机），等同命令行 --pg
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "RunConfig":

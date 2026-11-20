@@ -59,7 +59,7 @@ def _configured_run_args(args, run: RunConfig, config: str | None = None):
         db=None, storage=None,
         urls=run.urls or None, type=run.url_type, workers=run.workers,
         curl=run.mode == "curl", browser=run.mode == "browser",
-        no_proxy=not run.proxy, headed=run.headed,
+        no_proxy=not run.proxy, headed=run.headed, pg=run.pg,
     )
 
 

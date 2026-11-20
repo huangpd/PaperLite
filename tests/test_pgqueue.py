@@ -64,6 +64,23 @@ class PgQueueTest(unittest.TestCase):
         rows = [{"doi": "10.1/b", "url": "https://a.com/dup"}, {"doi": "10.1/a", "url": "https://a.com/dup"}]
         self.assertEqual(q.import_urls(rows), (1, 1))
 
+    def test_concurrent_build_chunks_never_double_assign(self):
+        setup = self.q("setup")
+        setup.import_urls(_rows(5000))
+        made = []
+
+        def run(i):
+            made.append(self.q(f"c{i}").build_chunks(100))
+
+        ts = [threading.Thread(target=run, args=(i,)) for i in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(sorted(made), [0, 0, 0, 50])        # 只有一个真的切了
+        n = setup._conn.execute("SELECT count(*), count(DISTINCT chunk_id) FROM pl_tasks").fetchone()
+        self.assertEqual(n, (5000, 50))
+
     def test_concurrent_claims_never_share_a_chunk(self):
         setup = self.q("setup")
         setup.import_urls(_rows(20_000))
@@ -472,6 +489,16 @@ class PgConfigTest(unittest.TestCase):
             p.write_text("[paths]\n")
             with self.assertRaises(ValueError):
                 config.load_pg(p)
+
+    def test_run_section_pg_switch(self):
+        from paperlite import config
+        from paperlite.cli import _configured_run_args
+        import argparse
+        run = config.RunConfig.from_dict({"command": "run", "pg": True})
+        ns = _configured_run_args(argparse.Namespace(config="c.toml", log_level="INFO"), run)
+        self.assertTrue(ns.pg)
+        self.assertFalse(_configured_run_args(argparse.Namespace(config="c.toml", log_level="INFO"),
+                                              config.RunConfig()).pg)
 
     def test_pg_flag_only_on_supported_commands(self):
         from paperlite.cli import _build_parser
