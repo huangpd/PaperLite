@@ -315,7 +315,7 @@ class PgTaskSourceTest(unittest.TestCase):
 
 
     def test_browser_pools_on_two_machines_share_one_batch(self):
-        """浏览器模式：2 个 BrowserPool（模拟 2 台机器）各 2 个浏览器，配置里开着巡检也不启用（PG 模式不做巡检）。"""
+        """浏览器模式：2 个 BrowserPool（模拟 2 台机器）各 2 个浏览器；标题各不相同，巡检开着也不跳过任何任务。"""
         from tests.test_paperlite import PROXY
         from paperlite import browser_pool as bp
         from paperlite.browser import RenderResult
@@ -351,7 +351,7 @@ class PgTaskSourceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(bp, "BrowserSession", FakeSession), \
                 mock.patch.object(bp, "IpSource", FakeIp):
             pools = [bp.BrowserPool(cfg, PROXY, self.src(f"m{m}"), Path(tmp), 2) for m in range(2)]
-            self.assertTrue(all(p.inspector is None for p in pools))
+            self.assertTrue(all(p.inspector is not None for p in pools))
             ts = [threading.Thread(target=p.run) for p in pools]
             for t in ts:
                 t.start()
@@ -366,6 +366,127 @@ class PgTaskSourceTest(unittest.TestCase):
         self.assertEqual(set(pages.values()), {1})
         st = self.queue().stats()
         self.assertEqual((st.tasks, st.chunks), ({"success": 20}, {"done": 5}))
+
+    # ── 块内卷期停止 / 巡检 ─────────────────────────────────
+
+    def _acm(self, vols):
+        rows = []
+        for vol, n in vols:
+            rows += [{"doi": f"10.1145/{vol}.{i}", "url": f"https://dl.acm.org/doi/pdf/10.1145/{vol}.{i}"}
+                     for i in range(1, n + 1)]
+        return rows
+
+    def test_volume_gate_limits_inflight_per_volume(self):
+        s = self.src("a", chunk_size=100)
+        s.volume_stop_after = 2
+        s.import_urls(self._acm([(100, 5), (200, 5)]))
+        got = [s.claim("x") for _ in range(3)]
+        vols = [t.doi.split("/")[1].split(".")[0] for t in got]
+        self.assertEqual(vols, ["100", "100", "200"])       # 卷期 100 已有 2 篇在途：第 3 次领到别的卷期
+
+    def test_volume_stop_skips_rest_of_volume_in_chunk(self):
+        s = self.src("a", chunk_size=100)
+        s.volume_stop_after = 2
+        s.import_urls(self._acm([(100, 6), (200, 3)]))
+        requested, stopped = [], []
+        while (t := s.claim("x")) is not None:
+            requested.append(t.doi)
+            if t.doi.startswith("10.1145/100."):
+                r = s.finish(t, "non_pdf", error_kind="paywall")
+                if r:
+                    stopped.append(r)
+            else:
+                s.finish(t, "success")
+        self.assertEqual([d for d in requested if d.startswith("10.1145/100.")], ["10.1145/100.1", "10.1145/100.2"])
+        self.assertEqual(stopped, [("100", 4)])               # 与 TaskDB.finish 同样的返回值
+        s._flush()
+        q = self.queue()
+        self.assertEqual(q.skip_counts(), {"volume_stop": 4})
+        self.assertEqual(s.counts()["pending"], 0)            # 跳过的不算待下载
+        self.assertEqual(q.clear_skips("volume_stop"), 4)    # 撤销：放回、切成下一代块
+        again = self.src("b", chunk_size=100)
+        back = []
+        while (t := again.claim("y")) is not None:
+            back.append(t.doi)
+            again.finish(t, "success")
+        self.assertEqual(sorted(back), [f"10.1145/100.{i}" for i in range(3, 7)])
+
+    def test_volume_with_a_pdf_is_never_stopped(self):
+        s = self.src("a", chunk_size=100)
+        s.volume_stop_after = 2
+        s.import_urls(self._acm([(100, 5)]))
+        n = 0
+        while (t := s.claim("x")) is not None:
+            n += 1
+            s.finish(t, "success" if n == 1 else "non_pdf", error_kind=None if n == 1 else "not_found")
+        self.assertEqual(n, 5)
+
+    def test_inspector_hooks_only_touch_local_queue(self):
+        a, b = self.src("a", chunk_size=5), self.src("b", chunk_size=5)
+        a.import_urls({"doi": f"10.1/x{i:02d}", "url": f"https://h.org/pii/A{i:02d}"} for i in range(10))
+        ta = a.claim("x")                                     # a 领第 1 块（x00..x04），本地剩 4 条
+        tb = b.claim("y")                                     # b 领第 2 块
+        self.assertEqual(a.count_pending_matching("10.1/x", ""), 4)
+        self.assertEqual(a.flag_suspects("10.1/x", "https://h.org/pii/A", "Deleted", 10, 1.0), 4)
+        a.finish(ta, "success")                               # 第 1 块：1 条成功 + 4 条跳过 → 收尾
+        self.assertIsNone(a.claim("x"))                       # 第 2 块在 b 手里，a 没有可领的
+        a._flush()
+        q = self.queue()
+        self.assertEqual(q.skip_counts(), {"title_dup": 4})  # b 手里的块不受影响
+        rest = [tb.doi]
+        b.finish(tb, "success")
+        while (t := b.claim("y")) is not None:
+            rest.append(t.doi)
+            b.finish(t, "success")
+        self.assertEqual(sorted(rest), [f"10.1/x{i:02d}" for i in range(5, 10)])
+
+    def test_browser_title_dup_skips_rest_in_chunk(self):
+        """浏览器模式块内巡检：一段 URL 全是同一个"Deleted DOI"页，触发后本块里剩下的同前缀任务不再渲染。"""
+        from tests.test_paperlite import PROXY
+        from paperlite import browser_pool as bp
+        from paperlite.browser import RenderResult
+        from paperlite.config import Limits
+        from paperlite.proxy import Lease
+
+        base = "https://www.sciencedirect.com/science/article/pii/"
+        rows = ([{"doi": f"10.1/a{i:03d}", "url": f"{base}A{i:03d}", "url_type": "html"} for i in range(30)] +
+                [{"doi": f"10.1/b{i:03d}", "url": f"{base}B{i:03d}", "url_type": "html"} for i in range(10)])
+        self.src("loader", chunk_size=100).import_urls(rows)
+        rendered = []
+
+        class FakeSession:
+            def __init__(s, proxy, headed=False, geoip=False, webrtc_spoof=True):
+                pass
+            async def start(s):
+                pass
+            async def render(s, url, timeout_s, settle_s=2.0):
+                if "/pii/" in url:
+                    rendered.append(url)
+                title = "Deleted DOI" if "/pii/A" in url else f"Paper {url[-3:]}"
+                return RenderResult(ok=True, seconds=0.1, url=url, status=200, title=title, html="<html/>")
+            async def close(s):
+                pass
+
+        class FakeIp:
+            def __init__(s, proxy):
+                pass
+            def extract_checked(s):
+                return Lease(server="1.2.3.4:1", exit_ip="1.2.3.4", area="", expires_at=time.time() + 9999)
+
+        cfg = Limits(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, title_dup_trigger=3,
+                     rule_min_support=3, rule_min_precision=0.9)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(bp, "BrowserSession", FakeSession), \
+                mock.patch.object(bp, "IpSource", FakeIp):
+            pool = bp.BrowserPool(cfg, PROXY, self.src("m", chunk_size=100), Path(tmp), 1)
+            pool.run()
+            pool.db._flush()
+        a_seen = [u for u in rendered if "/pii/A" in u]
+        self.assertEqual(sorted(u for u in rendered if "/pii/B" in u), [f"{base}B{i:03d}" for i in range(10)])
+        self.assertLess(len(a_seen), 30)                      # 触发后跳过了一部分
+        q = self.queue()
+        self.assertEqual(q.skip_counts().get("title_dup", 0), 30 - len(a_seen))
+        self.assertEqual(q.stats().tasks.get("success"), len(rendered))
+
 
 
 class PgConfigTest(unittest.TestCase):
@@ -393,9 +514,10 @@ class PgConfigTest(unittest.TestCase):
     def test_pg_flag_only_on_supported_commands(self):
         from paperlite.cli import _build_parser
         ap, _ = _build_parser()
-        for cmd in (["import", "--urls", "x"], ["run"], ["download"], ["produce"], ["status"]):
+        for cmd in (["import", "--urls", "x"], ["run"], ["download"], ["produce"], ["status"], ["inspect"],
+                    ["retry", "--stopped-volumes"]):
             self.assertTrue(ap.parse_args(cmd + ["--pg"]).pg, cmd)
-        for cmd in (["inspect"], ["export"], ["retry", "--status", "failed"]):
+        for cmd in (["export"],):
             with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
                 ap.parse_args(cmd + ["--pg"])
 

@@ -320,16 +320,20 @@ def _status(args, cfg) -> None:
     db = _open_db(args)
     host = db.host()
     c = db.counts()
-    print(f"任务库 {db.path}（{host or '空'}）: 共 {sum(c.values())}  " +
+    q = getattr(db, "q", None)                      # --pg：counts() 的 pending 不含块内推断跳过的
+    sk = q.skip_counts() if q is not None else {}
+    print(f"任务库 {db.path}（{host or '空'}）: 共 {sum(c.values()) + sum(sk.values())}  " +
           "  ".join(f"{s} {c[s]}" for s in Status.ALL))
     types = db.type_counts()
     if len(types) > 1 or UrlType.PDF not in types:
         for t, tc in sorted(types.items()):
             print(f"  [{t}] 共 {sum(tc.values())}  " + "  ".join(f"{s} {tc[s]}" for s in Status.ALL if tc[s]))
-    q = getattr(db, "q", None)                      # --pg：附带块统计
-    if q is not None:
+    if q is not None:                               # --pg：附带块统计
         ch = q.stats().chunks
         print(f"  块: " + "  ".join(f"{k} {ch.get(k, 0)}" for k in ("queued", "leased", "done")))
+        if sk:
+            print(f"  块内推断跳过（仍 pending、不再领取）: 卷期停止 {sk.get('volume_stop', 0)}  "
+                  f"巡检 {sk.get('title_dup', 0)}（retry --pg --stopped-volumes / inspect --pg --reset 可放回）")
     for status, kind, n, inferred in db.kind_counts():
         print(f"  {status:8s} {kind or '-':16s} {n}" + (f"（其中按卷期推断 {inferred}）" if inferred else ""))
     v, n = db.volume_summary()
@@ -438,6 +442,17 @@ def _inspect(args) -> None:
     """巡检：同标题重复到阈值就归纳 doi/url 规则、标记疑似封面的未采任务。"""
     cfg = _limits(args)
     db = _open_db(args)
+    if getattr(args, "pg", False):                  # PG：巡检只在下载时按块做，这里只能查看 / 撤销
+        try:
+            if args.reset:
+                print(f"已放回 {db.q.clear_skips('title_dup')} 个巡检跳过的任务")
+            elif args.list:
+                print(f"巡检跳过（仍 pending、不再领取）: {db.q.skip_counts().get('title_dup', 0)}")
+            else:
+                raise SystemExit("--pg 下巡检在 run 时按块自动进行；这里只支持 --list / --reset")
+        finally:
+            db.close()
+        return
     try:
         if args.reset:
             print(f"已清除 {db.clear_suspects()} 条 suspect_cover 标记与全部规则，放回可采")
@@ -587,14 +602,14 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p = cmd("status")
     site_args(p)
     p = cmd("inspect")
-    site_args(p, pg=False)
+    site_args(p)
     p.add_argument("--trigger", type=int, help="同标题重复多少篇触发（覆盖配置 title_dup_trigger）")
     p.add_argument("--min-precision", type=float, help="规则最低精确率（覆盖配置 rule_min_precision）")
     p.add_argument("--min-support", type=int, help="规则最低命中数（覆盖配置 rule_min_support）")
     p.add_argument("--list", action="store_true", help="只列出已生效的规则，不重新巡检")
     p.add_argument("--reset", action="store_true", help="清除所有 suspect_cover 标记与规则（放回可采）")
     p = cmd("retry")
-    site_args(p, pg=False)
+    site_args(p)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--status", choices=[Status.FAILED, Status.NON_PDF], help="重置该状态的任务")
     g.add_argument("--stopped-volumes", action="store_true",
@@ -676,7 +691,12 @@ def main() -> None:
         return
     if args.cmd == "retry":
         db = _open_db(args)
-        if args.stopped_volumes:
+        if args.pg:                                 # PG：只能撤销卷期停止（失败任务的重置暂不支持）
+            if not args.stopped_volumes:
+                db.close()
+                raise SystemExit("--pg 目前只支持 retry --stopped-volumes")
+            print(f"已放回 {db.q.clear_skips('volume_stop')} 个按卷期跳过的任务")
+        elif args.stopped_volumes:
             v, n = db.reset_stopped_volumes()
             print(f"已重置 {v} 个被停卷期的 {n} 个任务为 pending")
         else:

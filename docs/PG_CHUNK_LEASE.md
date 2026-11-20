@@ -25,8 +25,15 @@ paperlite run --pg --workers 20            # 每台机器各跑一个；浏览�
 paperlite status --pg                      # 任务状态 + 块统计（queued / leased / done）
 ```
 
-PG 模式**不做巡检**：`run --pg` 即使配置了 `title_dup_trigger` 也不启用巡检器，`inspect` 不接受 `--pg`。
-`retry` / `export` 暂不支持 `--pg`（参数解析时直接拒绝）。
+卷期停止和巡检在 PG 模式下**只在本机领到的块里做**（见第 6 节）。被跳过的任务保持 pending、不再领取，可以放回：
+
+```bash
+paperlite retry --pg --stopped-volumes     # 放回按卷期跳过的
+paperlite inspect --pg --list              # 看巡检跳过了多少
+paperlite inspect --pg --reset             # 放回巡检跳过的
+```
+
+`export` 不支持 `--pg`；`retry --pg` 只支持 `--stopped-volumes`。
 
 ## 1. 为什么按块，而不是逐条领
 
@@ -54,7 +61,8 @@ PG 模式**不做巡检**：`run --pg` 即使配置了 `title_dup_trigger` 也�
 ## 3. 表结构
 
 - `pl_tasks`：与 SQLite 的 `paper_pdf_resources` 同名同义列，另加 `batch`、`host`、`chunk_id`、`next_attempt_at`、
-  `worker`；没有 `running` 状态（块内任务领取时不改状态，省掉每篇一次写）。`fillfactor = 80`。
+  `worker`、`skip_reason`（`volume_stop` / `title_dup`：块内推断跳过，保持 pending、不再领取）；
+  没有 `running` 状态（块内任务领取时不改状态，省掉每篇一次写）。`fillfactor = 80`。
 - `pl_chunks`：`chunk_id, batch, generation, order_key, host, size, first_doi, last_doi, status(queued/leased/done),
   worker, lease_until, attempts`。
 
@@ -72,7 +80,7 @@ import_urls ─▶ build_chunks（每 host 每 1000 条一块，换 host 必切�
 ```
 
 - **领取** `claim_chunk`：先回收过期租约，再按 `(generation, order_key)` 取第一块 queued。
-  块内取 `pending AND next_attempt_at 已到`，按 `(challenge_count, id)` 排序。
+  块内取 `pending AND skip_reason IS NULL AND next_attempt_at 已到`，按 `(challenge_count, id)` 排序。
   块里没有可领任务就直接记 done，继续领下一块。
 - **续租** `LeaseKeeper`：后台线程每 `lease/6` 续一次（默认租约 30 分钟）。续租失败 = 块已被别人回收，
   `lost` 置位，worker 停止领这块剩下的任务（已下的结果照常上报）。
@@ -87,7 +95,8 @@ import_urls ─▶ build_chunks（每 host 每 1000 条一块，换 host 必切�
 
 worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB 的一小部分接口：
 `claim / finish / retry_later / challenged / count_claimable / has_status / host / hosts / counts`。
-`PgTaskSource` 实现同样的接口，worker 代码不用改（浏览器模式看到 `supports_inspect = False` 就不开巡检器）：
+`PgTaskSource` 实现同样的接口，worker 代码不用改。巡检器（`WindowInspector`）需要的两个钩子
+`count_pending_matching` / `flag_suspects` 也由它实现，只作用于本地队列：
 
 | 接口 | PgTaskSource 的做法 |
 |---|---|
@@ -102,13 +111,32 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB �
 
 | 单机功能 | 多机做法 | 状态 |
 |---|---|---|
-| 卷期停止（`volume_stop_after`） | 一块基本是同一卷期，在本机块内判断；判停后对 PG 执行 `UPDATE ... WHERE volume = ? AND status = 'pending'` | 待接入 |
-| 巡检（`flag` / `skip_rules`） | 不做。`pl_tasks` 没有 `flag` 列，也没有 `skip_rules` 表 | 移除 |
+| 卷期停止（`volume_stop_after`，curl 模式） | 只在本机领到的块里判断，见下 | 已实现 |
+| 巡检（`title_dup_trigger`，浏览器模式） | 只在本机领到的块里跳过，见下 | 已实现 |
 | 被挑战排后（`challenge_count`） | `Result(challenged=True)`：块内排序靠后；放回重试时进入下一代 | 已实现 |
 | 重试退避 | `next_attempt_at` | 已实现 |
 | 身份池（curl 模式） | 不变，继续用 Redis | — |
 | 跨机器的按站点限速 / 并发上限 | Redis 计数（每个 host 的在线 worker 数、令牌桶） | 待设计 |
 | 进度和统计 | `stats()`；大表上改为汇总表，不要直接 `GROUP BY` 全表 | 部分 |
+
+**为什么只在块内做**：单机版的判断依赖全库状态（全库在途数、全库批量标记），多机下要么每篇查一次 PG，
+要么已经发到别的机器本地队列里的任务看不到标记。导入时按 (host, doi) 排过序，同一卷期、同一期刊基本在同一块里，
+信号大部分在本机，块内判断就够了，也不需要跨机器协调。
+
+**卷期停止**：
+- 本机按卷期记状态（进程内，跨块保留）：下到过 PDF → 永不停；本机在途 + 已判没有 PDF 达到 N 篇前才放行同卷期任务，
+  其余线程先领别的卷期（本地队列都被卡住时最多多领 `max_active_chunks` 块）。
+- N 篇都没有 PDF → 本地队列里同卷期的任务记 `skip_reason = volume_stop`，之后再领到的同卷期任务也直接跳过。
+  `finish` 返回 `(卷期号, 跳过数)`，与 TaskDB 一致，Downloader 的统计照常。
+- 代价：同一卷期跨块 / 跨机器时，每台机器各自试探 N 篇。
+- 卷期号只认 ACM 式 DOI（`10.xxxx/数字.数字`），10.1016 这类 DOI 不适用（单机版同样如此）。
+
+**巡检**：
+- 仍是 `WindowInspector`（本机最近 `title_window_size` 条已加载页），规则归纳和精确率护栏不变；
+  只是"有多少待采匹配""标记哪些"换成本地队列：命中的记 `skip_reason = title_dup`。
+- 代价：精确率只在本机窗口上验证（单机版也是窗口）；别的机器手里的同前缀任务不受影响，它们自己的窗口会各自触发。
+
+**撤销**：`clear_skips(reason)` 清掉 `skip_reason`、切成下一代块重新下载（CLI 见第 0 节）。
 
 ## 7. 参数
 
@@ -136,6 +164,8 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB �
   重试退避与下一代、空块跳过、LeaseKeeper；
 - PgTaskSource：多线程领完且每条一次、重试在同一次运行里排到最后再做、挑战到上限判 failed、
   close 交还未完成的块、租约丢失放弃本地任务；
+- 块内卷期停止：同卷期在途上限、N 篇没有 PDF 后跳过其余并可放回、下到过 PDF 的卷期不停；
+- 块内巡检：钩子只作用于本地队列（别的机器手里的块不受影响）、浏览器模式同标题触发后跳过本块剩余同前缀任务；
 - 端到端：3 个 curl `Downloader`（各 2 线程）共享一个批次，30 条每条恰好请求一次；
   2 个 `BrowserPool`（各 2 浏览器）共享一个批次，20 页每页恰好渲染一次；
 - `[pg]` 配置解析和 `--pg` 开关（不需要 PG）。
