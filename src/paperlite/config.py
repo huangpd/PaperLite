@@ -12,6 +12,7 @@ paperlite/config.py
   [paths]    位置：db（任务库，本地盘）、storage（输出 PDF/HTML，可挂载）、log_dir
   [run]      paperlite run config.toml 时的启动参数
   [landing]  主机 → 过盾落地页（可选）
+  [pg]       【研究】多机共享任务队列：PostgreSQL 按块领取（命令加 --pg 时才用，见 docs/PG_CHUNK_LEASE.md）
 """
 
 import os
@@ -154,6 +155,30 @@ class RunConfig:
         return cfg
 
 
+@dataclass(frozen=True)
+class PgConfig:
+    """[pg]：多台机器共享一个批次时的 PostgreSQL 任务队列（paperlite.pgqueue）。"""
+
+    dsn: str = ""                     # postgresql://user:pass@host:5432/db（含密码，config.toml 不要提交）
+    batch: str = ""                   # 批次名：同一批次的机器填同一个
+    schema: str = ""                  # 可选：表所在 schema，空 = 默认 search_path
+    chunk_size: int = 1000            # 每块任务数
+    lease_s: float = 1800             # 块租约秒数，后台每 lease_s/6 续一次
+    flush_n: int = 500                # 结果攒够这么多条回写一次
+    flush_s: float = 5.0              # 或者攒了这么久回写一次
+    retry_delay_s: float = 0.0        # 要重试的任务至少等这么久再进下一代块
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "PgConfig":
+        _reject_unknown("pg", raw, cls)
+        cfg = cls(**raw)
+        if not cfg.dsn or not cfg.batch:
+            raise ValueError("[pg] dsn 和 batch 必填")
+        if cfg.chunk_size < 1 or cfg.lease_s <= 0 or cfg.flush_n < 1 or cfg.flush_s <= 0:
+            raise ValueError("[pg] chunk_size / lease_s / flush_n / flush_s 必须大于 0")
+        return cfg
+
+
 def proxy_settings(raw: dict[str, Any]) -> ProxySettings:
     _reject_unknown("proxy", raw, ProxySettings)
     if not raw.get("api_url"):
@@ -167,7 +192,7 @@ def _read(path: Path) -> dict[str, Any]:
                                 f"或用 --config / 环境变量 {CONFIG_ENV} 指定）")
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "landing", "monitor"})   # [monitor] 见 monitor/config.py
+    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "landing", "monitor", "pg"})   # [monitor] 见 monitor/config.py
     return raw
 
 
@@ -194,6 +219,14 @@ def load_run(path: Path | None = None) -> RunConfig:
     """读 [run]。"""
     raw = _read(path or resolve_path())
     return RunConfig.from_dict(raw.get("run", {}))
+
+
+def load_pg(path: Path | None = None) -> PgConfig:
+    """读 [pg]；没有这一段报错（命令加了 --pg 才会调用）。"""
+    raw = _read(path or resolve_path())
+    if "pg" not in raw:
+        raise ValueError("用了 --pg，但配置文件里没有 [pg] 段（dsn、batch）")
+    return PgConfig.from_dict(raw["pg"])
 
 
 def _reject_unknown(section: str, raw: dict, cls, allowed: set[str] | None = None) -> None:

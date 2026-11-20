@@ -27,7 +27,9 @@ import csv
 import dataclasses
 import json
 import logging
+import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -99,11 +101,33 @@ def _storage_dir(args, paths: Paths) -> Path:
 
 
 def _open_db(args, create: bool = False) -> TaskDB:
-    """打开任务库（位置：--db > [paths].db）。create=False 且文件不存在就报错。"""
+    """打开任务库（位置：--db > [paths].db）。create=False 且文件不存在就报错。
+    加了 --pg 时返回 PgTaskSource（[pg] 段的多机共享队列），worker 侧接口与 TaskDB 一致。"""
+    if getattr(args, "pg", False):
+        return _open_pg(args)
     db = _db_file(args, _paths(args))
     if not create and not db.exists():
         raise SystemExit(f"任务库不存在: {db}（先 import，或用 --db 指定）")
     return TaskDB(db)
+
+
+def _open_pg(args):
+    try:
+        pc = config_mod.load_pg(config_mod.resolve_path(args.config))
+    except FileNotFoundError as e:
+        raise SystemExit(str(e))
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"配置错误: {e}")
+    from paperlite import pgqueue
+    try:
+        q = pgqueue.PgTaskQueue(pc.dsn, pc.batch, schema=pc.schema or None,
+                                worker=f"{socket.gethostname()}-{os.getpid()}")
+    except RuntimeError as e:                       # 没装 psycopg
+        raise SystemExit(str(e))
+    except Exception as e:
+        raise SystemExit(f"连接 PostgreSQL 失败: {e}")
+    return pgqueue.PgTaskSource(q, chunk_size=pc.chunk_size, lease_s=pc.lease_s, flush_n=pc.flush_n,
+                                flush_s=pc.flush_s, retry_delay_s=pc.retry_delay_s)
 
 
 def _require_geoip(cfg) -> None:
@@ -302,6 +326,10 @@ def _status(args, cfg) -> None:
     if len(types) > 1 or UrlType.PDF not in types:
         for t, tc in sorted(types.items()):
             print(f"  [{t}] 共 {sum(tc.values())}  " + "  ".join(f"{s} {tc[s]}" for s in Status.ALL if tc[s]))
+    q = getattr(db, "q", None)                      # --pg：附带块统计
+    if q is not None:
+        ch = q.stats().chunks
+        print(f"  块: " + "  ".join(f"{k} {ch.get(k, 0)}" for k in ("queued", "leased", "done")))
     for status, kind, n, inferred in db.kind_counts():
         print(f"  {status:8s} {kind or '-':16s} {n}" + (f"（其中按卷期推断 {inferred}）" if inferred else ""))
     v, n = db.volume_summary()
@@ -520,8 +548,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
                                     description=_COMMANDS[name])
         return parsers[name]
 
-    def site_args(p):
+    def site_args(p, pg: bool = True):
         p.add_argument("--db", help="任务库文件（覆盖 [paths].db）；必须本地盘")
+        if pg:
+            p.add_argument("--pg", action="store_true",
+                           help="【研究】改用 [pg] 段的 PostgreSQL 共享队列（多机按块领取），不用本地 --db")
 
     p = cmd("init")
     p.add_argument("--force", action="store_true", help="已存在也覆盖")
@@ -556,21 +587,21 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p = cmd("status")
     site_args(p)
     p = cmd("inspect")
-    site_args(p)
+    site_args(p, pg=False)
     p.add_argument("--trigger", type=int, help="同标题重复多少篇触发（覆盖配置 title_dup_trigger）")
     p.add_argument("--min-precision", type=float, help="规则最低精确率（覆盖配置 rule_min_precision）")
     p.add_argument("--min-support", type=int, help="规则最低命中数（覆盖配置 rule_min_support）")
     p.add_argument("--list", action="store_true", help="只列出已生效的规则，不重新巡检")
     p.add_argument("--reset", action="store_true", help="清除所有 suspect_cover 标记与规则（放回可采）")
     p = cmd("retry")
-    site_args(p)
+    site_args(p, pg=False)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--status", choices=[Status.FAILED, Status.NON_PDF], help="重置该状态的任务")
     g.add_argument("--stopped-volumes", action="store_true",
                    help="重新核实按卷期停掉的：这些卷期的 non_pdf（样本 + 推断）全部放回 pending")
     p.add_argument("--kind", choices=ERROR_KINDS, help="配合 --status，只重置该 error_kind")
     p = cmd("export")
-    site_args(p)
+    site_args(p, pg=False)
     p.add_argument("--status", choices=Status.ALL, help="只导出该状态")
     p.add_argument("--file", default="-", help="输出文件，默认标准输出")
     p = cmd("turnstile")

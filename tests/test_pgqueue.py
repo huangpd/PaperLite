@@ -6,9 +6,13 @@
 
 import os
 import random
+import tempfile
 import threading
+import time
 import unittest
 import uuid
+from pathlib import Path
+from unittest import mock
 
 DSN = os.environ.get("PAPERLITE_TEST_PG")
 
@@ -151,6 +155,249 @@ class PgQueueTest(unittest.TestCase):
         b.claim_chunk()                                              # 被 b 回收
         with self.pg.LeaseKeeper(a, ch.chunk_id, lease_s=60, interval_s=0.05) as k:
             self.assertTrue(k.lost.wait(2))
+
+
+@unittest.skipUnless(DSN, "需要 PAPERLITE_TEST_PG")
+class PgTaskSourceTest(unittest.TestCase):
+    """PgTaskSource：TaskDB 的多机替身（worker 侧接口一致）。"""
+
+    def setUp(self):
+        from paperlite import pgqueue
+        self.pg = pgqueue
+        self.schema = "s_" + uuid.uuid4().hex[:10]
+        self.sources = []
+
+    def tearDown(self):
+        import psycopg
+        for s in self.sources:
+            s.close()
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f'DROP SCHEMA IF EXISTS "{self.schema}" CASCADE')
+
+    def src(self, worker, **kw):
+        kw.setdefault("chunk_size", 4)
+        kw.setdefault("flush_s", 0.2)
+        kw.setdefault("remote_check_s", 0)
+        q = self.pg.PgTaskQueue(DSN, "b1", schema=self.schema, worker=worker)
+        s = self.pg.PgTaskSource(q, **kw)
+        self.sources.append(s)
+        return s
+
+    def queue(self):
+        q = self.pg.PgTaskQueue(DSN, "b1", schema=self.schema, worker="inspect")
+        self.addCleanup(q.close)
+        return q
+
+    def test_import_builds_chunks_and_claim_drains_everything_once(self):
+        a, b = self.src("a"), self.src("b")
+        self.assertEqual(a.import_urls(_rows(10)), (10, 0))
+        self.assertEqual(a.hosts(), ["a.com"])
+        got, lock = [], threading.Lock()
+
+        def run(s):
+            while (t := s.claim("x")) is not None:
+                with lock:
+                    got.append(t.id)
+                s.finish(t, "success", file_size=1)
+
+        ts = [threading.Thread(target=run, args=(s,)) for s in (a, a, b, b)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertEqual(len(got), 10)
+        self.assertEqual(len(set(got)), 10)
+        st = self.queue().stats()
+        self.assertEqual((st.tasks, st.chunks), ({"success": 10}, {"done": 3}))
+        self.assertEqual(a.count_claimable(cap=1), 0)
+        self.assertFalse(a.has_status("running"))
+
+    def test_retry_comes_back_in_same_run_after_other_tasks(self):
+        s = self.src("a")
+        s.import_urls(_rows(6))
+        order, tries = [], {}
+        while (t := s.claim("x")) is not None:
+            order.append(t.doi)
+            tries[t.doi] = tries.get(t.doi, 0) + 1
+            if t.doi == "10.1/x000000" and tries[t.doi] == 1:
+                s.retry_later(t, count=True, error_kind="network", error_message="reset")
+            else:
+                s.finish(t, "success")
+        self.assertEqual(order[-1], "10.1/x000000")           # 重试排到最后（下一代块）
+        self.assertEqual(tries["10.1/x000000"], 2)
+        self.assertEqual(self.queue().stats().tasks, {"success": 6})
+
+    def test_challenged_until_max_then_failed(self):
+        s = self.src("a")
+        s.import_urls(_rows(1))
+        results = []
+        while (t := s.claim("x")) is not None:
+            results.append(s.challenged(t, 3, "1.1.1.1", "HTTP 403 挑战"))
+        self.assertEqual(results, [False, False, True])
+        st = self.queue().stats().tasks
+        self.assertEqual(st, {"failed": 1})
+
+    def test_close_releases_unfinished_chunk_for_other_machines(self):
+        a = self.src("a")
+        a.import_urls(_rows(4))
+        t = a.claim("x")
+        a.finish(t, "success")
+        a.close()                                             # 中断：剩 3 条没做
+        self.sources.remove(a)
+        b = self.src("b")
+        rest = []
+        while (t := b.claim("y")) is not None:
+            rest.append(t.id)
+            b.finish(t, "success")
+        self.assertEqual(len(rest), 3)                        # 不用等租约过期
+        self.assertEqual(self.queue().stats().tasks, {"success": 4})
+
+    def test_lost_lease_drops_local_tasks(self):
+        a = self.src("a", lease_s=0.3)
+        a.import_urls(_rows(4))
+        t = a.claim("x")                                      # 本地还剩 3 条
+        for k in a._chunks.values():                          # 模拟续租线程卡死：租约过期
+            k.keeper._stop.set()
+        time.sleep(0.5)
+        b = self.src("b")
+        stolen = b.claim("y")                                 # b 回收并领到同一块
+        self.assertIsNotNone(stolen)
+        for k in a._chunks.values():
+            k.keeper.lost.set()                               # a 的续租发现租约已丢
+        a.finish(t, "success")                                # 在途的照常上报
+        self.assertIsNone(a.claim("x"))                       # 本地剩余的放弃，没有别的块
+        a._flush()
+        self.assertEqual(self.queue().stats().tasks.get("success"), 1)
+
+    def test_curl_downloaders_on_three_machines_share_one_batch(self):
+        """3 个 Downloader（模拟 3 台机器）各 2 线程，共享一个 PG 批次：每条恰好处理一次。"""
+        from tests.test_paperlite import FAKE_PDF, PROXY, FakeStore, Resp, ident
+        from paperlite.config import Limits
+        from paperlite.consumer import Downloader
+
+        urls = [f"https://dl.acm.org/doi/pdf/10.1145/{i}" for i in range(30)]
+        loader = self.src("loader")
+        loader.import_urls({"url": u} for u in urls)
+        hits, lock = {}, threading.Lock()
+
+        def respond(url):
+            with lock:
+                hits[url] = hits.get(url, 0) + 1
+            return Resp(404, b"<html>not found</html>") if url.endswith("/7") else Resp(200, FAKE_PDF)
+
+        def fake_session(_ident):
+            s = mock.Mock()
+            s.get.side_effect = lambda url, **kw: respond(url)
+            return s
+
+        cfg = Limits(request_gap_s=(0, 0))
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(Downloader, "_session", side_effect=fake_session):
+            dls = [Downloader(cfg, FakeStore([ident(exit_ip=f"9.9.9.{m}{i}") for i in range(2)]), PROXY,
+                              self.src(f"m{m}"), Path(tmp), workers=2) for m in range(3)]
+            ts = [threading.Thread(target=d.run) for d in dls]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(30)
+            self.assertFalse(any(t.is_alive() for t in ts))
+            for d in dls:
+                d.db._flush()
+            pdfs = list(Path(tmp).rglob("*.pdf"))
+        self.assertEqual(sorted(hits), sorted(urls))
+        self.assertEqual(set(hits.values()), {1})             # 没有一条被两台机器重复请求
+        self.assertEqual(len(pdfs), 29)
+        st = self.queue().stats()
+        self.assertEqual(sum(st.tasks.values()), 30)
+        self.assertEqual(st.tasks.get("success"), 29)
+        self.assertEqual(st.chunks, {"done": 8})
+        self.assertTrue(all(d.stats.success for d in dls))    # 三台都分到了活
+
+
+    def test_browser_pools_on_two_machines_share_one_batch(self):
+        """浏览器模式：2 个 BrowserPool（模拟 2 台机器）各 2 个浏览器，开着巡检配置也不报错（PG 版不支持、自动关闭）。"""
+        from tests.test_paperlite import PROXY
+        from paperlite import browser_pool as bp
+        from paperlite.browser import RenderResult
+        from paperlite.config import Limits
+        from paperlite.proxy import Lease
+
+        urls = [f"https://www.sciencedirect.com/science/article/abs/pii/{i}" for i in range(20)]
+        self.src("loader").import_urls({"url": u, "url_type": "html"} for u in urls)
+        hits, lock = {}, threading.Lock()
+
+        class FakeSession:
+            def __init__(s, proxy, headed=False, geoip=False, webrtc_spoof=True):
+                pass
+            async def start(s):
+                pass
+            async def render(s, url, timeout_s, settle_s=2.0):
+                with lock:
+                    hits[url] = hits.get(url, 0) + 1
+                return RenderResult(ok=True, seconds=0.1, url=url, status=200, title=f"P{url}", html="<html/>")
+            async def close(s):
+                pass
+
+        n = iter(range(1000))
+
+        class FakeIp:
+            def __init__(s, proxy):
+                pass
+            def extract_checked(s):
+                i = next(n)
+                return Lease(server=f"1.2.{i}.1:1", exit_ip=f"1.2.{i}.1", area="", expires_at=time.time() + 9999)
+
+        cfg = Limits(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, title_dup_trigger=3)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(bp, "BrowserSession", FakeSession), \
+                mock.patch.object(bp, "IpSource", FakeIp):
+            pools = [bp.BrowserPool(cfg, PROXY, self.src(f"m{m}"), Path(tmp), 2) for m in range(2)]
+            self.assertTrue(all(p.inspector is None for p in pools))
+            ts = [threading.Thread(target=p.run) for p in pools]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(30)
+            self.assertFalse(any(t.is_alive() for t in ts))
+            for p in pools:
+                p.db._flush()
+            self.assertEqual(len(list(Path(tmp).rglob("*.html"))), 20)
+        pages = {u: k for u, k in hits.items() if "/pii/" in u}            # 去掉热身落地页
+        self.assertEqual(sorted(pages), sorted(urls))
+        self.assertEqual(set(pages.values()), {1})
+        st = self.queue().stats()
+        self.assertEqual((st.tasks, st.chunks), ({"success": 20}, {"done": 5}))
+
+
+class PgConfigTest(unittest.TestCase):
+    """[pg] 段解析与 --pg 开关（不需要 PostgreSQL）。"""
+
+    def test_from_dict(self):
+        from paperlite.config import PgConfig
+        c = PgConfig.from_dict({"dsn": "postgresql://h/db", "batch": "b", "chunk_size": 500})
+        self.assertEqual((c.batch, c.chunk_size, c.lease_s), ("b", 500, 1800))
+        for bad in ({"batch": "b"}, {"dsn": "x"}, {"dsn": "x", "batch": "b", "chunk_size": 0},
+                    {"dsn": "x", "batch": "b", "nope": 1}):
+            with self.assertRaises(ValueError):
+                PgConfig.from_dict(bad)
+
+    def test_load_pg_requires_section(self):
+        from paperlite import config
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.toml"
+            p.write_text('[pg]\ndsn = "postgresql://h/db"\nbatch = "b"\n')
+            self.assertEqual(config.load_pg(p).batch, "b")
+            p.write_text("[paths]\n")
+            with self.assertRaises(ValueError):
+                config.load_pg(p)
+
+    def test_pg_flag_only_on_supported_commands(self):
+        from paperlite.cli import _build_parser
+        ap, _ = _build_parser()
+        for cmd in (["import", "--urls", "x"], ["run"], ["download"], ["produce"], ["status"]):
+            self.assertTrue(ap.parse_args(cmd + ["--pg"]).pg, cmd)
+        for cmd in (["inspect"], ["export"], ["retry", "--status", "failed"]):
+            with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+                ap.parse_args(cmd + ["--pg"])
 
 
 if __name__ == "__main__":
