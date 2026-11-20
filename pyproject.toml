@@ -30,6 +30,9 @@ dependencies = [
 
 [project.optional-dependencies]
 monitor = []                  # 兼容旧安装命令 paperlite[monitor]；pika 已是默认依赖
+pg = [
+    "psycopg[binary]>=3.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/huangpd/PaperLite"
