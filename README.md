@@ -23,6 +23,7 @@ PaperLite is a high-volume downloader for PDFs and web pages served behind bot-p
 - [Configuration](#configuration)
 - [Command reference](#command-reference)
 - [Operations](#operations)
+- [Multi-machine queue (experimental)](#multi-machine-queue-experimental)
 - [Monitoring](#monitoring)
 - [Turnstile tokens](#turnstile-tokens)
 - [Task database](#task-database)
@@ -189,6 +190,20 @@ storage = "/mnt/obs/papers"     # object-storage mount
 Curl mode converts browser cookies into a `CookieJar`, retaining duplicate names with distinct domains/paths, host-only scope, secure, expires, HttpOnly and SameSite attributes. Redis keeps a JSON list in `cookies` with a `cookies_format=cookiejar-v1` marker; existing browser-cookie lists remain readable without clearing Redis. Admission checks and downloads use the identity's live jar, so response cookie updates and deletions are saved on insertion, consumer heartbeats and release. Saving never extends the identity or proxy lifetime. Restart both producers and consumers when upgrading.
 
 > When running from a source checkout installed through a mirror, call `.venv/bin/paperlite` directly. `uv run` re-syncs against `uv.lock` and the default index, which can stall on restricted networks.
+
+## Multi-machine queue (experimental)
+
+> Experimental, only on the `research/pg-chunk-lease` branch, not on PyPI; the interface may change.
+
+To share one batch across many machines, the task database can be PostgreSQL instead of SQLite: import sorts tasks by (host, DOI) and cuts them into chunks of about 1000; each machine leases one chunk at a time (another machine takes over if it dies), downloads it locally and writes results back in batches. All machines are peers — there is no master. Install `paperlite[pg]`, add a `[pg]` section (`dsn`, `batch`) to the config, and pass `--pg` (or set `pg = true` under `[run]`):
+
+```bash
+paperlite import --pg --urls batch.csv     # once, from any machine
+paperlite run --pg --workers 20            # on every machine
+paperlite status --pg
+```
+
+Inspection only acts on the chunks a machine holds; volume stop is not done; `export` / `retry` do not support `--pg` yet. Deployment steps: [docs/PG_DEPLOY.md](docs/PG_DEPLOY.md) (Chinese); design and benchmarks: [docs/PG_CHUNK_LEASE.md](docs/PG_CHUNK_LEASE.md) (Chinese).
 
 ## Monitoring
 

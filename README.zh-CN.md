@@ -23,6 +23,7 @@ PaperLite 是一个面向大批量场景的 PDF 与网页下载工具，适用�
 - [配置](#配置)
 - [命令参考](#命令参考)
 - [运维](#运维)
+- [多机共享队列（研究中）](#多机共享队列研究中)
 - [监控](#监控)
 - [Turnstile token](#turnstile-token)
 - [任务库](#任务库)
@@ -189,6 +190,20 @@ storage = "/mnt/obs/papers"     # 对象存储挂载
 curl 模式将浏览器导出的 cookie 转为 `CookieJar`，保留同名 cookie 的 domain/path、host-only、secure、expires、HttpOnly 和 SameSite 属性。Redis 中的 `cookies` 仍是 JSON 列表，新增 `cookies_format=cookiejar-v1` 标记；旧版浏览器 cookie 列表可直接读取，无需清空 Redis。生产者验收和消费者下载共用身份的 Jar，响应更新或删除 cookie 后，验收入池、消费者续租和归还都会保存最新状态；保存不会延长身份或代理的有效期。升级时请同时重启生产者和消费者。
 
 > 通过镜像源安装的源码环境，请直接调用 `.venv/bin/paperlite`。`uv run` 会按 `uv.lock` 从默认源重新同步，在受限网络下可能卡住。
+
+## 多机共享队列（研究中）
+
+> 实验功能，仅在 `research/pg-chunk-lease` 分支，未发布到 PyPI，接口可能变化。
+
+多台机器共享同一个批次时，任务库可以换成 PostgreSQL：导入时按 (主机, DOI) 排序切成约 1000 条一块，各机器一次领一块（带租约，机器挂了由别的机器接手），块内本地下载、结果批量写回。所有机器对等，没有主从之分。安装 `paperlite[pg]`，配置文件加 `[pg]` 段（`dsn`、`batch`），命令加 `--pg`（或 `[run]` 里写 `pg = true`）：
+
+```bash
+paperlite import --pg --urls batch.csv     # 任一台导入一次
+paperlite run --pg --workers 20            # 每台机器各跑一个
+paperlite status --pg
+```
+
+巡检只在本机领到的块里做；不做卷期停止；`export` / `retry` 暂不支持 `--pg`。部署步骤见 [docs/PG_DEPLOY.md](docs/PG_DEPLOY.md)，设计与压测见 [docs/PG_CHUNK_LEASE.md](docs/PG_CHUNK_LEASE.md)。
 
 ## 监控
 
