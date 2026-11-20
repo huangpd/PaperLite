@@ -23,8 +23,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
-from .tasks import (ERROR_KINDS, NO_PDF_KINDS, Status, Task, UrlType, derive_doi, derive_volume, url_host,
-                    url_key)
+from .tasks import ERROR_KINDS, Status, Task, UrlType, derive_doi, url_host, url_key
 
 try:  # 可选依赖：只有用到 PG 队列时才需要
     import psycopg
@@ -38,7 +37,7 @@ logger = logging.getLogger("paperlite")
 _WAIT = object()                       # PgTaskSource 内部：本进程还有块在收尾，稍后再领
 RETRY = "retry"                       # report 用：放回 pending，next_attempt_at 之后再领
 SKIP = "skip"                         # report 用：块内推断跳过，保持 pending、写 skip_reason，不再领取
-SKIP_REASONS = ("volume_stop", "title_dup")   # 卷期停止 / 巡检（同标题重复）
+SKIP_REASONS = ("title_dup",)         # 巡检（同标题重复）；PG 模式不做卷期停止
 
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_LEASE_S = 1800                # 30 分钟；正常一块 10～30 分钟，worker 每 lease/6 续一次
@@ -52,14 +51,13 @@ CREATE TABLE IF NOT EXISTS pl_tasks (
     url             text        NOT NULL,
     url_type        text        NOT NULL DEFAULT 'pdf' CHECK (url_type IN ('pdf', 'html')),
     host            text        NOT NULL,
-    volume          text,
     chunk_id        bigint,
     status          text        NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'success', 'failed', 'non_pdf')),
     retry_count     int         NOT NULL DEFAULT 0,
     challenge_count int         NOT NULL DEFAULT 0,
     next_attempt_at timestamptz,
-    skip_reason     text        CHECK (skip_reason IN ('volume_stop', 'title_dup')),  -- 块内推断跳过，不再领取
+    skip_reason     text        CHECK (skip_reason IN ('title_dup')),  -- 块内巡检跳过，不再领取
     http_status     int,
     error_kind      text        CHECK (error_kind IN ({", ".join(f"'{k}'" for k in ERROR_KINDS)})),
     error_message   text,
@@ -171,8 +169,8 @@ class PgTaskQueue:
         seen = 0
         with self._lock, self._conn.transaction():
             c = self._conn
-            c.execute("CREATE TEMP TABLE pl_import (url_key bytea, doi text, url text, url_type text, host text, "
-                      "volume text) ON COMMIT DROP")
+            c.execute("CREATE TEMP TABLE pl_import (url_key bytea, doi text, url text, url_type text, host text) "
+                      "ON COMMIT DROP")
             with c.cursor().copy("COPY pl_import FROM STDIN") as cp:
                 for r in rows:
                     url = (r.get("url") or r.get("pdf_url") or "").strip()
@@ -183,12 +181,12 @@ class PgTaskQueue:
                     kind = (r.get("url_type") or UrlType.PDF).strip().lower()
                     if kind not in UrlType.ALL:
                         raise ValueError(f"url_type 只能是 {' / '.join(UrlType.ALL)}，不是 {kind!r}: {url}")
-                    cp.write_row((url_key(url), doi, url, kind, h, derive_volume(doi)))
+                    cp.write_row((url_key(url), doi, url, kind, h))
                     seen += 1
             # 同一 url 多行只留 doi 最小的一行；按 (host, doi) 顺序插入，id 顺序即领取顺序
             added = c.execute(
-                "INSERT INTO pl_tasks (batch, url_key, doi, url, url_type, host, volume) "
-                "SELECT %s, url_key, doi, url, url_type, host, volume FROM ("
+                "INSERT INTO pl_tasks (batch, url_key, doi, url, url_type, host) "
+                "SELECT %s, url_key, doi, url, url_type, host FROM ("
                 "  SELECT DISTINCT ON (url_key) * FROM pl_import ORDER BY url_key, doi"
                 ") d ORDER BY host, doi "
                 "ON CONFLICT (url_key) DO NOTHING", (self.batch,)).rowcount
@@ -465,15 +463,6 @@ class _Active:
     left: int                         # 本块还没出结果的任务数（本地排队 + 在途）
 
 
-@dataclass
-class _Volume:
-    """本进程见过的一个卷期：只凭本机领到的块判断（不查全库）。"""
-    ok: bool = False                  # 下到过 PDF：永不停
-    stopped: bool = False             # 已判停：之后领到的同卷期任务直接跳过
-    inflight: int = 0                 # 本机在途
-    nopdf: list = field(default_factory=list)    # [(doi, error_kind)] 实际请求得到的"没有 PDF"
-
-
 class PgTaskSource:
     """
     给下载 worker（consumer.Downloader / browser_pool.BrowserPool）用的任务来源，接口与 TaskDB 中
@@ -483,15 +472,11 @@ class PgTaskSource:
     - 本地队列空了就领下一块（上一块还有在途任务也照领，线程不空等）；没块了先 requeue_leftovers 再试
     - 一块的任务全部出结果 → 回写缓冲 → complete；租约丢了 → 丢弃本地还没领的任务，在途的结果照常上报
     - 结果每 flush_n 条或 flush_s 秒回写一次；关闭时回写剩余结果、交还没做完的块
-    - 卷期停止、巡检都只在本机领到的块里做，不查、不改全库（见 docs/PG_CHUNK_LEASE.md）：
-      · 卷期停止（volume_stop_after > 0，curl 模式）：同卷期还没下到 PDF 时本机最多放 N 篇在途；N 篇都没有 PDF
-        → 本地队列里同卷期的任务记 skip_reason = volume_stop，之后再领到的同卷期任务也直接跳过
-      · 巡检（浏览器模式的 WindowInspector）：count_pending_matching / flag_suspects 只看、只跳本地队列，
-        记 skip_reason = title_dup
-      跳过的任务保持 pending，不再领取；clear_skips 可放回
+    - 巡检只在本机领到的块里做，不查、不改全库（见 docs/PG_CHUNK_LEASE.md）：浏览器模式的 WindowInspector
+      调 count_pending_matching / flag_suspects，只看、只跳本地队列，记 skip_reason = title_dup；
+      跳过的任务保持 pending，不再领取，clear_skips 可放回
+    - 不做卷期停止（依赖 ACM 式 DOI 结构，不通用）：volume_stop_after 被忽略，finish 恒返回 None
     """
-
-    max_active_chunks = 3             # 本地队列里的任务都被卷期卡住时最多再多领几块，防止把块囤在本机
 
     def __init__(self, queue: PgTaskQueue, *, chunk_size: int = DEFAULT_CHUNK_SIZE,
                  lease_s: float = DEFAULT_LEASE_S, flush_n: int = 500, flush_s: float = 5.0,
@@ -502,8 +487,7 @@ class PgTaskSource:
         self.flush_n, self.flush_s = flush_n, flush_s
         self.retry_delay_s = retry_delay_s
         self.remote_check_s = remote_check_s
-        self.volume_stop_after = 0                 # Downloader 按 [limits] 赋值；0 = 不按卷期停止
-        self._vols: dict[str, _Volume] = {}
+        self.volume_stop_after = 0                 # Downloader 会赋值；PG 模式不做卷期停止，忽略
         self._lock = threading.RLock()
         self._local: "deque[Task]" = deque()
         self._chunks: dict[int, _Active] = {}
@@ -540,15 +524,10 @@ class PgTaskSource:
         with self._lock:
             while True:
                 self._drop_lost()
-                t = self._pop_open()
-                if t is not None:
+                if self._local:
+                    t = self._local.popleft()
                     self._inflight.add(t.id)
-                    v = self._vol(t)
-                    if v is not None:
-                        v.inflight += 1
                     return t
-                if self._local and len(self._chunks) >= self.max_active_chunks:
-                    return _WAIT                   # 本地剩下的都在等卷期试探结果
                 ch = self.q.claim_chunk(self.lease_s)
                 if ch is None:
                     if self.q.requeue_leftovers(self.chunk_size):
@@ -564,37 +543,6 @@ class PgTaskSource:
                 self._local.extend(ch.tasks)
                 logger.info("领到块 %d（第 %d 代，%s，%d 条，第 %d 次领取）", ch.chunk_id, ch.generation, ch.host,
                             len(ch.tasks), ch.attempts)
-
-    def _vol(self, t: Task) -> Optional[_Volume]:
-        if not self.volume_stop_after:
-            return None
-        key = derive_volume(t.doi)
-        if key is None:
-            return None
-        return self._vols.setdefault(key, _Volume())
-
-    def _pop_open(self) -> Optional[Task]:
-        """调用方持锁：按顺序取第一条卷期放行的任务；已判停卷期的任务顺手跳过。"""
-        n = self.volume_stop_after
-        if not n:
-            return self._local.popleft() if self._local else None
-        stopped: list[int] = []
-        pick = None
-        for i, t in enumerate(self._local):
-            v = self._vol(t)
-            if v is not None and v.stopped:
-                stopped.append(i)
-                continue
-            if v is None or v.ok or v.inflight + len(v.nopdf) < n:
-                pick = i
-                break
-        got = self._local[pick] if pick is not None else None
-        dropped = [self._local[i] for i in stopped]
-        for i in sorted(stopped + ([pick] if pick is not None else []), reverse=True):
-            del self._local[i]
-        for t in dropped:                          # 后来领到的块里，已判停卷期的任务
-            self._skip_one(t, "volume_stop", None, "按卷期推断（本机块内）：卷期已判停，未请求")
-        return got
 
     def count_claimable(self, cap: Optional[int] = None) -> int:
         """本地排队数 + 远端是否还有块（远端每 remote_check_s 秒最多查一次）。"""
@@ -627,31 +575,10 @@ class PgTaskSource:
                error_kind: Optional[str] = None, error_message: Optional[str] = None,
                final_url: Optional[str] = None, title: Optional[str] = None) -> Optional[tuple[str, int]]:
         assert status in Status.FINAL, status
-        with self._lock:
-            self._done(task, Result(task.id, status, http_status=http_status, error_kind=error_kind,
-                                    error_message=error_message, file_path=file_path, file_size=file_size,
-                                    elapsed_ms=elapsed_ms, exit_ip=exit_ip, final_url=final_url, title=title))
-            v = self._vol(task)
-            if v is None or v.stopped:
-                return None
-            if status == Status.SUCCESS:
-                v.ok = True
-            elif status == Status.NON_PDF and error_kind in NO_PDF_KINDS and not v.ok:
-                v.nopdf.append((task.doi, error_kind))
-                if len(v.nopdf) >= self.volume_stop_after:
-                    return self._stop_volume(derive_volume(task.doi), v)
-            return None
-
-    def _stop_volume(self, key: str, v: _Volume) -> tuple[str, int]:
-        """调用方持锁：本地队列里该卷期的任务全部记 volume_stop。返回 (卷期号, 跳过数)，与 TaskDB.finish 一致。"""
-        v.stopped = True
-        kinds = [k for _, k in v.nopdf]
-        kind = max(set(kinds), key=kinds.count)
-        msg = (f"按卷期推断（本机块内）：卷期 {key} 已有 {len(v.nopdf)} 篇没有 PDF"
-               f"（{', '.join(sorted(set(kinds)))}；{' '.join(d for d, _ in v.nopdf)}），未请求")
-        n = self._skip_local(lambda t: derive_volume(t.doi) == key, "volume_stop", kind, msg)
-        logger.info("卷期 %s 判停（本机块内）：%d 篇没有 PDF，跳过本地队列 %d 篇", key, len(v.nopdf), n)
-        return key, n
+        self._done(task, Result(task.id, status, http_status=http_status, error_kind=error_kind,
+                                error_message=error_message, file_path=file_path, file_size=file_size,
+                                elapsed_ms=elapsed_ms, exit_ip=exit_ip, final_url=final_url, title=title))
+        return None
 
     # ── 巡检钩子：browser_pool 的 WindowInspector 调用，只作用于本地队列 ──────
 
@@ -697,11 +624,7 @@ class PgTaskSource:
     def _done(self, task: Task, result: Result) -> None:
         with self._lock:
             self._buf.append(result)
-            if task.id in self._inflight:
-                self._inflight.discard(task.id)
-                v = self._vol(task)
-                if v is not None:
-                    v.inflight -= 1
+            self._inflight.discard(task.id)
             cid = self._task_chunk.pop(task.id, None)
             if len(self._buf) >= self.flush_n:
                 self._flush()

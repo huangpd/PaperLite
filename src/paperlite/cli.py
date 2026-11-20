@@ -332,8 +332,7 @@ def _status(args, cfg) -> None:
         ch = q.stats().chunks
         print(f"  块: " + "  ".join(f"{k} {ch.get(k, 0)}" for k in ("queued", "leased", "done")))
         if sk:
-            print(f"  块内推断跳过（仍 pending、不再领取）: 卷期停止 {sk.get('volume_stop', 0)}  "
-                  f"巡检 {sk.get('title_dup', 0)}（retry --pg --stopped-volumes / inspect --pg --reset 可放回）")
+            print(f"  巡检跳过（块内，仍 pending、不再领取）: {sk.get('title_dup', 0)}（inspect --pg --reset 可放回）")
     for status, kind, n, inferred in db.kind_counts():
         print(f"  {status:8s} {kind or '-':16s} {n}" + (f"（其中按卷期推断 {inferred}）" if inferred else ""))
     v, n = db.volume_summary()
@@ -609,7 +608,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p.add_argument("--list", action="store_true", help="只列出已生效的规则，不重新巡检")
     p.add_argument("--reset", action="store_true", help="清除所有 suspect_cover 标记与规则（放回可采）")
     p = cmd("retry")
-    site_args(p)
+    site_args(p, pg=False)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--status", choices=[Status.FAILED, Status.NON_PDF], help="重置该状态的任务")
     g.add_argument("--stopped-volumes", action="store_true",
@@ -691,12 +690,7 @@ def main() -> None:
         return
     if args.cmd == "retry":
         db = _open_db(args)
-        if args.pg:                                 # PG：只能撤销卷期停止（失败任务的重置暂不支持）
-            if not args.stopped_volumes:
-                db.close()
-                raise SystemExit("--pg 目前只支持 retry --stopped-volumes")
-            print(f"已放回 {db.q.clear_skips('volume_stop')} 个按卷期跳过的任务")
-        elif args.stopped_volumes:
+        if args.stopped_volumes:
             v, n = db.reset_stopped_volumes()
             print(f"已重置 {v} 个被停卷期的 {n} 个任务为 pending")
         else:

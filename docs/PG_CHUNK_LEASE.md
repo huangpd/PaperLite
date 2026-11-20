@@ -25,15 +25,14 @@ paperlite run --pg --workers 20            # 每台机器各跑一个；浏览�
 paperlite status --pg                      # 任务状态 + 块统计（queued / leased / done）
 ```
 
-卷期停止和巡检在 PG 模式下**只在本机领到的块里做**（见第 6 节）。被跳过的任务保持 pending、不再领取，可以放回：
+巡检在 PG 模式下**只在本机领到的块里做**（见第 6 节）。被跳过的任务保持 pending、不再领取，可以放回：
 
 ```bash
-paperlite retry --pg --stopped-volumes     # 放回按卷期跳过的
 paperlite inspect --pg --list              # 看巡检跳过了多少
 paperlite inspect --pg --reset             # 放回巡检跳过的
 ```
 
-`export` 不支持 `--pg`；`retry --pg` 只支持 `--stopped-volumes`。
+PG 模式**不做卷期停止**（`volume_stop_after` 被忽略）。`export` / `retry` 暂不支持 `--pg`。
 
 ## 1. 为什么按块，而不是逐条领
 
@@ -61,7 +60,7 @@ paperlite inspect --pg --reset             # 放回巡检跳过的
 ## 3. 表结构
 
 - `pl_tasks`：与 SQLite 的 `paper_pdf_resources` 同名同义列，另加 `batch`、`host`、`chunk_id`、`next_attempt_at`、
-  `worker`、`skip_reason`（`volume_stop` / `title_dup`：块内推断跳过，保持 pending、不再领取）；
+  `worker`、`skip_reason`（`title_dup`：块内巡检跳过，保持 pending、不再领取）；
   没有 `running` 状态（块内任务领取时不改状态，省掉每篇一次写）。`fillfactor = 80`。
 - `pl_chunks`：`chunk_id, batch, generation, order_key, host, size, first_doi, last_doi, status(queued/leased/done),
   worker, lease_until, attempts`。
@@ -111,7 +110,7 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB �
 
 | 单机功能 | 多机做法 | 状态 |
 |---|---|---|
-| 卷期停止（`volume_stop_after`，curl 模式） | 只在本机领到的块里判断，见下 | 已实现 |
+| 卷期停止（`volume_stop_after`） | 不做：卷期号只能从 ACM 式 DOI（`10.xxxx/数字.数字`）里认，针对性太强、不通用 | 移除 |
 | 巡检（`title_dup_trigger`，浏览器模式） | 只在本机领到的块里跳过，见下 | 已实现 |
 | 被挑战排后（`challenge_count`） | `Result(challenged=True)`：块内排序靠后；放回重试时进入下一代 | 已实现 |
 | 重试退避 | `next_attempt_at` | 已实现 |
@@ -119,17 +118,9 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB �
 | 跨机器的按站点限速 / 并发上限 | Redis 计数（每个 host 的在线 worker 数、令牌桶） | 待设计 |
 | 进度和统计 | `stats()`；大表上改为汇总表，不要直接 `GROUP BY` 全表 | 部分 |
 
-**为什么只在块内做**：单机版的判断依赖全库状态（全库在途数、全库批量标记），多机下要么每篇查一次 PG，
+**为什么巡检只在块内做**：单机版的判断依赖全库状态（全库批量标记），多机下要么每篇查一次 PG，
 要么已经发到别的机器本地队列里的任务看不到标记。导入时按 (host, doi) 排过序，同一卷期、同一期刊基本在同一块里，
 信号大部分在本机，块内判断就够了，也不需要跨机器协调。
-
-**卷期停止**：
-- 本机按卷期记状态（进程内，跨块保留）：下到过 PDF → 永不停；本机在途 + 已判没有 PDF 达到 N 篇前才放行同卷期任务，
-  其余线程先领别的卷期（本地队列都被卡住时最多多领 `max_active_chunks` 块）。
-- N 篇都没有 PDF → 本地队列里同卷期的任务记 `skip_reason = volume_stop`，之后再领到的同卷期任务也直接跳过。
-  `finish` 返回 `(卷期号, 跳过数)`，与 TaskDB 一致，Downloader 的统计照常。
-- 代价：同一卷期跨块 / 跨机器时，每台机器各自试探 N 篇。
-- 卷期号只认 ACM 式 DOI（`10.xxxx/数字.数字`），10.1016 这类 DOI 不适用（单机版同样如此）。
 
 **巡检**：
 - 仍是 `WindowInspector`（本机最近 `title_window_size` 条已加载页），规则归纳和精确率护栏不变；
@@ -164,7 +155,7 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB �
   重试退避与下一代、空块跳过、LeaseKeeper；
 - PgTaskSource：多线程领完且每条一次、重试在同一次运行里排到最后再做、挑战到上限判 failed、
   close 交还未完成的块、租约丢失放弃本地任务；
-- 块内卷期停止：同卷期在途上限、N 篇没有 PDF 后跳过其余并可放回、下到过 PDF 的卷期不停；
+- 卷期停止：PG 模式下 `volume_stop_after` 被忽略，同卷期接连没有 PDF 也逐条请求；
 - 块内巡检：钩子只作用于本地队列（别的机器手里的块不受影响）、浏览器模式同标题触发后跳过本块剩余同前缀任务；
 - 端到端：3 个 curl `Downloader`（各 2 线程）共享一个批次，30 条每条恰好请求一次；
   2 个 `BrowserPool`（各 2 浏览器）共享一个批次，20 页每页恰好渲染一次；

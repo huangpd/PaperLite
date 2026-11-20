@@ -367,59 +367,7 @@ class PgTaskSourceTest(unittest.TestCase):
         st = self.queue().stats()
         self.assertEqual((st.tasks, st.chunks), ({"success": 20}, {"done": 5}))
 
-    # ── 块内卷期停止 / 巡检 ─────────────────────────────────
-
-    def _acm(self, vols):
-        rows = []
-        for vol, n in vols:
-            rows += [{"doi": f"10.1145/{vol}.{i}", "url": f"https://dl.acm.org/doi/pdf/10.1145/{vol}.{i}"}
-                     for i in range(1, n + 1)]
-        return rows
-
-    def test_volume_gate_limits_inflight_per_volume(self):
-        s = self.src("a", chunk_size=100)
-        s.volume_stop_after = 2
-        s.import_urls(self._acm([(100, 5), (200, 5)]))
-        got = [s.claim("x") for _ in range(3)]
-        vols = [t.doi.split("/")[1].split(".")[0] for t in got]
-        self.assertEqual(vols, ["100", "100", "200"])       # 卷期 100 已有 2 篇在途：第 3 次领到别的卷期
-
-    def test_volume_stop_skips_rest_of_volume_in_chunk(self):
-        s = self.src("a", chunk_size=100)
-        s.volume_stop_after = 2
-        s.import_urls(self._acm([(100, 6), (200, 3)]))
-        requested, stopped = [], []
-        while (t := s.claim("x")) is not None:
-            requested.append(t.doi)
-            if t.doi.startswith("10.1145/100."):
-                r = s.finish(t, "non_pdf", error_kind="paywall")
-                if r:
-                    stopped.append(r)
-            else:
-                s.finish(t, "success")
-        self.assertEqual([d for d in requested if d.startswith("10.1145/100.")], ["10.1145/100.1", "10.1145/100.2"])
-        self.assertEqual(stopped, [("100", 4)])               # 与 TaskDB.finish 同样的返回值
-        s._flush()
-        q = self.queue()
-        self.assertEqual(q.skip_counts(), {"volume_stop": 4})
-        self.assertEqual(s.counts()["pending"], 0)            # 跳过的不算待下载
-        self.assertEqual(q.clear_skips("volume_stop"), 4)    # 撤销：放回、切成下一代块
-        again = self.src("b", chunk_size=100)
-        back = []
-        while (t := again.claim("y")) is not None:
-            back.append(t.doi)
-            again.finish(t, "success")
-        self.assertEqual(sorted(back), [f"10.1145/100.{i}" for i in range(3, 7)])
-
-    def test_volume_with_a_pdf_is_never_stopped(self):
-        s = self.src("a", chunk_size=100)
-        s.volume_stop_after = 2
-        s.import_urls(self._acm([(100, 5)]))
-        n = 0
-        while (t := s.claim("x")) is not None:
-            n += 1
-            s.finish(t, "success" if n == 1 else "non_pdf", error_kind=None if n == 1 else "not_found")
-        self.assertEqual(n, 5)
+    # ── 块内巡检 ────────────────────────────────────────────
 
     def test_inspector_hooks_only_touch_local_queue(self):
         a, b = self.src("a", chunk_size=5), self.src("b", chunk_size=5)
@@ -439,6 +387,20 @@ class PgTaskSourceTest(unittest.TestCase):
             rest.append(t.doi)
             b.finish(t, "success")
         self.assertEqual(sorted(rest), [f"10.1/x{i:02d}" for i in range(5, 10)])
+
+    def test_volume_stop_after_is_ignored(self):
+        """PG 模式不做卷期停止：同卷期接连没有 PDF 也照常逐条请求。"""
+        s = self.src("a", chunk_size=100)
+        s.volume_stop_after = 2
+        s.import_urls({"doi": f"10.1145/100.{i}", "url": f"https://dl.acm.org/doi/pdf/10.1145/100.{i}"}
+                      for i in range(1, 6))
+        n = 0
+        while (t := s.claim("x")) is not None:
+            n += 1
+            self.assertIsNone(s.finish(t, "non_pdf", error_kind="paywall"))
+        self.assertEqual(n, 5)
+        s._flush()
+        self.assertEqual(self.queue().skip_counts(), {})
 
     def test_browser_title_dup_skips_rest_in_chunk(self):
         """浏览器模式块内巡检：一段 URL 全是同一个"Deleted DOI"页，触发后本块里剩下的同前缀任务不再渲染。"""
@@ -514,10 +476,9 @@ class PgConfigTest(unittest.TestCase):
     def test_pg_flag_only_on_supported_commands(self):
         from paperlite.cli import _build_parser
         ap, _ = _build_parser()
-        for cmd in (["import", "--urls", "x"], ["run"], ["download"], ["produce"], ["status"], ["inspect"],
-                    ["retry", "--stopped-volumes"]):
+        for cmd in (["import", "--urls", "x"], ["run"], ["download"], ["produce"], ["status"], ["inspect"]):
             self.assertTrue(ap.parse_args(cmd + ["--pg"]).pg, cmd)
-        for cmd in (["export"],):
+        for cmd in (["export"], ["retry", "--stopped-volumes"]):
             with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
                 ap.parse_args(cmd + ["--pg"])
 
