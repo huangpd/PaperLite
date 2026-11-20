@@ -53,7 +53,6 @@ CREATE TABLE IF NOT EXISTS pl_tasks (
     chunk_id        bigint,
     status          text        NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'success', 'failed', 'non_pdf')),
-    flag            text,
     retry_count     int         NOT NULL DEFAULT 0,
     challenge_count int         NOT NULL DEFAULT 0,
     next_attempt_at timestamptz,
@@ -231,7 +230,7 @@ class PgTaskQueue:
             moved = c.execute(
                 "UPDATE pl_tasks t SET chunk_id = NULL FROM pl_chunks k "
                 "WHERE t.chunk_id = k.chunk_id AND k.status = 'done' AND k.batch = %s AND t.status = 'pending' "
-                "AND t.flag IS NULL AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= now())",
+                "AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= now())",
                 (self.batch,)).rowcount
         if not moved:
             return 0
@@ -268,7 +267,7 @@ class PgTaskQueue:
                 chunk_id, gen, host, attempts = row
                 tasks = tuple(Task(r[0], r[1], r[2], r[3], r[4], r[5]) for r in c.execute(
                     "SELECT id, doi, url, retry_count, challenge_count, url_type FROM pl_tasks "
-                    "WHERE chunk_id = %s AND status = 'pending' AND flag IS NULL "
+                    "WHERE chunk_id = %s AND status = 'pending' "
                     "AND (next_attempt_at IS NULL OR next_attempt_at <= now()) "
                     "ORDER BY challenge_count, id", (chunk_id,)))
                 if tasks:
@@ -298,7 +297,7 @@ class PgTaskQueue:
             return self._conn.execute(
                 "SELECT EXISTS (SELECT 1 FROM pl_chunks WHERE batch = %(b)s AND status = 'queued') "
                 "OR EXISTS (SELECT 1 FROM pl_chunks k JOIN pl_tasks t ON t.chunk_id = k.chunk_id "
-                "  WHERE k.batch = %(b)s AND k.status = 'done' AND t.status = 'pending' AND t.flag IS NULL "
+                "  WHERE k.batch = %(b)s AND k.status = 'done' AND t.status = 'pending' "
                 "  AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= now()))", {"b": self.batch}).fetchone()[0]
 
     def complete(self, chunk_id: int) -> bool:
@@ -429,10 +428,11 @@ class PgTaskSource:
     - 本地队列空了就领下一块（上一块还有在途任务也照领，线程不空等）；没块了先 requeue_leftovers 再试
     - 一块的任务全部出结果 → 回写缓冲 → complete；租约丢了 → 丢弃本地还没领的任务，在途的结果照常上报
     - 结果每 flush_n 条或 flush_s 秒回写一次；关闭时回写剩余结果、交还没做完的块
-    - 卷期停止、巡检暂不支持（见 docs/PG_CHUNK_LEASE.md「待研究」）：finish 恒返回 None，supports_inspect = False
+    - 不做巡检（设计上不支持，supports_inspect = False，浏览器模式据此不开巡检器）
+    - 卷期停止暂不支持（见 docs/PG_CHUNK_LEASE.md「待研究」）：finish 恒返回 None
     """
 
-    supports_inspect = False
+    supports_inspect = False          # PG 模式不做巡检
 
     def __init__(self, queue: PgTaskQueue, *, chunk_size: int = DEFAULT_CHUNK_SIZE,
                  lease_s: float = DEFAULT_LEASE_S, flush_n: int = 500, flush_s: float = 5.0,

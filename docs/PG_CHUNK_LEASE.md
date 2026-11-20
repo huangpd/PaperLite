@@ -25,7 +25,8 @@ paperlite run --pg --workers 20            # 每台机器各跑一个；浏览�
 paperlite status --pg                      # 任务状态 + 块统计（queued / leased / done）
 ```
 
-`inspect` / `retry` / `export` 暂不支持 `--pg`（参数解析时直接拒绝）。
+PG 模式**不做巡检**：`run --pg` 即使配置了 `title_dup_trigger` 也不启用巡检器，`inspect` 不接受 `--pg`。
+`retry` / `export` 暂不支持 `--pg`（参数解析时直接拒绝）。
 
 ## 1. 为什么按块，而不是逐条领
 
@@ -33,7 +34,7 @@ paperlite status --pg                      # 任务状态 + 块统计（queued /
 
 - 领取热点：`SKIP LOCKED` 要跳过一串被别人锁住的行，并发越高越慢；
 - 状态列在索引里，每次更新都是非 HOT 更新，死元组堆积，autovacuum 压力大；
-- 每台机器拿到的是相隔很远的零散任务，卷期停止、巡检这些"本机连续看到相邻任务"的判断失效。
+- 每台机器拿到的是相隔很远的零散任务，卷期停止这类"本机连续看到相邻任务"的判断失效。
 
 按块领取：一块 = 按 `(host, doi)` 排好序后连续的约 1000 条。机器一次领一块，块内在本地按顺序处理，
 结果攒批回写。PG 的交互从"每篇两次"变成"每块一次领取 + 几次批量回写"。
@@ -71,7 +72,7 @@ import_urls ─▶ build_chunks（每 host 每 1000 条一块，换 host 必切�
 ```
 
 - **领取** `claim_chunk`：先回收过期租约，再按 `(generation, order_key)` 取第一块 queued。
-  块内取 `pending AND flag IS NULL AND next_attempt_at 已到`，按 `(challenge_count, id)` 排序。
+  块内取 `pending AND next_attempt_at 已到`，按 `(challenge_count, id)` 排序。
   块里没有可领任务就直接记 done，继续领下一块。
 - **续租** `LeaseKeeper`：后台线程每 `lease/6` 续一次（默认租约 30 分钟）。续租失败 = 块已被别人回收，
   `lost` 置位，worker 停止领这块剩下的任务（已下的结果照常上报）。
@@ -86,7 +87,7 @@ import_urls ─▶ build_chunks（每 host 每 1000 条一块，换 host 必切�
 
 worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB 的一小部分接口：
 `claim / finish / retry_later / challenged / count_claimable / has_status / host / hosts / counts`。
-`PgTaskSource` 实现同样的接口，worker 代码不用改（只有浏览器模式在 `supports_inspect = False` 时不开巡检）：
+`PgTaskSource` 实现同样的接口，worker 代码不用改（浏览器模式看到 `supports_inspect = False` 就不开巡检器）：
 
 | 接口 | PgTaskSource 的做法 |
 |---|---|
@@ -102,7 +103,7 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB �
 | 单机功能 | 多机做法 | 状态 |
 |---|---|---|
 | 卷期停止（`volume_stop_after`） | 一块基本是同一卷期，在本机块内判断；判停后对 PG 执行 `UPDATE ... WHERE volume = ? AND status = 'pending'` | 待接入 |
-| 巡检（`flag` / `skip_rules`） | 本机滑动窗口归纳规则，写共享的 `skip_rules`；标记 pending 后，下次领块时自然过滤 | 待接入 |
+| 巡检（`flag` / `skip_rules`） | 不做。`pl_tasks` 没有 `flag` 列，也没有 `skip_rules` 表 | 移除 |
 | 被挑战排后（`challenge_count`） | `Result(challenged=True)`：块内排序靠后；放回重试时进入下一代 | 已实现 |
 | 重试退避 | `next_attempt_at` | 已实现 |
 | 身份池（curl 模式） | 不变，继续用 Redis | — |

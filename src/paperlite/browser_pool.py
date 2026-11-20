@@ -80,7 +80,7 @@ class BrowserPool:
         self.stats = BrowserStats()
         self._drained = threading.Event()      # 所有任务领完
         self._live: set[str] = set()           # 当前开着浏览器的 worker（监控：在线浏览器数）
-        # PG 共享队列（pgqueue.PgTaskSource）暂不支持巡检
+        # PG 共享队列（pgqueue.PgTaskSource）不做巡检
         self.inspector = (WindowInspector(db, cfg.title_dup_trigger, cfg.rule_min_precision,
                                           cfg.rule_min_support, cfg.title_window_size)
                           if cfg.title_dup_trigger and getattr(db, "supports_inspect", True) else None)

@@ -315,7 +315,7 @@ class PgTaskSourceTest(unittest.TestCase):
 
 
     def test_browser_pools_on_two_machines_share_one_batch(self):
-        """浏览器模式：2 个 BrowserPool（模拟 2 台机器）各 2 个浏览器，开着巡检配置也不报错（PG 版不支持、自动关闭）。"""
+        """浏览器模式：2 个 BrowserPool（模拟 2 台机器）各 2 个浏览器，配置里开着巡检也不启用（PG 模式不做巡检）。"""
         from tests.test_paperlite import PROXY
         from paperlite import browser_pool as bp
         from paperlite.browser import RenderResult
