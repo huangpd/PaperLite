@@ -5,6 +5,8 @@
 
 ## 0. 用法
 
+> 多机部署的完整步骤（PostgreSQL、安装、配置、启动、看进度）见 [PG_DEPLOY.md](PG_DEPLOY.md)。
+
 每台机器的 config.toml 加 `[pg]` 段（`batch` 相同即共享同一批次）：
 
 ```toml
