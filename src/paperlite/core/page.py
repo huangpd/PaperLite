@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-paperlite/page.py
-─────────────────
+paperlite/core/page.py
+──────────────────────
 页面判定，两种模式共用（只看响应头和正文，不做网络请求）：
 
   is_challenge / is_cf_denied   响应是不是 Cloudflare 挑战页 / 封禁页（curl 模式判身份）

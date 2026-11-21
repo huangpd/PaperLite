@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-paperlite/tasks.py
-────────────────────
+paperlite/core/tasks.py
+───────────────────────
 任务的公共定义：状态、链接类型、错误分类、Task，以及任务身份规则（URL 规范化、url_key、DOI 推导、文件路径）。
 存储在 taskq/（PostgreSQL）；本模块不碰数据库。
 

@@ -45,7 +45,7 @@ from paperlite.errors import UserError
 from paperlite import logutil
 from paperlite.logutil import setup_logging
 from paperlite.taskq import PgTaskQueue, PgTaskSource, importer
-from paperlite.tasks import ERROR_KINDS, Status, UrlType
+from paperlite.core.tasks import ERROR_KINDS, Status, UrlType
 
 logger = logging.getLogger("paperlite")
 

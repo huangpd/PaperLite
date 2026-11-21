@@ -13,7 +13,7 @@ from typing import Iterator
 
 from paperlite.errors import UserError
 from paperlite.taskq.source import PgTaskSource
-from paperlite.tasks import UrlType
+from paperlite.core.tasks import UrlType
 
 logger = logging.getLogger("paperlite")
 

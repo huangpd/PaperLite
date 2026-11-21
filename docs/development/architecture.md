@@ -120,7 +120,7 @@ curl 模式的身份池（`curl/identity.py`）和任务队列在同一个库、
 
 - 打开前在页面上开拦截。途中任一响应的响应头是 PDF（`Content-Type` 含 pdf、`Content-Disposition` 是 `.pdf`），或地址像 PDF 且没说是 HTML，就用 `Fetch.takeResponseBodyAsStream` + `IO.read` 把响应体流式写盘，写完中止这个请求，浏览器不渲染、不下载它。明确是 HTML 的响应不截：`.pdf` 地址上也可能是挑战页或中转页。
 - 请求走的是浏览器自己的网络栈：同一 IP、同一 cookie、同一 TLS 指纹，过盾后的身份直接可用，不会因为换了下载工具再被挑战。
-- 校验与 curl 模式一致（同一份实现 `paperlite/pdf.py`）：前 1024 字节内有 `%PDF-`，且它前面只允许空白 / BOM（去掉后写盘）、不小于 `min_file_size`、不超过 `max_file_size_mb`、有 `Content-Length` 时长度对得上；206 响应要求覆盖整个文件；先写 `.part` 再改名。校验没过按 `extract_failed` 重试，`max_tries` 用完判死。
+- 校验与 curl 模式一致（同一份实现 `paperlite/core/pdf.py`）：前 1024 字节内有 `%PDF-`，且它前面只允许空白 / BOM（去掉后写盘）、不小于 `min_file_size`、不超过 `max_file_size_mb`、有 `Content-Length` 时长度对得上；206 响应要求覆盖整个文件；先写 `.part` 再改名。校验没过按 `extract_failed` 重试，`max_tries` 用完判死。
 - 写盘期间原请求暂停、页面导航一直等：这段时间不按 `pass_timeout_s` 判超时，大文件也能下完。
 - 开了拦截后代理鉴权要由拦截会话应答（`Fetch.authRequired`），否则 Chromium 报 `ERR_INVALID_AUTH_CREDENTIALS`。
 - 每篇用完关掉拦截，`url_type=html` 的任务不受影响。

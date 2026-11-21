@@ -10,6 +10,7 @@
 
 ### 内部
 
+- `tasks.py`、`page.py`、`pdf.py` 移到 `core/`：纯规则（不联网、不读写文件和数据库、不依赖本包其他模块），由 `tests/test_layering.py` 检查。
 - `cli.py` 从 757 行拆到 534 行，只留命令行本身：导入移到 `taskq/importer.py`（`import_file`、`read_url_file`），跑下载移到 `browser/runner.py`（`run_browser`）和 `curl/runner.py`（`run_curl`、`run_producer`），GeoIP 检查移到 `browser.session.require_geoip`。库代码不再直接 `SystemExit`，改抛 `errors.UserError`，由命令行打印后退出；报错文字和退出码不变。
 - 去重：PDF 文件头规则只留一份（`pdf.py`）；挑战 / 封禁 / WAF / non-PDF 判定收进 `page.py`（原 `classify.py`）；curl 会话与 Retry-After 解析移到 `curl/http.py`，生产者不再从下载线程借函数；`ProxySettings` 移到 `config.py`（配置不再依赖 proxy 模块）；`browser_env` 移到 `browser/env.py`，`turnstile` 与 `session` 不再互相 import。新增 `tests/test_layering.py` 检查包之间的依赖方向。
 - 代码按功能分包，行为不变：任务队列进 `taskq/`（`queue.py` 放 SQL、`source.py` 放 worker 侧、`title_dup.py` 巡检），浏览器模式进 `browser/`（`session` / `pool` / `pdf_capture` / `turnstile`），curl 模式进 `curl/`（`producer` / `downloader` / `identity` / `cookies`）；`monitor/consumer.py` 改名 `ingest.py`。命令、配置不变；PG 里的锁名保持不变，新旧版本可以同时连一个库。测试按模块拆分。

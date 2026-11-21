@@ -1,6 +1,6 @@
 """
-paperlite/pdf.py
-────────────────
+paperlite/core/pdf.py
+─────────────────────
 PDF 文件头判定。curl 模式的下载线程和浏览器模式的 CDP 拦截（browser/pdf_capture.py）共用这一条规则，
 改规则只改这里。
 """

@@ -8,7 +8,7 @@ from unittest import mock
 from paperlite.browser.pool import BrowserPool
 from paperlite.config import Limits
 from paperlite.proxy import Lease
-from paperlite.tasks import Status, pdf_path
+from paperlite.core.tasks import Status, pdf_path
 from tests.pgutil import make_source, needs_pg, row as pg_row, rows as pg_rows
 from tests.fakes import FAKE_PDF, PROXY
 

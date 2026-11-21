@@ -18,7 +18,7 @@ paperlite/curl/downloader.py
 - 流式下载：先读够 1024 字节判文件头（%PDF- 前允许空白 / BOM，写盘时去掉），是 PDF 就边下边写 .part，
   超过 max_file_size_mb 中止，完成后原子改名；不是 PDF 只读前 256KB 用于判挑战和分类。
   超时是卡顿超时（连续 download_timeout_s 秒收不到数据），慢代理上的大文件不会被总时长掐断；
-- 返回 HTML 的判 non_pdf（error_kind 见 page.py），原始页面存到 <out>/non_pdf/；
+- 返回 HTML 的判 non_pdf（error_kind 见 core/page.py），原始页面存到 <out>/non_pdf/；
 - url_type = html 的任务要的就是网页：整页（上限 max_file_size_mb）存为 .html、记 success；404/410 判 failed / not_found，
   其他 4xx 判 failed；挑战、封禁、5xx、网络错误的处理与 PDF 任务相同；
   跳转由框架自己跟：curl 跟 HTTP 3xx 和中转页的 meta refresh（≤10s，最多 _MAX_REFRESH_HOPS 跳）；跳到别的主机后被挑战
@@ -42,12 +42,12 @@ from urllib.parse import urljoin
 
 
 from paperlite.curl.http import rate_limit_wait, session_for_identity
-from paperlite.page import classify_html, is_cf_denied, is_challenge, page_title
-from paperlite.pdf import HEAD_BYTES, pdf_offset
+from paperlite.core.page import classify_html, is_cf_denied, is_challenge, page_title
+from paperlite.core.pdf import HEAD_BYTES, pdf_offset
 from paperlite.config import Limits, ProxySettings
 from paperlite.curl.identity import Identity, IdentityStore
 from paperlite.taskq import PgTaskSource
-from paperlite.tasks import Status, Task, UrlType, pdf_path, url_host
+from paperlite.core.tasks import Status, Task, UrlType, pdf_path, url_host
 
 logger = logging.getLogger(__name__)
 

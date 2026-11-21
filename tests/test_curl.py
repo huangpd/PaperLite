@@ -13,7 +13,7 @@ from paperlite.curl.cookies import jar_to_records
 from paperlite.curl.producer import Producer
 from paperlite.proxy import Lease
 from paperlite.curl.identity import Identity
-from paperlite.tasks import Status, derive_doi, pdf_path, url_key
+from paperlite.core.tasks import Status, derive_doi, pdf_path, url_key
 from tests.pgutil import execute, make_source, make_store, needs_pg, row as pg_row
 from tests.fakes import FAKE_PDF, PROXY, ident, Resp, FakeStore
 
@@ -628,7 +628,7 @@ def test_meta_refresh_target():
 
 
 def test_cf_probe_scripts_are_not_challenge():
-    from paperlite.page import is_cf_denied, is_challenge
+    from paperlite.core.page import is_cf_denied, is_challenge
     normal = b'<html><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>' \
              b'<script src="/cdn-cgi/challenge-platform/scripts/precursor"></script></html>'
     assert not is_challenge({}, normal)
