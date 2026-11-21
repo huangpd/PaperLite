@@ -20,7 +20,7 @@ from paperlite.logutil import JsonFormatter
 from paperlite.producer import Producer
 from paperlite.proxy import Lease, ProxySettings, parse_deadline
 from paperlite.store import Identity
-from paperlite.tasks import Status, UrlType, derive_doi, pdf_path, url_key
+from paperlite.tasks import Status, UrlType, derive_doi, pdf_path, url_key, url_problem
 from tests.pgutil import DSN, execute, make_source, needs_pg, new_schema, pg_config, row as pg_row, rows as pg_rows
 
 FAKE_PDF = b"%PDF-1.4\n" + b"0" * 2048          # 超过最小文件大小（1024 字节）
@@ -189,6 +189,41 @@ class IdentityRulesTest(unittest.TestCase):
         self.assertEqual(len(p.parent.name), 2)              # out/<h0:2>/<h2:4>/
         self.assertEqual(url_key("HTTPS://DL.ACM.org/a#x"), url_key("https://dl.acm.org/a"))
         self.assertNotEqual(url_key("https://dl.acm.org/A"), url_key("https://dl.acm.org/a"))
+
+
+class UrlProblemTest(unittest.TestCase):
+    """导入时剔除明显下载不到的链接（来自 hw1 两个批次里的真实坏数据）。"""
+
+    def test_obviously_bad(self):
+        cases = {
+            "https://10.65.16.77/index.php/sociobiology/article/view/3300": "private_ip",
+            "http://192.168.1.111/index.php/ForoEducacional/article/view/779": "private_ip",
+            "https://192.168.7.25:443/index.php/assc/article/view/6870": "private_ip",
+            "http://172.20.1.1/a": "private_ip",
+            "http://127.0.0.1/a": "private_ip",
+            "http://[::1]/a": "private_ip",
+            "https://.asm.org/content/177/11/3358": "bad_host",
+            "http://0": "bad_host",
+            "http://null/10.1017/S0022112011000036": "bad_host",
+            "http://http://sociologiaitaliana.egeaonline.it/it/21": "bad_host",
+            "https://opgadmin/oe/abstract.cfm?doi=10.1364/OE.473012": "bad_host",
+            "https://x..org/a": "bad_host",
+            "http://x.org:abc/": "bad_host",
+            "ftp://ftp.example.org/a.pdf": "bad_scheme",
+            "http:///path": "no_host",
+            "": "bad_scheme",
+        }
+        for url, reason in cases.items():
+            self.assertEqual(url_problem(url), reason, url)
+
+    def test_normal_kept(self):
+        for url in ("https://www.sciencedirect.com/science/article/pii/S0092867424000011",
+                    "https://linkinghub.elsevier.com/retrieve/pii/0001691855900019",
+                    "HTTPS://WWW.Nature.COM/articles/x", "https://example.com./a", "https://a_b.example.com/x",
+                    "https://xn--fiqs8s.cn/a",
+                    "http://219.238.6.200/x", "http://155.206.11.181:90/content/x",     # 公网 IP 建站：放行
+                    "http://10040.indexcopernicus.com/abstracted.php?level=5&ICID=1138423"):   # 合法但打不开：交给下载
+            self.assertIsNone(url_problem(url), url)
 
 
 @needs_pg
@@ -444,6 +479,16 @@ class TaskSourceTest(unittest.TestCase):
         got = sorted((r["doi"], r["source"], r["batch_no"]) for r in pg_rows(self.db))
         self.assertEqual(got, [("10.1145/2", None, None), ("10.9999/custom", "s", "b7")])   # doi 转小写
 
+    def test_bad_urls_rejected_not_imported(self):
+        rows = [{"url": "https://dl.acm.org/doi/pdf/10.1145/1", "doi": "10.1145/1"},
+                {"url": "https://10.65.16.77/a", "doi": "10.13102/x"},
+                {"url": "https://.asm.org/content/1", "doi": "10.1128/y"},
+                {"url": "", "doi": "10.1/empty"}]
+        self.assertEqual(self.db.import_urls(rows), (1, 0))                 # 坏的不算新增也不算已存在
+        self.assertEqual([reason for _, reason in self.db.q.last_rejected], ["private_ip", "bad_host", "bad_scheme"])
+        self.assertEqual([r["doi"] for r in pg_rows(self.db)], ["10.1145/1"])
+        self.assertEqual(self.db.hosts(), ["dl.acm.org"])
+
     def test_check_constraints(self):
         import psycopg
         from paperlite.pgqueue import Result
@@ -526,8 +571,10 @@ class CliTest(unittest.TestCase):
         schema = new_schema(self)
         Path("config.toml").write_text(pg_config(schema, batch="cli"))
         f = Path("mixed.txt")
-        f.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\nhttps://example.org/a.pdf\n")
+        f.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\nhttps://example.org/a.pdf\nhttp://192.168.1.111/x\n")
         self.run_cli("import", "--urls", str(f))
+        bad = Path("mixed.txt.bad_url.csv").read_text().splitlines()
+        self.assertEqual(bad, ["doi,url,reason", ",http://192.168.1.111/x,private_ip"])   # 文本文件没有 doi 列
         db = make_source(self, batch="cli", schema=schema)
         self.assertEqual(sorted(db.hosts()), ["dl.acm.org", "example.org"])   # 多主机同一批次
         self.assertEqual(db.counts()[Status.PENDING], 2)
@@ -1193,14 +1240,15 @@ class BrowserPoolTest(unittest.TestCase):
         self.assertTrue(all(r["challenge_count"] == 0 and r["retry_count"] == 0 for r in pg_rows(self.db)))
 
     def test_bad_hosts_first_do_not_stop_no_proxy_worker(self):
-        """不走代理、批次开头全是打不开的坏主机：worker 不会因此收工，后面的正常站点照常下载，坏链接最终判死。"""
+        """不走代理、批次开头是格式合法但打不开的站点（明显坏的在导入时已剔除）：worker 不会因此收工，
+        后面的正常站点照常下载，打不开的最终判死。"""
         from paperlite.browser import RenderResult
         self.cfg = Limits(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, max_url_challenges=1)
-        bad = ["https://.asm.org/content/1", "https://10.65.16.77/a"]
+        bad = ["http://10040.indexcopernicus.com/abstracted.php?ICID=1", "http://219.238.6.200/a"]
         good = [f"https://link.springer.com/article/{i}" for i in range(3)]
         def resp(u):
             if u in bad:
-                return RenderResult(ok=False, seconds=1, error="Error: Page.goto: net::ERR_NAME_NOT_RESOLVED")
+                return RenderResult(ok=False, seconds=1, error="Error: Page.goto: net::ERR_CONNECTION_TIMED_OUT")
             return self._ok(u)
         from paperlite import browser_pool as bp
         self.db.import_urls({"url": u, "url_type": "html"} for u in bad + good)

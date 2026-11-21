@@ -193,6 +193,27 @@ def _import(db: PgTaskSource, path: str, source: str = "", batch: str = "", url_
     except ValueError as e:
         raise SystemExit(str(e))
     logger.info("导入 %s：新增 %d，已存在 %d（已存在的不重置）", path, added, existed)
+    _report_rejected(path, db.q.last_rejected)
+
+
+def _report_rejected(path: str, rejected: list) -> None:
+    """明显坏的链接没入库：按原因打一行日志，明细写到输入文件旁边的 <文件名>.bad_url.csv。"""
+    if not rejected:
+        return
+    from collections import Counter
+    by = Counter(reason for _, reason in rejected)
+    out = Path(path).with_name(Path(path).name + ".bad_url.csv")
+    try:
+        with open(out, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["doi", "url", "reason"])
+            for r, reason in rejected:
+                w.writerow([r.get("doi") or r.get("paper_uid") or "", r.get("url") or r.get("pdf_url") or "", reason])
+        where = f"，明细见 {out}"
+    except OSError as e:
+        where = f"（明细写不了 {out}: {e}）"
+    logger.warning("剔除明显下载不到的链接 %d 条，未入库：%s%s", len(rejected),
+                   "，".join(f"{k} {n}" for k, n in by.most_common()), where)
 
 
 class _ProducerThread:

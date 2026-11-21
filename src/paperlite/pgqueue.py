@@ -20,7 +20,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
-from .tasks import ERROR_KINDS, Status, Task, UrlType, derive_doi, url_host, url_key
+from .tasks import ERROR_KINDS, Status, Task, UrlType, derive_doi, url_host, url_key, url_problem
 
 import psycopg
 from psycopg import sql
@@ -152,6 +152,7 @@ class PgTaskQueue:
     def __init__(self, dsn: str, batch: str, *, schema: Optional[str] = None, worker: str = "") -> None:
         self.batch = batch
         self.worker = worker
+        self.last_rejected: list[tuple[dict, str]] = []    # 最近一次 import_urls 剔除的 (原始行, 原因)
         self._lock = threading.Lock()
         self._conn = psycopg.connect(dsn, autocommit=True)
         with self._lock:
@@ -173,8 +174,10 @@ class PgTaskQueue:
         """
         rows：dict，含 url（或 pdf_url），可选 doi / source / batch_no / url_type。先 COPY 进临时表，
         再按 (host, doi) 排序插入：id 顺序即领取顺序，导入前不需要排序。返回 (新增, 已存在)。
+        明显下载不到的链接（内网 IP、主机名不合法等，见 tasks.url_problem）不入库，记在 last_rejected 里。
         """
         seen = 0
+        self.last_rejected = []
         with self._lock, self._conn.transaction():
             c = self._conn
             c.execute("CREATE TEMP TABLE pl_import (url_key bytea, doi text, url text, url_type text, host text, "
@@ -182,9 +185,11 @@ class PgTaskQueue:
             with c.cursor().copy("COPY pl_import FROM STDIN") as cp:
                 for r in rows:
                     url = (r.get("url") or r.get("pdf_url") or "").strip()
+                    problem = url_problem(url)
+                    if problem:
+                        self.last_rejected.append((r, problem))
+                        continue
                     h = url_host(url)
-                    if not h:
-                        raise ValueError(f"不是有效链接: {url}")
                     doi = (r.get("doi") or r.get("paper_uid") or "").strip().lower() or derive_doi(url)
                     kind = (r.get("url_type") or UrlType.PDF).strip().lower()
                     if kind not in UrlType.ALL:

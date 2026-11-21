@@ -60,14 +60,14 @@ class PgQueueTest(unittest.TestCase):
         self.assertEqual(seen, [("a.com", 1000), ("a.com", 667), ("b.com", 833)])
 
     def test_hosts_ordered_by_task_count_not_name(self):
-        """热身主机取任务最多的：排序靠前的坏主机（.asm.org）不能挡住整个批次。"""
+        """主机按任务数排：排序靠前、任务很少的站点（打不开的小站）不能当成批次的代表主机。"""
         q = self.q()
-        q.import_urls([{"url": "https://.asm.org/content/1"}] +
+        q.import_urls([{"url": "http://10040.indexcopernicus.com/a"}] +
                       [{"url": f"https://link.springer.com/{i}"} for i in range(5)] +
                       [{"url": f"https://b.org/{i}"} for i in range(2)])
-        self.assertEqual(q.hosts(), ["link.springer.com", "b.org", ".asm.org"])     # 未切块
+        self.assertEqual(q.hosts(), ["link.springer.com", "b.org", "10040.indexcopernicus.com"])   # 未切块
         q.build_chunks(1000)
-        self.assertEqual(q.hosts(), ["link.springer.com", "b.org", ".asm.org"])     # 切块后
+        self.assertEqual(q.hosts(), ["link.springer.com", "b.org", "10040.indexcopernicus.com"])   # 切块后
 
     def test_same_url_twice_in_one_import_keeps_one(self):
         q = self.q()
