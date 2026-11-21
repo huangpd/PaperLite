@@ -8,8 +8,9 @@ paperlite/consumer.py
 - 每个下载线程独占一个身份（IP+cookie），同一 IP 两次请求随机间隔 request_gap_s；
 - 线程只在有活可干（有 pending 任务）时登记心跳，生产者据此决定要多少身份；只剩别的线程的在途任务时
   注销并把身份还回池里空等（收尾阶段不再让生产者白白补身份）；没有 pending 也没有在途任务时退出；
-- 遇到挑战先用落地页验身份：落地页也被挑战 → 身份坏了（cookie 被拒），丢弃换下一个，任务放回不计次数；
-  落地页正常 → 站点单独盯上了这条 URL，任务 challenge_count+1 排到后面，满 max_url_challenges 判 failed；
+- 遇到挑战先用参照链接验身份（最近下载成功的链接，没有时用首页）：参照也打不开 → 身份坏了（cookie 被拒），
+  丢弃换下一个，任务放回不计次数；参照正常 → 站点单独盯上了这条 URL，任务 challenge_count+1 排到后面，
+  满 max_url_challenges 判 failed；
   （站点会成批盯上相邻论文，如 ACM 1005062.* 的 14 篇；只按"下一条也被挑战"判身份会把好身份接连误杀）
 - 连接被断（IP 掉线）/ IP 被站点封禁 / 寿命不足 min_left_s → 丢弃身份换下一个，任务放回且不计重试；
 - 连接被断（curl 56）先用同一身份重试一次（代理偶尔成批断连，见 docs/development/architecture.md「IP 中途失效」）；
@@ -188,6 +189,8 @@ class Downloader:
         self._worker_prefix = f"{socket.gethostname()}-{os.getpid()}"
         self._pending_lock = threading.Lock()
         self._pending_at = float("-inf")
+        self._good_url: Optional[str] = None         # 本进程最近一次下载成功的链接：复验身份的参照
+        self._good_shared_at = float("-inf")
 
     def report_pending(self, force: bool = False) -> None:
         """
@@ -272,11 +275,12 @@ class Downloader:
                     uses = 0
                 task = self.db.claim(worker)
                 if task is None:
-                    # 被别的线程抢先领走，或剩下的都在"卷期待核实"（同卷期已有 N 篇在途），稍等再看
+                    # 被别的线程抢先领走，或本进程的块还在收尾，稍等再看
                     stop.wait(0.5)
                     continue
                 keep, outcome = self._download(task, ident, session)
                 if outcome in ("pdf", "page"):       # 下到了想要的内容，身份有效
+                    self._remember_good(task.url)
                     if uses == 0:
                         self.store.note_success(self.host)
                     uses += 1
@@ -407,13 +411,13 @@ class Downloader:
             if task.url_type == UrlType.HTML and got.url and url_host(got.url) != self.host:
                 return self._render_page(task, ident, got.url, t0)     # 跳到了别的主机：身份不适用，交给浏览器
             if not self._identity_alive(ident, session):
-                return self._drop_identity(task, ident, f"HTTP {code} 挑战，落地页也被挑战，cookie 被拒"), "rejected"
+                return self._drop_identity(task, ident, f"HTTP {code} 挑战，参照链接也打不开，cookie 被拒"), "rejected"
             self.stats.add("challenged")
             if self.db.challenged(task, self.cfg.max_url_challenges, ident.exit_ip, f"HTTP {code} 挑战（cookie 有效）"):
                 self.stats.add("failed")
                 logger.warning("URL 被站点单独挑战 %d 次，判失败: %s", self.cfg.max_url_challenges, task.url)
             else:
-                logger.info("URL 被挑战但身份正常（落地页可访问），排到后面: %s", task.url)
+                logger.info("URL 被挑战但身份正常（参照链接可访问），排到后面: %s", task.url)
             return True, "challenged"
         if code >= 500:
             self._retry_or_fail(task, ident, "server_error", f"HTTP {code}", http_status=code)
@@ -489,15 +493,47 @@ class Downloader:
         logger.debug("网页 %s → %s（%d 字节）%s", final_url or task.url, dest, len(body), title)
         return True, "page"
 
-    def _identity_alive(self, ident: Identity, session) -> bool:
-        """用过盾时的落地页验身份：能正常打开说明 cookie 有效，挑战只针对那条 URL。"""
+    def _remember_good(self, url: str) -> None:
+        """记下最近一次下载成功的链接；每分钟最多同步一次到 Redis，供生产者验收新身份。"""
+        self._good_url = url
+        now = time.monotonic()
+        if now - self._good_shared_at >= 60:
+            self._good_shared_at = now
+            try:
+                self.store.note_good_url(self.host, url)
+            except Exception as e:
+                logger.debug("记录最近成功链接失败: %s", e)
+
+    def _reference_url(self) -> str:
+        """复验身份的参照：本进程最近成功的链接 > 各进程共享的最近成功链接 > 站点首页（批次刚开始还没成功过时）。"""
+        if self._good_url:
+            return self._good_url
         try:
-            resp = session.get(self.cfg.landing_for(self.host), proxy=self.proxy.url_for(ident.proxy_server),
-                               timeout=30, allow_redirects=True)
+            shared = self.store.good_url(self.host)
+        except Exception:
+            shared = None
+        return shared or f"https://{self.host}/"
+
+    def _identity_alive(self, ident: Identity, session) -> bool:
+        """用一个已知能访问的链接验身份：能正常打开说明 cookie 有效，挑战只针对那条 URL。
+        参照是最近下载成功过的链接（同一类文章页，比首页更能代表身份是否可用），只读前 20KB。"""
+        ref = self._reference_url()
+        try:
+            resp = session.get(ref, proxy=self.proxy.url_for(ident.proxy_server), timeout=30,
+                               allow_redirects=True, stream=True)
+            try:
+                body = bytearray()
+                for chunk in resp.iter_content(chunk_size=8192):
+                    body.extend(chunk)
+                    if len(body) >= 20000:
+                        break
+                code, headers = resp.status_code, resp.headers
+            finally:
+                resp.close()
         except Exception as e:
-            logger.info("验身份时请求落地页出错 %s: %s", ident.exit_ip, type(e).__name__)
+            logger.info("验身份时请求参照链接出错 %s: %s", ident.exit_ip, type(e).__name__)
             return False
-        return resp.status_code < 400 and not is_challenge(resp.headers, resp.content)
+        return code < 400 and not is_challenge(headers, bytes(body))
 
     def _drop_identity(self, task: Task, ident: Identity, reason: str) -> bool:
         self.stats.add("rejected")

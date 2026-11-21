@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from paperlite.browser import pass_challenge
 from paperlite.config import Limits
@@ -46,9 +46,11 @@ class ProducerStats:
 
 
 class Producer:
-    def __init__(self, cfg: Limits, store: IdentityStore, ips: IpSource, host: str) -> None:
+    def __init__(self, cfg: Limits, store: IdentityStore, ips: IpSource, host: str,
+                 sample_url: Optional[Callable[[], Optional[str]]] = None) -> None:
         self.cfg, self.store, self.ips, self.host = cfg, store, ips, host
-        self.landing = cfg.landing_for(host)
+        self.home = f"https://{host}/"             # 浏览器在站点首页过盾拿 cookie（直链 PDF 在浏览器里会变成下载）
+        self.sample_url = sample_url               # 从任务队列里取一条该站点的待下载链接（验收用，批次刚开始时）
         self.stats = ProducerStats()
         self._started: dict[int, float] = {}       # 过盾任务编号 → 开始时间（monotonic）
         self._seq = 0
@@ -67,8 +69,8 @@ class Producer:
 
     async def run(self, stop: threading.Event | None = None) -> None:
         """一直运行到 stop 被置位（或被取消）。"""
-        logger.info("生产者启动: %s，落地页 %s，浏览器上限 %d，身份上限 %d",
-                    self.host, self.landing, self.cfg.max_browsers, self.cfg.max_identities)
+        logger.info("生产者启动: %s，浏览器上限 %d，身份上限 %d（首页过盾，用真实文章链接验收）",
+                    self.host, self.cfg.max_browsers, self.cfg.max_identities)
         tasks: set[asyncio.Task] = set()
         last_log = 0.0
         standby = False
@@ -142,7 +144,7 @@ class Producer:
             if lease.expires_at - time.time() < self.cfg.refill_before_s + self.cfg.pass_timeout_s:
                 logger.info("IP %s 剩余寿命太短，丢弃", lease.exit_ip)
                 return
-            r = await pass_challenge(self.landing, lease, self.ips.s, self.cfg.pass_timeout_s,
+            r = await pass_challenge(self.home, lease, self.ips.s, self.cfg.pass_timeout_s,
                                      self.cfg.headed, self.cfg.debug_dir, geoip=self.cfg.geoip,
                                      webrtc_spoof=self.cfg.webrtc_spoof)
             if not r.ok:
@@ -181,11 +183,32 @@ class Producer:
         finally:
             self._started.pop(seq, None)
 
+    def _probe_url(self) -> tuple[str, bool]:
+        """验收新身份用的链接和判定是否严格：
+        最近下载成功过的链接（严格：要 2xx/3xx）> 队列里一条待下载链接（宽松：没被挑战、没被封就算通过，
+        它本身可能是 404）> 站点首页（严格）。都是真实数据，不用配置。"""
+        try:
+            good = self.store.good_url(self.host)
+        except Exception:
+            good = None
+        if good:
+            return good, True
+        if self.sample_url is not None:
+            try:
+                pending = self.sample_url()
+            except Exception as e:
+                logger.debug("从任务队列取验收链接失败: %s", e)
+                pending = None
+            if pending:
+                return pending, False
+        return self.home, True
+
     def _curl_usable(self, ident: Identity) -> bool | None:
+        probe, strict = self._probe_url()
         try:
             with session_for_identity(ident) as session:
                 for attempt in (1, 2):
-                    response = session.get(self.landing, proxy=self.ips.s.url_for(ident.proxy_server),
+                    response = session.get(probe, proxy=self.ips.s.url_for(ident.proxy_server),
                                            allow_redirects=True, stream=True,
                                            timeout=(self.cfg.connect_timeout_s, min(self.cfg.download_timeout_s, 30)))
                     try:
@@ -211,9 +234,10 @@ class Producer:
                         # 等待后仍 429（非 CF 封禁），视为临时限流，不计入拒绝（return None）
                         logger.info("curl 身份验收 %s HTTP 429，限流未恢复", ident.exit_ip)
                         return None
-                    accepted = code < 400 and not is_challenge(headers, bytes(body))
-                    logger.info("curl 身份验收 %s HTTP %d %s", ident.exit_ip, code,
-                                "通过" if accepted else "拒绝")
+                    challenged = is_challenge(headers, bytes(body))
+                    accepted = not challenged and (code < 400 if strict else code != 403)
+                    logger.info("curl 身份验收 %s HTTP %d %s（%s）", ident.exit_ip, code,
+                                "通过" if accepted else "拒绝", probe)
                     return accepted
         except Exception as error:
             logger.info("curl 身份验收 %s 出错: %s", ident.exit_ip, type(error).__name__)

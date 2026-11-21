@@ -3,7 +3,7 @@
 ```
 src/paperlite/
   cli.py              命令行入口：子命令解析、run / import / status / retry / export / inspect
-  config.py           配置加载与校验：[pg] [proxy] [paths] [limits] [run] [landing]
+  config.py           配置加载与校验：[pg] [proxy] [paths] [limits] [run]
   config.example.toml paperlite init 生成的配置模板
   tasks.py            任务的公共定义：状态、错误分类、Task、URL 规范化、DOI 推导、文件路径（不碰数据库）
   pgqueue.py          任务队列（PostgreSQL）：导入、切块、按块领取、租约、批量回写、重试、导出、巡检；

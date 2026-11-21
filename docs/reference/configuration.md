@@ -8,7 +8,7 @@
 2. 环境变量 `PAPERLITE_CONFIG`
 3. 当前目录的 `config.toml`
 
-写了不认识的段或字段会直接报错，防止拼写错误被静默忽略。旧版的 `[queue]`、`[paths] db`、`[run] pg`、`[limits] volume_stop_after`、`[monitor] db` 会报错并提示怎么改。
+写了不认识的段或字段会直接报错，防止拼写错误被静默忽略。旧版的 `[queue]`、`[landing]`、`[paths] db`、`[run] pg`、`[limits] volume_stop_after`、`[monitor] db` 会报错并提示怎么改。
 
 命令行覆盖：`--storage`（`run`、`download` 可用）优先于 `[paths].storage`。给 `run` 传入配置文件时以 `[run]` 段为准，命令行上的其他 `run` 参数会被忽略。
 
@@ -119,18 +119,6 @@
 | `rule_min_support` | 10 | 规则在已采数据上的最低命中数 |
 
 原理见[架构与设计说明](../development/architecture.md#重复标题巡检)。
-
-## `[landing]` 过盾落地页
-
-可选。主机名 → 用来热身过盾的页面，未配置的主机用 `https://{host}/`。
-
-```toml
-[landing]
-"dl.acm.org" = "https://dl.acm.org/doi/10.1145/3779295"
-```
-
-- 浏览器模式：每个新浏览器在批次里任务最多的主机的落地页上热身。
-- curl 模式：生产者用落地页验收身份；遇到挑战时也用它复验身份。建议配成有代表性的真实文章页。
 
 ## `[monitor]` 监控
 

@@ -7,7 +7,7 @@
 type 与 data 字段：
   proxy_check  一个新 IP 的质检结果（每 IP 一条，不按域名）
                ok, total_ms, reason
-  browser      一次浏览器启动 + 过落地页的盾
+  browser      一次浏览器启动：首篇打开（ok）、首篇失败换 IP（challenge_failed）或启动异常（exception）
                ok, kind(ok|challenge_failed|exception), host, waf, seconds, error
   page         一次页面采集尝试（含失败后稍后重试的那次）
                host, passed(页面真加载出来=过了盾), ok(passed 且 HTTP<400), status, waf, elapsed_ms, error

@@ -78,6 +78,3 @@ heartbeat_s = 15              # 心跳间隔（在线浏览器数、待下载数
 # token = ""                  # 可选：给脚本调 /api/summary 用（?token=…）
 # retention_days = 30         # 大屏数据（小时汇总）保留天数
 # raw_retention_hours = 48    # 原始事件（实时事件流）保留小时数
-
-[landing]                     # 可选：各主机的过盾落地页（任意会触发挑战的普通页面）；未配置的用主机首页
-"dl.acm.org" = "https://dl.acm.org/doi/10.1145/3779295"
