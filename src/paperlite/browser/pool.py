@@ -17,7 +17,7 @@ paperlite/browser/pool.py
 
 url_type=html 的任务整页存成 .html。url_type=pdf 的任务开 CDP 拦截（pdf_capture.py）：途中任一响应是 PDF
 就流式写盘（校验 %PDF-、大小、长度）记 success；最后停在网页上（摘要页、订阅页）记 non_pdf
-（error_kind 按 classify.py 分类），网页存到 <out>/non_pdf/，与 curl 模式一致。worker 数就是同时打开的浏览器数，受 max_browsers 约束。
+（error_kind 按 page.py 分类），网页存到 <out>/non_pdf/，与 curl 模式一致。worker 数就是同时打开的浏览器数，受 max_browsers 约束。
 """
 
 import asyncio
@@ -32,12 +32,12 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from paperlite.browser.session import BrowserSession
-from paperlite.classify import classify_html
-from paperlite.config import Limits
+from paperlite.page import classify_html
+from paperlite.config import Limits, ProxySettings
 from paperlite.taskq.title_dup import WindowInspector
 from paperlite.logutil import log_event
 from paperlite.monitor import reporter as mon
-from paperlite.proxy import IpSource, Lease, ProxySettings, ProxyUnavailable
+from paperlite.proxy import IpSource, Lease, ProxyUnavailable
 from paperlite.taskq import PgTaskSource
 from paperlite.tasks import Status, Task, UrlType, pdf_path
 

@@ -32,7 +32,7 @@
 | 浏览器过盾一直停在 "Verifying…" | 过盾要么很快、要么卡死。超过 `hedge_after_s` 会自动补位一个浏览器，超过 `pass_timeout_s` 放弃这个 IP |
 | `non_pdf` 很多 | 先抽几条看 `error_kind`：`not_found` 是 DOI 不存在，`paywall` 是出口没有订阅，`landing_page` 是只有摘要页。不是程序错误 |
 | 很多 pending 不再被领取 | 巡检规则把它们标记为跳过了（`status` 里的"巡检跳过"）。`inspect --list` 查看，`inspect --reset` 放回 |
-| 大 PDF 下载失败 `extract_failed` | 超过 `max_file_size_mb`，或文件太小、前 1024 字节里没有 `%PDF-` |
+| 大 PDF 下载失败 `extract_failed` | 超过 `max_file_size_mb`，或文件太小、前 1024 字节里没有 `%PDF-`（或 `%PDF-` 前面不只是空白 / BOM） |
 
 ## curl 模式
 

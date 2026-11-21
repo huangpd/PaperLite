@@ -4,8 +4,13 @@
 
 ## [Unreleased]
 
+### 变更
+
+- 浏览器模式下载 PDF 的文件头校验改为和 curl 模式同一条规则：`%PDF-` 之前只允许空白 / BOM。以前浏览器模式只要求前 1024 字节里出现 `%PDF-`，正文里提到 `%PDF-` 的网页会被从那里截断存成 PDF；现在判为不是 PDF（`extract_failed`）。
+
 ### 内部
 
+- 去重：PDF 文件头规则只留一份（`pdf.py`）；挑战 / 封禁 / WAF / non-PDF 判定收进 `page.py`（原 `classify.py`）；curl 会话与 Retry-After 解析移到 `curl/http.py`，生产者不再从下载线程借函数；`ProxySettings` 移到 `config.py`（配置不再依赖 proxy 模块）；`browser_env` 移到 `browser/env.py`，`turnstile` 与 `session` 不再互相 import。新增 `tests/test_layering.py` 检查包之间的依赖方向。
 - 代码按功能分包，行为不变：任务队列进 `taskq/`（`queue.py` 放 SQL、`source.py` 放 worker 侧、`title_dup.py` 巡检），浏览器模式进 `browser/`（`session` / `pool` / `pdf_capture` / `turnstile`），curl 模式进 `curl/`（`producer` / `downloader` / `identity` / `cookies`）；`monitor/consumer.py` 改名 `ingest.py`。命令、配置不变；PG 里的锁名保持不变，新旧版本可以同时连一个库。测试按模块拆分。
 
 ## [0.3.0] - 2026-11-21

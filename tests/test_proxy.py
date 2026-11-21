@@ -3,7 +3,7 @@ import time
 import unittest
 from unittest import mock
 
-from paperlite.proxy import ProxySettings
+from paperlite.config import ProxySettings
 
 
 

@@ -27,10 +27,10 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
+from paperlite.pdf import HEAD_BYTES, pdf_offset
+
 logger = logging.getLogger("paperlite.browser.pdf_capture")
 
-PDF_MAGIC = b"%PDF-"
-HEAD_BYTES = 1024                      # %PDF- 必须出现在这么多字节以内（与 curl 模式一致）
 _CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+)$", re.IGNORECASE)
 
 
@@ -175,9 +175,9 @@ class PdfCapture:
                         head.extend(chunk)
                         if len(head) < HEAD_BYTES and not eof:
                             continue
-                        at = bytes(head[:HEAD_BYTES]).find(PDF_MAGIC)
-                        if at < 0:
-                            raise ValueError("响应不是 PDF（前 1024 字节没有 %PDF-）")
+                        at = pdf_offset(bytes(head[:HEAD_BYTES]))
+                        if at is None:
+                            raise ValueError("响应不是 PDF（前 1024 字节没有 %PDF-，或 %PDF- 前不只是空白 / BOM）")
                         out.write(head[at:])
                         written += len(head) - at
                         started = True

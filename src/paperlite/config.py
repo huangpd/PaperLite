@@ -22,8 +22,8 @@ from importlib import resources
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from paperlite.proxy import ProxySettings
 
 CONFIG_ENV = "PAPERLITE_CONFIG"
 CONFIG_NAME = "config.toml"
@@ -42,6 +42,35 @@ def write_example(path: Path, force: bool = False) -> None:
     path.write_text(resources.files("paperlite").joinpath("config.example.toml").read_text(encoding="utf-8"),
                     encoding="utf-8")
     path.chmod(0o600)
+
+
+@dataclass(frozen=True)
+class ProxySettings:
+    api_url: str
+    scheme: str = "http"
+    username: str = ""
+    password: str = ""
+    lease_s: float = 600              # 单个 IP 最长使用时间，与接口 deadline 取较早者
+    check_url: str = "https://www.cloudflare.com/cdn-cgi/trace"   # 首选判定目标（回显出口 IP）
+    check_url2: str = "https://httpbin.org/ip"                    # 备用判定目标（回显 origin IP），去单点抖动；两者任一通过即合格
+    connect_timeout_s: float = 3                                  # 先 TCP 连代理端口，连不上快速弃（不耗满 check_timeout_s）
+    check_timeout_s: float = 10                                   # 单次体检 HTTP 请求超时
+    check_max_latency_ms: float = 3000                            # 体检往返延迟超过此值即弃（慢代理大概率过盾也慢）；0 关闭
+    verify_exit_ip: bool = True                                   # 核对回显出口 IP 是否等于接口给的 proxy_ip（证明真转发）
+    check_max_tries: int = 3
+
+    def browser_proxy_for(self, server: str) -> dict:
+        """ip:port → Playwright 代理配置（浏览器兜底下载用，与下载线程同一出口）。"""
+        proxy = {"server": f"{self.scheme}://{server}"}
+        if self.username:
+            proxy.update(username=self.username, password=self.password)
+        return proxy
+
+    def url_for(self, server: str) -> str:
+        """ip:port → 带鉴权的代理 URL（鉴权只在本地拼，不进身份池）。"""
+        if not self.username:
+            return f"{self.scheme}://{server}"
+        return f"{self.scheme}://{quote(self.username, safe='')}:{quote(self.password, safe='')}@{server}"
 
 
 @dataclass(frozen=True)

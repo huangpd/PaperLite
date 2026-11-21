@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest import mock
 
 from paperlite.config import Limits
-from paperlite.curl.downloader import Downloader, rate_limit_wait
+from paperlite.curl.downloader import Downloader
+from paperlite.curl.http import rate_limit_wait
 from paperlite.curl.cookies import jar_to_records
 from paperlite.curl.producer import Producer
 from paperlite.proxy import Lease
@@ -627,7 +628,7 @@ def test_meta_refresh_target():
 
 
 def test_cf_probe_scripts_are_not_challenge():
-    from paperlite.curl.downloader import is_cf_denied, is_challenge
+    from paperlite.page import is_cf_denied, is_challenge
     normal = b'<html><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>' \
              b'<script src="/cdn-cgi/challenge-platform/scripts/precursor"></script></html>'
     assert not is_challenge({}, normal)
