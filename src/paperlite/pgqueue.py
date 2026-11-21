@@ -498,14 +498,15 @@ class PgTaskQueue:
         return QueueStats(tasks, chunks)
 
     def hosts(self) -> list[str]:
-        """按领取顺序（块顺序）列出本批次的主机。"""
+        """本批次的主机，任务多的在前。第一个用作浏览器热身 / curl 模式的主机：不能按排序取第一个——
+        数据里混进一条 https://.asm.org/… 这样的坏链接，就会让整个批次的热身都失败。"""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT host FROM pl_chunks WHERE batch = %s GROUP BY host ORDER BY min(chunk_id)",
+                "SELECT host FROM pl_chunks WHERE batch = %s GROUP BY host ORDER BY sum(size) DESC, host",
                 (self.batch,)).fetchall()
             if not rows:                    # 还没切块
-                rows = self._conn.execute("SELECT DISTINCT host FROM pl_tasks WHERE batch = %s ORDER BY host",
-                                          (self.batch,)).fetchall()
+                rows = self._conn.execute("SELECT host FROM pl_tasks WHERE batch = %s GROUP BY host "
+                                          "ORDER BY count(*) DESC, host", (self.batch,)).fetchall()
         return [r[0] for r in rows]
 
     def kind_counts(self) -> list[tuple[str, str, int]]:

@@ -76,7 +76,7 @@ class BrowserPool:
         self.hosts = db.hosts()
         if not self.hosts:
             raise ValueError("任务队列里没有任务，无法确定主机")
-        self.host = db.host() or self.hosts[0]      # 热身落地页用第一个主机；其它主机的页面在首次渲染时各自过盾
+        self.host = db.host() or self.hosts[0]      # 热身落地页用任务最多的主机；其它主机的页面在首次渲染时各自过盾
         self.landing = cfg.landing_for(self.host)
         self.stats = BrowserStats()
         self._drained = threading.Event()      # 所有任务领完
