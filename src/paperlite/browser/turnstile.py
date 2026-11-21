@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-paperlite/turnstile.py
-────────────────────────
+paperlite/browser/turnstile.py
+──────────────────────────────
 Cloudflare Turnstile：点复选框 + 按 sitekey 取 token。
 
 两种用法：
@@ -176,7 +176,7 @@ async def solve_turnstile(
     token 要和出口 IP / UA 一起用：提交时请用同一代理和返回的 user_agent。
     """
     from cloakbrowser import get_default_stealth_args, launch_async
-    from paperlite.browser import browser_env
+    from paperlite.browser.session import browser_env
 
     t0 = time.monotonic()
     result = TokenResult(ok=False, seconds=0)

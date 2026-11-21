@@ -2,18 +2,16 @@
 
 import asyncio
 import json
-import os
 import tempfile
 import threading
 import time
 import unittest
 import urllib.request
-import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from paperlite.browser import RenderResult, classify_waf
+from paperlite.browser.session import RenderResult, classify_waf
 from paperlite.monitor import reporter as mon
 from paperlite.monitor import schema
 from paperlite.monitor.config import MonitorConfig, load_monitor
@@ -115,7 +113,7 @@ class ReporterTest(unittest.TestCase):
         r = mon.Reporter(MonitorConfig(enabled=True))
         r.enabled = True
         h = mon._ForwardHandler(r)
-        h.handle(logging.makeLogRecord({"name": "paperlite.browser_pool", "levelno": 30, "levelname": "WARNING",
+        h.handle(logging.makeLogRecord({"name": "paperlite.browser.pool", "levelno": 30, "levelname": "WARNING",
                                         "msg": "提取 IP 失败"}))
         h.handle(logging.makeLogRecord({"name": "paperlite.monitor.reporter", "levelno": 30,
                                         "levelname": "WARNING", "msg": "连不上"}))
@@ -359,7 +357,7 @@ class BrowserPoolMonitorWiringTest(unittest.TestCase):
         self.db = make_source(self)
 
     def _pool(self, url):
-        from paperlite.browser_pool import BrowserPool
+        from paperlite.browser.pool import BrowserPool
         from paperlite.config import Limits
         self.db.import_urls([{"url": url}])
         return BrowserPool(Limits(), None, self.db, Path(self.tmp.name) / "out", workers=1, no_proxy=True)
@@ -396,7 +394,7 @@ class BrowserPoolMonitorWiringTest(unittest.TestCase):
         self.assertEqual((kw["passed"], kw["ok"], kw["status"], kw["error"]), (False, False, None, "TimeoutError"))
 
     def test_online_tracks_open_browsers(self):
-        from paperlite import browser_pool as bp
+        from paperlite.browser import pool as bp
         from paperlite.config import Limits
         seen = []
 
@@ -440,7 +438,7 @@ class EventsEndToEndTest(unittest.TestCase):
     """终端 → events 中转表 → 面板消费 → 汇总，全在 PostgreSQL。"""
 
     def test_publish_consume_aggregate(self):
-        from paperlite.monitor.consumer import consume_forever
+        from paperlite.monitor.ingest import consume_forever
         db = _monitor_db(self)
         cfg = MonitorConfig(enabled=True, dsn=DSN, schema=db._schema, vendor="qg", flush_s=0.1)
         stop = threading.Event()

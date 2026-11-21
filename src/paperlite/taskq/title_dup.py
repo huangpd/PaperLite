@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-paperlite/inspect.py
-──────────────────────
+paperlite/taskq/title_dup.py
+────────────────────────────
 巡检：采集过程中，某个标题重复 >= 阈值次（默认 10）就认定它是栏目/封面类"坏标题"，
 从这些样本的 doi / url 归纳规则（两个维度各取最长公共前缀，再加一个去掉末尾数字的更宽前缀），
 用已采数据验证精确率（命中规则的已采条目里"坏标题"占比），只保留 precision/support 达标的最宽候选，
@@ -155,7 +155,7 @@ class WindowInspector:
 def inspect(db, trigger: int = 10, min_precision: float = 0.98, min_support: int = 10) -> tuple[int, int]:
     """
     跑一轮巡检，返回 (本次生效规则数, 本次新标记的 pending 数)。
-    db 需提供 crawled_titles() / count_pending_matching() / flag_suspects()（见 pgqueue.PgTaskQueue）。
+    db 需提供 crawled_titles() / count_pending_matching() / flag_suspects()（见 taskq.queue.PgTaskQueue）。
     """
     crawled = db.crawled_titles()
     if len(crawled) < trigger:

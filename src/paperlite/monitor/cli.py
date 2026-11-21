@@ -58,7 +58,7 @@ def _serve(cfg: MonitorConfig, consume: bool) -> None:
     db.prune(force=True)
     stop = threading.Event()
     if consume:
-        from paperlite.monitor.consumer import consume_forever
+        from paperlite.monitor.ingest import consume_forever
         threading.Thread(target=consume_forever, args=(cfg, db, stop), name="consumer", daemon=True).start()
     try:
         srv = make_server(cfg, db)

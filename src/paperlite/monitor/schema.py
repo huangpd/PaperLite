@@ -31,7 +31,7 @@ HEARTBEAT = "heartbeat"
 LOG = "log"
 TYPES = (PROXY_CHECK, BROWSER, PAGE, HEARTBEAT, LOG)
 
-# WAF 识别结果（browser.classify_waf）
+# WAF 识别结果（browser.session.classify_waf）
 WAF_CLOUDFLARE = "cloudflare"
 WAF_AWS = "aws_waf"
 WAF_DATADOME = "datadome"

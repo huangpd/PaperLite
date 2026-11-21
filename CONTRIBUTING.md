@@ -20,12 +20,12 @@ docker run -d --name paperlite-pg -e POSTGRES_PASSWORD=pl -e POSTGRES_DB=paperli
 export PAPERLITE_TEST_PG=postgresql://postgres:pl@127.0.0.1:5439/paperlite
 
 uv run pytest                                                   # 全部测试（任务队列、身份池、监控都在 PG）
-uv run pytest tests/test_paperlite.py::ConfigTest::test_from_dict   # 单个用例
+uv run pytest tests/test_config.py::ConfigTest::test_from_dict   # 单个用例
 ```
 
 不设 `PAPERLITE_TEST_PG` 时只跑不需要数据库的用例（配置、分类、参数解析等），不能代替完整测试。GitHub Actions 发布前会起一个 PG 服务跑全量。
 
-身份池（`store.py`）的测试也跑在 PG 上，跟着全量一起跑。PG 相关的测试辅助在 `tests/pgutil.py`（`make_source`、`make_store`、`needs_pg`、`pg_config`）。
+身份池（`curl/identity.py`）的测试也跑在 PG 上，跟着全量一起跑。PG 相关的测试辅助在 `tests/pgutil.py`（`make_source`、`make_store`、`needs_pg`、`pg_config`）。
 
 ## 改代码之前
 

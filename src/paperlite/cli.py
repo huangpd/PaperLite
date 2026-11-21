@@ -38,14 +38,14 @@ from pathlib import Path
 from paperlite import __version__
 from paperlite import config as config_mod
 from paperlite.config import Limits, Paths, RunConfig
-from paperlite.browser_pool import BrowserPool
-from paperlite.consumer import Downloader
+from paperlite.browser.pool import BrowserPool
+from paperlite.curl.downloader import Downloader
 from paperlite import logutil
 from paperlite.logutil import setup_logging
-from paperlite.producer import Producer
+from paperlite.curl.producer import Producer
 from paperlite.proxy import IpSource, ProxySettings
-from paperlite.store import IdentityStore
-from paperlite.pgqueue import PgTaskQueue, PgTaskSource
+from paperlite.curl.identity import IdentityStore
+from paperlite.taskq import PgTaskQueue, PgTaskSource
 from paperlite.tasks import ERROR_KINDS, Status, UrlType
 
 logger = logging.getLogger("paperlite")
@@ -132,7 +132,7 @@ def _require_geoip(cfg) -> None:
     （而不是让 cloakbrowser 每次启动都卡 5 分钟重试）。"""
     if not cfg.geoip:
         return
-    from paperlite.browser import ensure_geoip_db
+    from paperlite.browser.session import ensure_geoip_db
     ok, path, url = ensure_geoip_db()
     if ok:
         return
@@ -403,7 +403,7 @@ def _export(args) -> None:
 
 
 def _turnstile(args, parser) -> None:
-    from paperlite import turnstile
+    from paperlite.browser import turnstile
 
     try:
         proxy = turnstile.parse_proxy(args.proxy)
@@ -487,7 +487,7 @@ def _inspect(args) -> None:
         trigger = args.trigger if args.trigger is not None else cfg.title_dup_trigger
         mp = args.min_precision if args.min_precision is not None else cfg.rule_min_precision
         ms = args.min_support if args.min_support is not None else cfg.rule_min_support
-        from paperlite import inspect as inspect_mod
+        from paperlite.taskq import title_dup as inspect_mod
         rules, flagged = inspect_mod.inspect(q, trigger, mp, ms)
         print(f"巡检完成：本次生效规则 {rules} 条，新跳过 {flagged} 条；"
               f"累计规则 {len(q.skip_rules())} 条、跳过 {q.skip_counts().get('title_dup', 0)} 条")

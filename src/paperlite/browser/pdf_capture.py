@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-paperlite/pdf_capture.py
-──────────────────────────
+paperlite/browser/pdf_capture.py
+────────────────────────────────
 浏览器模式下载 PDF：在页面上开 CDP Fetch 拦截，主文档（或子请求）的响应是 PDF 时，
 直接用 Fetch.takeResponseBodyAsStream + IO.read 把响应体流式写盘，写完中止这个请求，浏览器不渲染、不下载它。
 
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-logger = logging.getLogger("paperlite.pdf_capture")
+logger = logging.getLogger("paperlite.browser.pdf_capture")
 
 PDF_MAGIC = b"%PDF-"
 HEAD_BYTES = 1024                      # %PDF- 必须出现在这么多字节以内（与 curl 模式一致）

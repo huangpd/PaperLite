@@ -91,7 +91,7 @@ class Limits:
     max_file_size_mb: int = 200       # 超过就中止，判 failed / extract_failed
     max_tries: int = 3                # 单条 URL 的网络错误重试次数（cookie 被拒不计）
     max_url_challenges: int = 3       # 单条 URL 带有效 cookie 仍被挑战满这么多次 → failed / challenge_failed
-    # 巡检：同标题重复到阈值就归纳 doi/url 规则，把疑似失效/封面的 pending 标记跳过（见 inspect.py）
+    # 巡检：同标题重复到阈值就归纳 doi/url 规则，把疑似失效/封面的 pending 标记跳过（见 taskq/title_dup.py）
     title_dup_trigger: int = 10       # 同一标题重复这么多篇就触发巡检；0 关闭巡检
     title_window_size: int = 500      # 实时巡检只保留本次运行最近这么多条已加载页面
     rule_min_precision: float = 0.98  # 归纳出的规则在已采数据上的最低精确率，防止把真文章误标
@@ -154,7 +154,7 @@ class RunConfig:
 
 @dataclass(frozen=True)
 class PgConfig:
-    """[pg]：任务队列（paperlite.pgqueue）。同一 batch 的机器共享一个批次。"""
+    """[pg]：任务队列（paperlite.taskq）。同一 batch 的机器共享一个批次。"""
 
     dsn: str = ""                     # postgresql://user:pass@host:5432/db（含密码，config.toml 不要提交）
     batch: str = ""                   # 批次名：同一批次的机器填同一个

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from paperlite.pdf_capture import PdfCapture, expected_response_size, looks_like_pdf_response
+from paperlite.browser.pdf_capture import PdfCapture, expected_response_size, looks_like_pdf_response
 
 
 class FakeCdp:

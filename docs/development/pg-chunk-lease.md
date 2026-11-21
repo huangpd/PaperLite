@@ -1,6 +1,6 @@
 # PG 按块领取设计
 
-目标：多台机器（目标 100 台、每天几千万篇）共享一个批次的任务队列。任务队列只有这一种实现：`paperlite.pgqueue`，
+目标：多台机器（目标 100 台、每天几千万篇）共享一个批次的任务队列。任务队列只有这一种实现：`paperlite.taskq`，
 一台机器也是同一套机制。部署与使用见[部署 PostgreSQL](../guide/postgres.md)和[多机部署](../guide/multi-machine.md)。本文讲为什么这样设计、怎么实现。
 
 ## 0. 组成
@@ -71,7 +71,7 @@ import_urls ─▶ build_chunks（每 host 每 1000 条一块，换 host 必切�
 
 ## 5. 接入方式：`PgTaskSource`
 
-worker（`consumer.Downloader`、`browser_pool.BrowserPool`）用到的接口：
+worker（`curl.downloader.Downloader`、`browser.pool.BrowserPool`）用到的接口：
 `claim / finish / retry_later / challenged / count_claimable / has_status / host / hosts / counts`。
 巡检器（`WindowInspector`）需要的两个钩子 `count_pending_matching` / `flag_suspects` 也由它实现，只作用于本地队列：
 
@@ -93,7 +93,7 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）用到的接口：
 | 重试退避 | `next_attempt_at` |
 | 手动重试（`retry`） | `reset`：放回 pending、清零计数，`requeue_leftovers` 切进下一代 |
 | 导出（`export`） | `rows`：服务端游标流式读出 |
-| 身份池（curl 模式） | 也在 PostgreSQL：`store.py`，UNLOGGED 表，`SKIP LOCKED` 领取 |
+| 身份池（curl 模式） | 也在 PostgreSQL：`curl/identity.py`，UNLOGGED 表，`SKIP LOCKED` 领取 |
 | 跨机器的按站点限速 / 并发上限 | 待设计：PG 里按 host 计数（在线 worker 数、令牌桶） |
 | 进度和统计 | `stats()`；大表上改为汇总表，不要直接 `GROUP BY` 全表（待做） |
 | 卷期停止 | 不做：卷期号只能从 ACM 式 DOI（`10.xxxx/数字.数字`）里认，针对性太强、不通用 |
@@ -131,7 +131,7 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）用到的接口：
 
 ## 9. 测试
 
-`tests/test_pgqueue.py`（需要 `PAPERLITE_TEST_PG`，没有时跳过；`tests/test_paperlite.py` 里的 worker 测试也跑在 PG 上）：
+`tests/test_taskq.py`（需要 `PAPERLITE_TEST_PG`，没有时跳过；`tests/test_curl.py`、`tests/test_browser.py` 里的 worker 测试也跑在 PG 上）：
 
 - 队列：导入排序和去重、按主机切块、16 线程并发领取不重复、租约过期回收与原主人续租失败、重复上报不覆盖、
   重试退避与下一代、空块跳过、LeaseKeeper；
@@ -144,5 +144,5 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）用到的接口：
 
 ```bash
 docker run -d --name paperlite-pg -e POSTGRES_PASSWORD=pl -e POSTGRES_DB=paperlite -p 5439:5432 postgres:16-alpine
-PAPERLITE_TEST_PG=postgresql://postgres:pl@127.0.0.1:5439/paperlite uv run pytest tests/test_pgqueue.py
+PAPERLITE_TEST_PG=postgresql://postgres:pl@127.0.0.1:5439/paperlite uv run pytest tests/test_taskq.py
 ```

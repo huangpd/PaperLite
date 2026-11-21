@@ -12,7 +12,7 @@ paperlite/monitor
     reporter.py  埋点 API：page / browser_start / proxy_check / heartbeat；未启用时全部 no-op、不连库
   面板端（paperlite-monitor）
     db.py        取走事件、汇总入库 + 按时间窗聚合查询
-    consumer.py  消费循环
+    ingest.py    消费循环：从 events 取走、汇总入库
     dashboard.py HTTP 大屏 + JSON 接口
     cli.py       paperlite-monitor 命令
 

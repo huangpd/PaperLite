@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-paperlite/browser.py
-──────────────────────
+paperlite/browser/session.py
+────────────────────────────
 用一个独立 CloakBrowser 进程经指定代理打开站点页面（curl 模式的生产者用站点首页），等 Cloudflare 挑战通过后导出 cookie。
-遇到交互式 Turnstile（复选框）时自动点击，见 paperlite/turnstile.py。
+遇到交互式 Turnstile（复选框）时自动点击，见 browser/turnstile.py。
 
 每次过盾单独 launch：CloakBrowser 的指纹种子（--fingerprint）是启动参数，同一进程内所有 context 共用，
 独立进程才能做到一 IP 一指纹。
@@ -19,10 +19,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from paperlite.proxy import Lease, ProxySettings
-from paperlite.turnstile import TurnstileClicker
+from paperlite.browser.turnstile import TurnstileClicker
 
 if TYPE_CHECKING:
-    from paperlite.pdf_capture import CapturedPdf
+    from paperlite.browser.pdf_capture import CapturedPdf
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +258,7 @@ class BrowserSession:
     """
     一个常驻 CloakBrowser 进程 + 一个出口 IP（由传入的 proxy 决定）。
     过盾一次后在同一个 context 里连续 render() 多篇：同站第二篇起多半不再弹挑战，省掉反复启动浏览器。
-    用于浏览器下载模式（browser_pool），也被一次性的 render_page() 复用。
+    用于浏览器下载模式（browser/pool.py），也被一次性的 render_page() 复用。
     """
 
     def __init__(self, proxy: Optional[dict], headed: bool = False, geoip: bool = False,
@@ -275,7 +275,7 @@ class BrowserSession:
 
     async def start(self) -> None:
         from cloakbrowser import get_default_stealth_args, launch_async
-        from paperlite.turnstile import TurnstileClicker
+        from paperlite.browser.turnstile import TurnstileClicker
 
         args = [a for a in get_default_stealth_args() if a.split("=", 1)[0] != "--no-sandbox"]
         self.browser = await launch_async(
@@ -306,7 +306,7 @@ class BrowserSession:
         try:
             doc.reset()                       # 别用上一页的 challenged 状态判断新页
             if pdf_dest is not None:
-                from paperlite.pdf_capture import PdfCapture
+                from paperlite.browser.pdf_capture import PdfCapture
                 auth = ((self.proxy["username"], self.proxy.get("password", ""))
                         if self.proxy and self.proxy.get("username") else None)
                 capture = await PdfCapture.create(self.context, page, url, pdf_dest, max_bytes=max_bytes,
