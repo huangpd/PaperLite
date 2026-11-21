@@ -1143,8 +1143,11 @@ class BrowserPoolTest(unittest.TestCase):
                 s.proxy = proxy
             async def start(s):
                 pass
-            async def render(s, url, timeout_s, settle_s=2.0):
-                return responses(url)
+            async def render(s, url, timeout_s, settle_s=2.0, **kw):
+                try:
+                    return responses(url, **kw)
+                except TypeError:                       # 只收 url 的 responses
+                    return responses(url)
             async def close(s):
                 pass
 
@@ -1215,6 +1218,39 @@ class BrowserPoolTest(unittest.TestCase):
                          ("non_pdf", "landing_page", "pdf", None))
         self.assertEqual(len(list((self.out / "non_pdf").glob("*.html"))), 1)       # 网页留在 non_pdf/ 备查
 
+    def test_pdf_task_captured_as_pdf(self):
+        """浏览器拦截到 PDF 响应（流式写盘、已校验）：记 success，file_path 是 .pdf。"""
+        from paperlite.browser import RenderResult
+        from paperlite.pdf_capture import CapturedPdf
+        url = "https://dl.acm.org/doi/pdf/10.1145/100348.100354"
+        self.db.import_urls([{"url": url, "url_type": "pdf"}])
+        seen = {}
+
+        def resp(u, pdf_dest=None, **kw):
+            seen["dest"] = pdf_dest
+            pdf_dest.parent.mkdir(parents=True, exist_ok=True)
+            pdf_dest.write_bytes(FAKE_PDF)
+            return RenderResult(ok=True, seconds=20.0, url=u, status=200, clicks=2, waf="cloudflare",
+                                pdf=CapturedPdf(pdf_dest, len(FAKE_PDF), 200, u))
+        pool = self.run_pool(resp, [])
+        self.assertEqual((pool.stats.success, pool.stats.non_pdf, pool.stats.failed), (1, 0, 0))
+        r = self.row(url)
+        self.assertEqual((r["status"], r["file_size"], r["error_kind"]), ("success", len(FAKE_PDF), None))
+        self.assertEqual(Path(r["file_path"]), pdf_path(self.out, r["doi"]))
+        self.assertEqual(seen["dest"], pdf_path(self.out, r["doi"]))          # 要 PDF 的任务才开拦截
+
+    def test_pdf_task_bad_pdf_retried_then_failed(self):
+        """截到了 PDF 响应但校验没过（不完整等）：按提取错误重试，max_tries 用完判 failed / extract_failed。"""
+        from paperlite.browser import RenderResult
+        self.cfg = Limits(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, max_tries=2)
+        url = "https://dl.acm.org/doi/pdf/10.1145/short"
+        self.db.import_urls([{"url": url, "url_type": "pdf"}])
+        pool = self.run_pool(lambda u, **kw: RenderResult(ok=True, seconds=1.0, url=u, status=200, html="",
+                                                           pdf_error="PDF 不完整: 实际 100，Content-Length 500 字节"), [])
+        r = self.row(url)
+        self.assertEqual((r["status"], r["error_kind"], r["retry_count"]), ("failed", "extract_failed", 1))
+        self.assertIn("不完整", r["error_message"])
+
     def test_404_fails_without_retry(self):
         from paperlite.browser import RenderResult
         gone = "https://www.sciencedirect.com/science/article/abs/pii/404"
@@ -1272,7 +1308,7 @@ class BrowserPoolTest(unittest.TestCase):
                 pass
             async def start(s):
                 pass
-            async def render(s, url, timeout_s, settle_s=2.0):
+            async def render(s, url, timeout_s, settle_s=2.0, **kw):
                 return resp(url)
             async def close(s):
                 pass

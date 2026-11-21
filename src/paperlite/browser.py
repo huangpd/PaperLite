@@ -16,10 +16,13 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from paperlite.proxy import Lease, ProxySettings
 from paperlite.turnstile import TurnstileClicker
+
+if TYPE_CHECKING:
+    from paperlite.pdf_capture import CapturedPdf
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +250,8 @@ class RenderResult:
     clicks: int = 0
     error: str = ""
     waf: str = ""                 # 识别到的 WAF（cloudflare/aws_waf/datadome/none），监控统计用
+    pdf: Optional["CapturedPdf"] = None   # 要 PDF 时：截到并写盘的 PDF（见 pdf_capture.py）
+    pdf_error: str = ""           # 要 PDF 时：截到了 PDF 响应但校验没过（不是 PDF、过小、过大、不完整）
 
 
 class BrowserSession:
@@ -263,6 +268,7 @@ class BrowserSession:
         self.geoip = geoip
         self.webrtc_spoof = webrtc_spoof
         self.browser = None
+        self.context = None
         self.page = None
         self.doc: Optional[DocTracker] = None
         self.clicker = None
@@ -277,26 +283,45 @@ class BrowserSession:
             args=args + ["--disable-dev-shm-usage", "--window-size=1440,900"]
             + (["--fingerprint-webrtc-ip=auto"] if self.webrtc_spoof else []), env=browser_env(),
         )
-        self.page = await (await self.browser.new_context()).new_page()
+        self.context = await self.browser.new_context()
+        self.page = await self.context.new_page()
         self.doc = DocTracker(self.page)
         self.clicker = TurnstileClicker()
 
-    async def render(self, url: str, timeout_s: float, settle_s: float = 2.0) -> RenderResult:
+    async def render(self, url: str, timeout_s: float, settle_s: float = 2.0, *, pdf_dest: Optional[Path] = None,
+                     max_bytes: int = 200 * 1024 * 1024, min_bytes: int = 1024) -> RenderResult:
         """
         在常驻浏览器里打开 url，让它自己完成跳转（HTTP 3xx、meta refresh、JS 跳转）和 Cloudflare 挑战
         （交互式 Turnstile 自动点），等页面不再是挑战页、无待执行 meta refresh、地址 settle_s 秒不变后返回。
         clicks 记本次新增的点击数。失败（超时/异常）时 ok=False，浏览器仍可复用于下一篇。
+
+        给了 pdf_dest：打开前开 CDP 拦截（pdf_capture.PdfCapture），途中任何一个响应是 PDF 就流式写到 pdf_dest，
+        立刻返回（result.pdf）；最后停在网页上就照常返回网页（调用方按 non_pdf 处理）。
         """
         page, doc, clicker = self.page, self.doc, self.clicker
         t0 = time.monotonic()
         result = RenderResult(ok=False, seconds=0)
         clicks0 = clicker.clicks
+        capture = None
         try:
             doc.reset()                       # 别用上一页的 challenged 状态判断新页
-            await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
+            if pdf_dest is not None:
+                from paperlite.pdf_capture import PdfCapture
+                auth = ((self.proxy["username"], self.proxy.get("password", ""))
+                        if self.proxy and self.proxy.get("username") else None)
+                capture = await PdfCapture.create(self.context, page, url, pdf_dest, max_bytes=max_bytes,
+                                                  min_bytes=min_bytes, proxy_auth=auth)
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
+            except Exception:
+                # PDF 被截下后原请求会被中止，goto 报 ERR_ABORTED / 下载开始之类的错，属正常
+                if not (capture and await _settle_capture(capture)):
+                    raise
             deadline = t0 + timeout_s
             last_url, stable_since = "", time.monotonic()
             while True:
+                if capture and capture.result.done():
+                    break
                 busy = doc.challenged is not False
                 if not busy:
                     try:
@@ -308,21 +333,29 @@ class BrowserSession:
                     last_url, stable_since = page.url, now
                 if not busy and now - stable_since >= settle_s:
                     break
-                if now > deadline:
+                if now > deadline and not (capture and capture.streaming):     # 正在写 PDF：慢但没坏，接着等
                     raise TimeoutError(f"{timeout_s:.0f}s 内页面未稳定（{await _title(page)!r}，{page.url[:120]}，点击 {clicker.clicks - clicks0} 次）")
                 if doc.challenged:
                     await clicker.tick(page)
                 await asyncio.sleep(0.5)
+            result.clicks = clicker.clicks - clicks0
+            if capture and capture.result.done() and not capture.result.cancelled():
+                got = capture.result.result()
+                result.pdf, result.url, result.status, result.ok = got, got.final_url, got.status, True
+                return result
             result.url = page.url
             result.status = doc.status
             result.title = await _title(page)
             result.html = await page.content()
-            result.clicks = clicker.clicks - clicks0
             result.ok = True
+            if capture:
+                result.pdf_error = capture.last_error
         except Exception as e:
             first = str(e).splitlines()[0][:200] if str(e) else ""
             result.error = f"{type(e).__name__}: {first}"
         finally:
+            if capture is not None:
+                await capture.close()
             result.seconds = round(time.monotonic() - t0, 1)
             result.waf = doc.waf or "none"
         return result
@@ -334,6 +367,19 @@ class BrowserSession:
             except Exception:
                 logger.debug("关闭浏览器异常", exc_info=True)
             self.browser = self.page = self.doc = self.clicker = None
+
+
+async def _settle_capture(capture, wait_s: float = 3.0, stream_limit_s: float = 1800) -> bool:
+    """goto 报错后等截获结果：PDF 被截下后原请求中止（goto 报 ERR_ABORTED），或大文件写盘期间 goto 超时。
+    正在写盘就一直等到写完（最多 stream_limit_s），否则再等 wait_s；截到合格 PDF 返回 True。"""
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    while not capture.result.done():
+        elapsed = loop.time() - start
+        if elapsed > stream_limit_s or (not capture.streaming and elapsed > wait_s):
+            return False
+        await asyncio.sleep(0.2)
+    return not capture.result.cancelled()
 
 
 async def render_page(url: str, proxy: Optional[dict], timeout_s: float, settle_s: float = 2.0,

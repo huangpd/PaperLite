@@ -92,6 +92,19 @@ curl 模式的生产目标 = min(`max_identities`, 在线下载线程数, 可领
 
 旧版在 curl 模式下有"卷期停止"：同一卷期接连几篇都没有 PDF，就把该卷期其余任务直接记为 `non_pdf`、不再请求。它只能从 ACM 式 DOI（`10.xxxx/数字.数字`）里认出卷期，对别的出版商不起作用，而且推断出来的结果没有实际请求过，容易误判。已移除；"成片失效"由下面的重复标题巡检覆盖。
 
+## 浏览器模式下载 PDF：拦截响应，流式写盘
+
+无界面 Chromium 打开 PDF 直链会把它当下载，`page.goto` 直接报错；靠"点下载按钮"又要按站点写规则。所以浏览器模式下 `url_type=pdf` 的任务用 CDP 的 Fetch 拦截（`pdf_capture.py`，参考 paper_downloader 的实现）：
+
+- 打开前在页面上开拦截。途中任一响应的响应头是 PDF（`Content-Type` 含 pdf、`Content-Disposition` 是 `.pdf`），或地址像 PDF 且没说是 HTML，就用 `Fetch.takeResponseBodyAsStream` + `IO.read` 把响应体流式写盘，写完中止这个请求，浏览器不渲染、不下载它。明确是 HTML 的响应不截：`.pdf` 地址上也可能是挑战页或中转页。
+- 请求走的是浏览器自己的网络栈：同一 IP、同一 cookie、同一 TLS 指纹，过盾后的身份直接可用，不会因为换了下载工具再被挑战。
+- 校验与 curl 模式一致：前 1024 字节内有 `%PDF-`（前导空白 / BOM 去掉）、不小于 `min_file_size`、不超过 `max_file_size_mb`、有 `Content-Length` 时长度对得上；206 响应要求覆盖整个文件；先写 `.part` 再改名。校验没过按 `extract_failed` 重试，`max_tries` 用完判死。
+- 写盘期间原请求暂停、页面导航一直等：这段时间不按 `pass_timeout_s` 判超时，大文件也能下完。
+- 开了拦截后代理鉴权要由拦截会话应答（`Fetch.authRequired`），否则 Chromium 报 `ERR_INVALID_AUTH_CREDENTIALS`。
+- 每篇用完关掉拦截，`url_type=html` 的任务不受影响。
+
+只管 PDF 直链。打开的是文章摘要页（要在页面上点"下载 PDF"）时记 `non_pdf`；按站点点按钮不做。
+
 ## 流式下载
 
 超时按卡顿时长计算（`download_timeout_s` 内收不到数据），而不是总时长，因此慢代理上的大文件也能完整下载。有效 PDF 必须在前 1024 字节内包含 `%PDF-`。
