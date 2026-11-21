@@ -142,8 +142,8 @@ paperlite-monitor [--config FILE] [--log-level LEVEL] <serve|test|demo>
 
 | 子命令 | 说明 |
 |---|---|
-| `serve` | 消费 RabbitMQ、写入 PostgreSQL，并提供网页面板。可加 `--dsn`、`--schema`、`--bind`、`--port`、`--amqp`、`--no-consume` |
-| `test` | 在终端机器上发一条测试心跳，验证到 RabbitMQ 的连通性 |
-| `demo` | 用模拟数据启动面板（写入 schema `paperlite_monitor_demo`），不需要 RabbitMQ |
+| `serve` | 从 `events` 表取走监控事件、汇总入库，并提供网页面板。可加 `--dsn`、`--schema`、`--bind`、`--port`、`--no-consume` |
+| `test` | 在下载机上写一条测试心跳，验证能写进监控库、面板是否在消费。可加 `--dsn`、`--schema` |
+| `demo` | 用模拟数据启动面板（写入 schema `paperlite_monitor_demo`） |
 
 读取配置文件的 `[monitor]` 段，查找顺序与 `paperlite` 相同；`[monitor] dsn` 留空时用 `[pg] dsn`。见[监控](../guide/monitoring.md)。

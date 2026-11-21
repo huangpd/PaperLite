@@ -19,7 +19,7 @@ URL 文件 ────────▶ PostgreSQL 任务队列 ◀────�
         │  下载线程：领身份 + 领任务 ─▶ curl_cffi 下载
         └────────────────────────────────────────
 
-  旁路：monitor.reporter ─▶ RabbitMQ ─▶ paperlite-monitor 面板 ─▶ PostgreSQL（schema paperlite_monitor）
+  旁路：monitor.reporter ─▶ PostgreSQL events 中转表 ─▶ paperlite-monitor 面板汇总（同在 schema paperlite_monitor）
 ```
 
 - 一份配置 = 一个批次（`[pg] batch`）。任务只存 PostgreSQL：进程按块领取（默认 1000 条）、带租约，块内在本地按顺序下载、结果攒批回写。一台机器和一百台机器是同一套机制。设计见 [PG 按块领取设计](pg-chunk-lease.md)。
@@ -73,6 +73,16 @@ curl 模式的身份池（`store.py`）和任务队列在同一个库、同一�
 | 在线下载线程、可领取任务上报 | `pl_id_workers`、`pl_id_pending`，按更新时间判离线 |
 
 表都是 UNLOGGED：内容是临时的，不写 WAL，频繁更新更快；PG 崩溃后清空，生产者重新生产即可。续租和在线记录都限了频（续租 ≤ 每 30 秒、在线 ≤ 每 20 秒），100 台 × 20 线程也只是每秒几十次小更新。续租、归还都要求 `holder` 还是自己：被回收后别人领走的身份，旧占用者写不进去。时间用调用方的 epoch 秒，各机器要做时钟同步。
+
+## 只依赖 PostgreSQL
+
+任务队列、curl 模式的身份池、监控都在同一个 PostgreSQL 里，不需要 Redis、RabbitMQ：
+
+- 任务：`[pg] schema` 的 `pl_tasks` / `pl_chunks` / `pl_skip_rules`。
+- 身份池：同一 schema 的 `pl_identities` 等 UNLOGGED 表（见上）。
+- 监控：`paperlite_monitor` schema。下载机按批 INSERT 进 `events`（UNLOGGED 中转表），面板在一个事务里取走、汇总、删掉；面板停机时事件在表里排队（上限 `backlog_max`）。所有下载机本来就要连 PG 领任务，监控也走 PG 不增加网络暴露面。
+
+每个下载进程最多 3 条连接（任务队列、身份池、监控上报），100 台机器也在 `max_connections=300` 的量级内；量再大时监控的 `dsn` 可以指到另一台 PG。
 
 ## 过盾要么很快，要么卡死
 

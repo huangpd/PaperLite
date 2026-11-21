@@ -4,9 +4,9 @@
   from paperlite.monitor import reporter as mon
   mon.page(host=..., passed=True, ok=True, status=200, waf="cloudflare", elapsed_ms=1234)
 
-未调用 start()（没配 [monitor] 或 enabled=false）时，所有函数立即返回：不建线程、不导入 pika。
-启用后事件进本地有界队列，由后台线程发往 RabbitMQ；连不上就按退避重连，队列满了丢最旧的——
-监控永远不能拖慢或打断下载。
+未调用 start()（没配 [monitor] 或 enabled=false）时，所有函数立即返回：不建线程、不连库。
+启用后事件进本地有界队列，由后台线程每 flush_s 秒按批写进 PostgreSQL（监控 schema 的 events 表，
+自己一条连接，不和任务队列共用）；连不上就按退避重连，队列满了丢最旧的——监控永远不能拖慢或打断下载。
 """
 
 import collections
@@ -21,6 +21,7 @@ from paperlite.monitor.config import MonitorConfig
 logger = logging.getLogger(__name__)
 
 _RECONNECT_MAX_S = 30.0
+_BATCH = 1000                 # 一次最多写这么多条
 
 
 class Reporter:
@@ -38,22 +39,16 @@ class Reporter:
 
     # ── 生命周期 ──
     def start(self) -> bool:
-        """启用上报；pika 未安装则告警并保持 no-op。返回是否真正启用。"""
-        if not self.cfg.enabled:
+        """启用上报（后台线程连库，连不上也不影响调用方）。返回是否真正启用。"""
+        if not self.cfg.enabled or not self.cfg.dsn:
             return False
-        try:
-            import pika  # noqa: F401
-        except ImportError:
-            logger.warning("[monitor] enabled = true 但未安装 pika，监控上报已关闭（pip install pika，或升级 paperlite）")
-            return False
-        logging.getLogger("pika").setLevel(logging.WARNING)    # pika 的 INFO 连接细节会刷屏下载日志
         self.enabled = True
         self._thread = threading.Thread(target=self._loop, name="monitor-publisher", daemon=True)
         self._thread.start()
         if self.cfg.forward_logs:
             self._log_handler = _ForwardHandler(self)
             logging.getLogger().addHandler(self._log_handler)
-        logger.info("监控上报已启用 → %s exchange=%s 终端 %s", _redact(self.cfg.amqp_url), self.cfg.exchange,
+        logger.info("监控上报已启用 → %s schema=%s 终端 %s", _redact(self.cfg.dsn), self.cfg.schema,
                     self.cfg.instance)
         return True
 
@@ -65,6 +60,8 @@ class Reporter:
             logging.getLogger().removeHandler(self._log_handler)
             self._log_handler = None
         deadline = time.monotonic() + timeout_s
+        with self._cv:
+            self._cv.notify_all()                  # 别等 flush_s，马上把剩下的写掉
         while self._buf and time.monotonic() < deadline:
             time.sleep(0.05)
         self.enabled = False
@@ -88,40 +85,35 @@ class Reporter:
 
     # ── 后台发送 ──
     def _loop(self) -> None:
-        import pika
+        import psycopg
+        from paperlite.monitor import events
 
         backoff = 1.0
         warned_at = 0.0
         while not self._stop.is_set():
             conn = None
             try:
-                params = self.cfg.amqp_params()
-                params.heartbeat = 60
-                params.blocked_connection_timeout = 30
-                params.socket_timeout = 10
-                conn = pika.BlockingConnection(params)
-                ch = conn.channel()
-                ch.exchange_declare(self.cfg.exchange, exchange_type="topic", durable=True)
+                conn = psycopg.connect(self.cfg.dsn, autocommit=True, connect_timeout=10)
+                events.use_schema(conn, self.cfg.schema, create=True)
                 backoff = 1.0
-                props = pika.BasicProperties(content_type="application/json", delivery_mode=2)
                 while not self._stop.is_set():
                     with self._cv:
-                        if not self._buf:
-                            self._cv.wait(timeout=1.0)
-                        batch = [self._buf.popleft() for _ in range(min(len(self._buf), 500))]
-                    for i, msg in enumerate(batch):
-                        try:
-                            ch.basic_publish(self.cfg.exchange, msg["type"], schema.encode(msg), props)
-                        except Exception:
-                            with self._cv:                      # 没发出去的放回队头，重连后再发
-                                self._buf.extendleft(reversed(batch[i:]))
-                            raise
-                        self.sent += 1
-                    conn.process_data_events(0)                 # 维持 AMQP 心跳
+                        if len(self._buf) < _BATCH:              # 攒 flush_s 秒或攒够一批再写
+                            self._cv.wait(timeout=self.cfg.flush_s)
+                        batch = [self._buf.popleft() for _ in range(min(len(self._buf), _BATCH))]
+                    if not batch:
+                        continue
+                    try:
+                        events.insert(conn, batch)
+                    except Exception:
+                        with self._cv:                          # 没写进去的放回队头，重连后再写
+                            self._buf.extendleft(reversed(batch))
+                        raise
+                    self.sent += len(batch)
             except Exception as e:
                 if time.monotonic() - warned_at > 300:         # 连不上时 5 分钟最多提示一次，别刷屏
                     warned_at = time.monotonic()
-                    logger.warning("监控上报连接 RabbitMQ 失败（不影响下载，%.0fs 后重连）: %s", backoff,
+                    logger.warning("监控上报写入 PostgreSQL 失败（不影响下载，%.0fs 后重连）: %s", backoff,
                                    str(e).splitlines()[0][:160] if str(e) else type(e).__name__,
                                    extra={"_monitor_internal": True})
                 self._stop.wait(backoff)
@@ -152,7 +144,7 @@ class _ForwardHandler(logging.Handler):
 
 
 def _redact(url: str) -> str:
-    """amqp://user:pass@host → amqp://user:***@host，日志里不露密码。"""
+    """postgresql://user:pass@host → postgresql://user:***@host，日志里不露密码。"""
     if "@" not in url or "://" not in url:
         return url
     scheme, rest = url.split("://", 1)

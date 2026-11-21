@@ -60,20 +60,20 @@ urls = ""                     # 可选：启动时先导入这个 URL 文件
 url_type = "html"              # pdf / html
 headed = false                # 仅 browser：有界面（调试）
 
-[monitor]                     # 可选：监控上报。各终端发到同一个 RabbitMQ，paperlite-monitor serve 出大屏
-enabled = false               # true 才上报；RabbitMQ 连不上/没装 pika 都不影响下载
-amqp_url = "amqp://pl_terminal:密码@服务器IP:5672/paperlite"    # 公共 RabbitMQ（含密码，别提交）。部署见 docs/guide/monitoring.md
-exchange = "paperlite.monitor"
+[monitor]                     # 可选：监控。各终端把指标写进 PostgreSQL，paperlite-monitor serve 汇总出大屏
+enabled = false               # true 才上报；PG 连不上 / 写失败都不影响下载
 node = ""                     # 终端名，留空用主机名
 vendor = "qingguo"            # 代理厂商标签：面板按「厂商 × 域名」统计成功率
 heartbeat_s = 15              # 心跳间隔（在线浏览器数、待下载数）
+# flush_s = 2.0               # 攒这么久按批写一次
+# dsn = ""                    # 监控用的 PostgreSQL（两端都用）；留空 = 用 [pg] 的 dsn（与任务队列同一个库）
+# schema = "paperlite_monitor" # 监控表所在 schema，与任务表分开
 # 以下仅面板端（paperlite-monitor serve）用
-# dsn = ""                    # 面板数据存 PostgreSQL；留空 = 用 [pg] 的 dsn（与任务队列同一个库）
-# schema = "paperlite_monitor" # 面板表所在 schema，与任务表分开
 # bind = "127.0.0.1"
 # port = 8700
 # username = "admin"          # 面板网页登录用户名
 # password = ""               # 面板网页登录密码；非空即需登录。对外开放必须设
 # token = ""                  # 可选：给脚本调 /api/summary 用（?token=…）
 # retention_days = 30         # 大屏数据（小时汇总）保留天数
-# raw_retention_hours = 48    # 原始事件（实时事件流）保留小时数
+# raw_retention_hours = 6     # 原始事件（实时事件流、排查明细）保留小时数；大屏只读小时汇总
+# backlog_max = 2000000       # 面板长期不开时，待处理事件最多积压这么多条，超出丢最旧的

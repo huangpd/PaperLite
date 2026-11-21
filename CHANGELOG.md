@@ -12,6 +12,7 @@
 - **监控面板数据改存 PostgreSQL**：`[monitor] db` 换成 `[monitor] dsn`（留空用 `[pg] dsn`）和 `[monitor] schema`（默认 `paperlite_monitor`）；`paperlite-monitor --db` 换成 `--dsn` / `--schema`。
 - **移除卷期停止**：`[limits] volume_stop_after`、`retry --stopped-volumes` 删除（只适用 ACM 式 DOI，不通用）。
 - `psycopg` 成为默认依赖；`paperlite[pg]` 保留为空的兼容写法。
+- **监控不再用 RabbitMQ，只用 PostgreSQL**：下载机按批（每 2 秒或 1000 条）把事件写进 `paperlite_monitor.events`（UNLOGGED 中转表），面板在一个事务里取走、汇总、删掉，不丢不重；面板停机时事件在表里排队（上限 `backlog_max`）。`[monitor] amqp_url` / `exchange` / `queue` / `queue_max_length` 删除（写了会报错提示），新增 `flush_s`、`backlog_max`；`dsn` / `schema` 两端共用；`paperlite-monitor test` 改为验证能写进监控库、面板是否在消费，`serve --amqp` 删除。原始事件默认保留从 48 小时改为 6 小时（大屏只读小时汇总）。删除 `pika` 依赖和 `deploy/monitor`（RabbitMQ 部署文件）。至此任务队列、身份池、监控全部在 PostgreSQL 里，不需要其他中间件。
 - **curl 模式的身份池改存 PostgreSQL，不再需要 Redis**：和任务队列同一个 `[pg]`（UNLOGGED 表，`SKIP LOCKED` 领取，租约、生产者锁、熔断、上报都在表里）。删除 `[limits] redis_url`、`key_prefix`（写了会报错提示）和 `redis` 依赖。续租、在线记录限频（≤ 每 30 / 20 秒）。原来依赖真实 Redis、CI 里一直跳过的身份池测试现在每次都跑。
 - **去掉热身和 `[landing]`**：写了 `[landing]` 会报错并提示删掉。
   - 浏览器模式：新浏览器不再先打开落地页，领到的第一篇就是探针。首篇打不开归咎于 IP：任务原样放回、不计次数，换 IP；同一站点连续 3 个新浏览器首篇都失败，就认定是站点问题，之后正常计次，不会无限换 IP。不走代理时规则相同（重开浏览器）。

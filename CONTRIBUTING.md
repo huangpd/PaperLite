@@ -19,8 +19,7 @@ uv run paperlite --version
 docker run -d --name paperlite-pg -e POSTGRES_PASSWORD=pl -e POSTGRES_DB=paperlite -p 5439:5432 postgres:16-alpine
 export PAPERLITE_TEST_PG=postgresql://postgres:pl@127.0.0.1:5439/paperlite
 
-uv run pytest                                                   # 跳过依赖 RabbitMQ 的用例
-PAPERLITE_TEST_AMQP=amqp://guest:guest@127.0.0.1:5672/%2F uv run pytest tests/test_monitor.py
+uv run pytest                                                   # 全部测试（任务队列、身份池、监控都在 PG）
 uv run pytest tests/test_paperlite.py::ConfigTest::test_from_dict   # 单个用例
 ```
 

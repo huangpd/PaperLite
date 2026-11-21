@@ -19,11 +19,10 @@ src/paperlite/
   inspect.py          重复标题规则归纳
   classify.py         non-PDF 分类：not_found、paywall、landing_page、blocked
   proxy.py            代理提取与分层体检（TCP / TLS / TTFB / 总耗时）
-  monitor/            指标上报（未启用时为空操作）与 paperlite-monitor 面板（数据存 PostgreSQL）
+  monitor/            指标上报（未启用时为空操作，按批写进 PG 的 events 表）与 paperlite-monitor 面板（取走、汇总）
 tests/                pytest 测试（unittest 风格）
 tools/bench_pg_chunks.py  PG 队列调度压测：按块领取 vs 逐条领取
 deploy/pg/            PostgreSQL docker-compose
-deploy/monitor/       监控用的 RabbitMQ docker-compose 与配置
 docs/                 文档
 ```
 

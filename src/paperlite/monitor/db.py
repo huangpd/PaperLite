@@ -1,5 +1,6 @@
 """
-面板端存储（PostgreSQL，默认 schema paperlite_monitor，与任务表分开）。两层：
+面板端存储（PostgreSQL，默认 schema paperlite_monitor，与任务表分开）。
+上报端写进 events 中转表（见 events.py），面板 consume() 在一个事务里取走、汇总。两层：
 
   原始事件表  page / browser / proxy_check / log      只留 raw_retention_hours（默认 48h），给实时事件流、
                                                        近 5 分钟域名频率、明细排查用
@@ -23,7 +24,7 @@ import psycopg
 from psycopg import sql as pgsql
 from psycopg.rows import dict_row
 
-from paperlite.monitor import schema
+from paperlite.monitor import events, schema
 
 WINDOWS = {"1d": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 TREND_BUCKET = {"1d": 3600, "7d": 6 * 3600, "30d": 86400}
@@ -104,30 +105,68 @@ class MonitorDB:
     """一个面板进程一条连接（加锁）：写入只有消费线程，查询来自几个浏览器，量都很小。"""
 
     def __init__(self, dsn: str, schema: str = "paperlite_monitor", retention_days: int = 30,
-                 raw_retention_hours: int = 48) -> None:
+                 raw_retention_hours: int = 6, backlog_max: int = 2_000_000) -> None:
         self.retention_s = retention_days * 86400
         self.raw_retention_s = raw_retention_hours * HOUR
+        self.backlog_max = backlog_max
         self._lock = threading.Lock()
+        self._dsn, self._schema = dsn, schema
         self.conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
         with self._lock, self.conn.transaction():
             self.conn.execute("SELECT pg_advisory_xact_lock(hashtext('paperlite.monitor.schema'))")
             self.conn.execute(pgsql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(pgsql.Identifier(schema)))
             self.conn.execute(pgsql.SQL("SET search_path TO {}").format(pgsql.Identifier(schema)))
             self.conn.execute(_DDL)
+            self.conn.execute(events.DDL)
         self._pruned_at = 0.0
         self._cache: dict[str, tuple[float, dict]] = {}
 
     def close(self) -> None:
         self.conn.close()
 
+    def reconnect_if_broken(self) -> bool:
+        """PG 重启 / 网络断过后连接失效：重连并切回 schema。返回是否重连了。"""
+        if not (self.conn.closed or self.conn.broken):
+            return False
+        with self._lock:
+            self.conn = psycopg.connect(self._dsn, autocommit=True, row_factory=dict_row)
+            self.conn.execute(pgsql.SQL("SET search_path TO {}").format(pgsql.Identifier(self._schema)))
+        return True
+
     def execute(self, query: str, params: Iterable = ()):
         """查询里用 ? 作占位符（与写法统一），这里换成 psycopg 的 %s。调用方持锁。"""
         return self.conn.execute(query.replace("?", "%s"), tuple(params))
 
     # ── 写入 ────────────────────────────────────────────────────────────
+    def consume(self, limit: int = 2000) -> int:
+        """从 events 中转表取走最早的一批并汇总入库：取、写、删在同一个事务里——崩溃就整批回滚，不丢不重。
+        返回处理条数（含校验不过被丢弃的）。"""
+        with self._lock, self.conn.transaction():
+            rows = self.conn.execute(
+                "DELETE FROM events WHERE id IN (SELECT id FROM events ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED) "
+                "RETURNING id, msg", (limit,)).fetchall()
+            msgs = []
+            for r in sorted(rows, key=lambda r: r["id"]):
+                try:
+                    msgs.append(schema.validate(r["msg"]))
+                except ValueError:
+                    pass                               # 不认识的版本 / 类型：丢弃
+            if msgs:
+                self._ingest(msgs)
+        if msgs:
+            self._cache.clear()
+        return len(rows)
+
     def ingest(self, msgs: Iterable[dict[str, Any]]) -> int:
-        """写原始事件 + 合并进小时汇总，整批一个事务（消费端提交成功后才 ack）。
-        原始事件按表攒起来 executemany（psycopg 走 pipeline，几千条一次往返），不逐条 INSERT。"""
+        """直接写一批事件（demo 灌数、测试用）；正常路径是 consume()。整批一个事务。"""
+        with self._lock, self.conn.transaction():
+            n = self._ingest(msgs)
+        if n:
+            self._cache.clear()
+        return n
+
+    def _ingest(self, msgs: Iterable[dict[str, Any]]) -> int:
+        """调用方持锁、在事务里：写原始事件 + 合并进小时汇总。原始事件按表 executemany（一次往返），不逐条 INSERT。"""
         acc = _Acc()
         raw: dict[str, list[tuple]] = defaultdict(list)
         n = 0
@@ -141,12 +180,10 @@ class MonitorDB:
                                *(_sql(d.get(c)) for c in _EVENT_COLUMNS[t])))
             acc.add(m)
             n += 1
-        with self._lock, self.conn.transaction(), self.conn.cursor() as cur:
+        with self.conn.cursor() as cur:
             for t, rows in raw.items():
                 cur.executemany(_insert_sql(t), rows)
-            acc.flush(self.execute)
-        if n:
-            self._cache.clear()
+        acc.flush(self.execute)
         return n
 
     def prune(self, now: Optional[float] = None, force: bool = False) -> int:
@@ -164,6 +201,9 @@ class MonitorDB:
             for t in ("page_h", "browser_h", "proxy_h", "proxy_reason_h", "fleet_h"):
                 n += self.execute(f"DELETE FROM {t} WHERE hour < ?", (hour_cut,)).rowcount
             n += self.execute("DELETE FROM instance WHERE last_seen < ?", (cut,)).rowcount
+            # 面板长期没开、中转表积压太多：丢最旧的（与原来 RabbitMQ 队列的 drop-head 一样）
+            n += self.execute("DELETE FROM events WHERE id <= (SELECT max(id) FROM events) - ?",
+                              (self.backlog_max,)).rowcount
         self._cache.clear()
         return n
 

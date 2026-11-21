@@ -39,7 +39,7 @@ uv run paperlite <命令>                   # 运行；子命令见 docs/referen
 - 按块领取（`pgqueue.py`）：领块不改任务状态（库里没有 running），回写只改仍是 pending 的行（至少一次、重复无害）；要重试的留在 pending 写 `next_attempt_at`，块做完由 `requeue_leftovers` 切进下一代；租约丢了放弃本地剩余任务。详见 pg-chunk-lease.md。
 - 巡检（`inspect.py` + `pgqueue.py` 的 `skip_reason`/`pl_skip_rules`）：浏览器模式下，任何**真加载出来**的页（成功页 + 404 等失效页，`browser_pool._observe` 在成功和 404 分支都喂、不喂 `r.ok=False` 的过盾超时页）标题重复到 `title_dup_trigger` 次就归纳规则。候选取 doi/url 最长公共前缀及其 `_coarsen`（限 `_MAX_COARSEN` 位，防退化成 `/pii/S`），选规则**偏最具体**（最长前缀）而非命中最多，用已采数据验 precision/support 达标才标 pending 跳过。只看内存滑动窗口，按 `(doi_prefix, url_prefix)` 去重，只跳本机领到的块（`PgTaskSource.flag_suspects`）；`paperlite inspect` 另对全批次做（`PgTaskQueue.flag_suspects`）——详见 docs/development/postmortems.md。
 
-**监控（`monitor/`）是旁路**：业务代码只调 `monitor.reporter` 的 `page`/`browser_start`/`proxy_check`（未启用时 no-op、不导入 pika），心跳由 `cli._attach_monitor` 挂上。改监控绝不能让下载阻塞或抛错；新增埋点只加一行调用，别把业务逻辑搬进 monitor。指标口径（按尝试计、耗时只算已加载页、WAF = 站点前面是哪家）见 `docs/guide/monitoring.md`「指标口径」，部署见同一文档。面板查询只读小时汇总表（`*_h`），别改回扫原始事件表——那是 30 天 52 秒的旧方案。
+**监控（`monitor/`）是旁路**：业务代码只调 `monitor.reporter` 的 `page`/`browser_start`/`proxy_check`（未启用时 no-op、不连库；启用后按批写进 PG 的 `paperlite_monitor.events`，面板 `MonitorDB.consume` 一个事务里取走、汇总、删掉；不再用 RabbitMQ），心跳由 `cli._attach_monitor` 挂上。改监控绝不能让下载阻塞或抛错；新增埋点只加一行调用，别把业务逻辑搬进 monitor。指标口径（按尝试计、耗时只算已加载页、WAF = 站点前面是哪家）见 `docs/guide/monitoring.md`「指标口径」，部署见同一文档。面板查询只读小时汇总表（`*_h`），别改回扫原始事件表——那是 30 天 52 秒的旧方案。
 
 ## 约束
 

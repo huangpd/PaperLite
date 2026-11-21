@@ -12,7 +12,7 @@
 - [部署 PostgreSQL](guide/postgres.md)：任务队列和监控数据所在的数据库：部署、访问控制、备份、清理。
 - [多机部署](guide/multi-machine.md)：多台机器跑同一个批次：安装、配置、启动、看进度。
 - [日常运维](guide/operations.md)：后台运行、中断续跑、重试、导出、巡检、新增站点、日志。
-- [监控](guide/monitoring.md)：RabbitMQ + 监控面板的部署、终端接入、安全与容量。
+- [监控](guide/monitoring.md)：监控面板的部署、下载机接入、容量与对 PG 的压力（只用 PostgreSQL）。
 - [Turnstile](guide/turnstile.md)：单独获取 Cloudflare Turnstile token（命令行或 HTTP 服务）。
 - [故障排查](guide/troubleshooting.md)：常见现象、原因和处理办法。
 

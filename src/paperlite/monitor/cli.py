@@ -1,9 +1,9 @@
 """
 paperlite-monitor：监控面板端命令。
 
-  paperlite-monitor serve  [--config config.toml]   # 消费 RabbitMQ → 入库 → 起大屏 http://127.0.0.1:8700/
-  paperlite-monitor test   [--config config.toml]   # 在终端机器上发一条测试心跳，验证到 RabbitMQ 的连通性
-  paperlite-monitor demo   [--config config.toml]   # 灌一份模拟数据（schema paperlite_monitor_demo）并起大屏，不需要 RabbitMQ
+  paperlite-monitor serve  [--config config.toml]   # 消费监控事件 → 汇总入库 → 起大屏 http://127.0.0.1:8700/
+  paperlite-monitor test   [--config config.toml]   # 在终端机器上写一条测试心跳，验证能写进监控库、面板是否在消费
+  paperlite-monitor demo   [--config config.toml]   # 灌一份模拟数据（schema paperlite_monitor_demo）并起大屏
 
 配置读 config.toml 的 [monitor] 段（查找顺序同 paperlite：--config > PAPERLITE_CONFIG > ./config.toml）。
 面板数据存 PostgreSQL：[monitor] dsn，留空则用 [pg] 的 dsn。
@@ -21,6 +21,7 @@ import time
 from paperlite import config as config_mod
 from paperlite.monitor import schema
 from paperlite.monitor.config import MonitorConfig, load_monitor
+from paperlite.monitor.reporter import _redact
 
 logger = logging.getLogger("paperlite.monitor")
 
@@ -32,16 +33,9 @@ def _cfg(args) -> MonitorConfig:
         raise SystemExit(f"配置错误: {e}")
     over = {k: v for k, v in (("dsn", getattr(args, "dsn", None)), ("schema", getattr(args, "schema", None)),
                                ("bind", getattr(args, "bind", None)),
-                               ("port", getattr(args, "port", None)), ("amqp_url", getattr(args, "amqp", None)))
+                               ("port", getattr(args, "port", None)))
             if v is not None}
     return dataclasses.replace(cfg, **over) if over else cfg
-
-
-def _need_pika() -> None:
-    try:
-        import pika  # noqa: F401
-    except ImportError:
-        raise SystemExit("需要 pika：pip install pika（或升级 paperlite）")
 
 
 def _open(cfg: MonitorConfig):
@@ -49,7 +43,7 @@ def _open(cfg: MonitorConfig):
     if not cfg.dsn:
         raise SystemExit("面板数据存 PostgreSQL：请在 [monitor] 填 dsn，或在 [pg] 填 dsn（两者共用一个库）")
     try:
-        return MonitorDB(cfg.dsn, cfg.schema, cfg.retention_days, cfg.raw_retention_hours)
+        return MonitorDB(cfg.dsn, cfg.schema, cfg.retention_days, cfg.raw_retention_hours, cfg.backlog_max)
     except Exception as e:
         raise SystemExit(f"连接 PostgreSQL 失败: {e}")
 
@@ -64,7 +58,6 @@ def _serve(cfg: MonitorConfig, consume: bool) -> None:
     db.prune(force=True)
     stop = threading.Event()
     if consume:
-        _need_pika()
         from paperlite.monitor.consumer import consume_forever
         threading.Thread(target=consume_forever, args=(cfg, db, stop), name="consumer", daemon=True).start()
     try:
@@ -87,26 +80,37 @@ def _serve(cfg: MonitorConfig, consume: bool) -> None:
         db.close()
 
 
-def _test(cfg: MonitorConfig) -> None:
-    _need_pika()
-    import pika
+def _test(cfg: MonitorConfig, wait_s: float = 5.0) -> None:
+    """写一条测试心跳到 events 表，再看面板有没有把它取走（取走 = 面板在消费）。"""
+    import psycopg
+    from psycopg.types.json import Jsonb
+    from paperlite.monitor import events
 
+    if not cfg.dsn:
+        raise SystemExit("没有监控用的 PostgreSQL：填 [monitor] dsn，或 [pg] dsn")
     msg = schema.envelope(schema.HEARTBEAT, time.time(), cfg.node_name, cfg.instance, "monitor-test",
                           cfg.vendor_name, {"mode": "test", "browsers_online": 0, "workers": 0,
                                             "pending": 0, "running": 0, "success": 0, "failed": 0})
     try:
-        conn = pika.BlockingConnection(cfg.amqp_params())
-        ch = conn.channel()
-        ch.exchange_declare(cfg.exchange, exchange_type="topic", durable=True)
-        ch.confirm_delivery()
-        ch.basic_publish(cfg.exchange, msg["type"], schema.encode(msg),
-                         pika.BasicProperties(content_type="application/json", delivery_mode=2), mandatory=True)
-        conn.close()
-    except pika.exceptions.UnroutableError:
-        raise SystemExit("已连上 RabbitMQ，但还没有面板队列绑定到该 exchange（先起 paperlite-monitor serve）")
+        with psycopg.connect(cfg.dsn, autocommit=True, connect_timeout=10) as conn:
+            events.use_schema(conn, cfg.schema, create=True)
+            event_id = conn.execute("INSERT INTO events (msg) VALUES (%s) RETURNING id", (Jsonb(msg),)).fetchone()[0]
+            deadline = time.monotonic() + wait_s
+            consumed = False
+            while time.monotonic() < deadline:
+                try:
+                    consumed = conn.execute("SELECT NOT EXISTS (SELECT 1 FROM events WHERE id = %s)",
+                                            (event_id,)).fetchone()[0]
+                except psycopg.errors.InsufficientPrivilege:
+                    break                                   # 只有写权限的终端账号：看不了，算写入成功
+                if consumed:
+                    break
+                time.sleep(0.5)
     except Exception as e:
-        raise SystemExit(f"连接/发送失败: {type(e).__name__}: {e}")
-    print(f"OK：测试心跳已送达 exchange={cfg.exchange}，终端 {cfg.instance}（面板「终端」表里会出现 batch=monitor-test）")
+        raise SystemExit(f"写入监控库失败: {type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}")
+    print(f"OK：测试心跳已写入 {_redact(cfg.dsn)} schema={cfg.schema}，终端 {cfg.instance}")
+    print("面板正在消费（「终端」表里会出现 batch=monitor-test）" if consumed
+          else f"面板 {wait_s:.0f}s 内没有取走它：面板没启动或看不到这张表；起 paperlite-monitor serve 后会补上")
 
 
 def demo_messages(now: float, days: int = 30, scale: int = 1) -> list[dict]:
@@ -179,24 +183,22 @@ def main(argv=None) -> None:
     ap.add_argument("--config", help="配置文件（读 [monitor] 段），默认同 paperlite")
     ap.add_argument("--log-level", default="INFO")
     sub = ap.add_subparsers(dest="cmd", required=True, metavar="<命令>")
-    for name, help_ in (("serve", "消费 RabbitMQ、入库并起大屏"), ("demo", "灌模拟数据并起大屏（不连 RabbitMQ）")):
+    for name, help_ in (("serve", "消费监控事件、汇总入库并起大屏"), ("demo", "灌模拟数据并起大屏")):
         p = sub.add_parser(name, help=help_)
         p.add_argument("--dsn", help="面板 PostgreSQL（覆盖 [monitor].dsn）")
         p.add_argument("--schema", help="面板表所在 schema（覆盖 [monitor].schema）")
         p.add_argument("--bind", help="监听地址（覆盖 [monitor].bind）")
         p.add_argument("--port", type=int, help="端口（覆盖 [monitor].port）")
         if name == "serve":
-            p.add_argument("--amqp", help="RabbitMQ 地址（覆盖 [monitor].amqp_url）")
             p.add_argument("--no-consume", action="store_true", help="只起大屏，不消费（看已有数据）")
         else:
             p.add_argument("--scale", type=int, default=1, help="模拟数据量倍数")
-    p = sub.add_parser("test", help="发一条测试心跳，验证终端到 RabbitMQ 的连通性")
-    p.add_argument("--amqp", help="RabbitMQ 地址（覆盖 [monitor].amqp_url）")
+    p = sub.add_parser("test", help="写一条测试心跳，验证终端能写进监控库、面板是否在消费")
+    p.add_argument("--dsn", help="监控用的 PostgreSQL（覆盖 [monitor].dsn）")
+    p.add_argument("--schema", help="监控表所在 schema（覆盖 [monitor].schema）")
     args = ap.parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)-7s %(message)s",
                         datefmt="%H:%M:%S", stream=sys.stdout)
-    for noisy in ("pika",):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
     cfg = _cfg(args)
     if args.cmd == "serve":
         _serve(cfg, consume=not args.no_consume)

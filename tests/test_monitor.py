@@ -1,5 +1,4 @@
-"""监控模块：配置、WAF 识别、埋点 no-op、入库聚合、HTTP 面板、浏览器模式埋点接线。
-RabbitMQ 端到端用例需 PAPERLITE_TEST_AMQP=amqp://... 才跑。"""
+"""监控模块：配置、WAF 识别、埋点 no-op、事件中转表、入库聚合、HTTP 面板、浏览器模式埋点接线、端到端（都在 PostgreSQL）。"""
 
 import asyncio
 import json
@@ -36,16 +35,20 @@ class MonitorConfigTest(unittest.TestCase):
         self.assertFalse(MonitorConfig().enabled)
         with self.assertRaises(ValueError):
             MonitorConfig.from_dict({"enable": True})
-        with self.assertRaises(ValueError):
-            MonitorConfig.from_dict({"enabled": True, "amqp_url": ""})
+        for old in ({"amqp_url": "amqp://x"}, {"exchange": "e"}, {"queue": "q"}, {"queue_max_length": 1}):
+            with self.assertRaisesRegex(ValueError, "RabbitMQ"):          # 旧配置：提示改连 PG
+                MonitorConfig.from_dict(old)
 
     def test_load_from_toml_and_missing_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "c.toml"
-            p.write_text('[monitor]\nenabled = true\namqp_url = "amqp://x"\nvendor = "qg"\n')
+            p.write_text('[pg]\ndsn = "postgresql://h/db"\nbatch = "b"\n[monitor]\nenabled = true\nvendor = "qg"\n')
             cfg = load_monitor(p)
             self.assertTrue(cfg.enabled)
-            self.assertEqual(cfg.vendor_name, "qg")
+            self.assertEqual((cfg.vendor_name, cfg.dsn, cfg.raw_retention_hours), ("qg", "postgresql://h/db", 6))
+            p.write_text('[monitor]\nenabled = true\n')
+            with self.assertRaisesRegex(ValueError, "PostgreSQL"):            # 开了监控却没有库
+                load_monitor(p)
             self.assertFalse(load_monitor(Path(tmp) / "none.toml").enabled)
 
     def test_dsn_falls_back_to_pg_section_and_db_removed(self):
@@ -119,7 +122,7 @@ class ReporterTest(unittest.TestCase):
         self.assertEqual([m["data"]["message"] for m in r._buf], ["提取 IP 失败"])
 
     def test_redact(self):
-        self.assertEqual(mon._redact("amqp://u:secret@h:5672/%2F"), "amqp://u:***@h:5672/%2F")
+        self.assertEqual(mon._redact("postgresql://u:secret@h:5432/db"), "postgresql://u:***@h:5432/db")
 
     def test_schema_rejects_unknown(self):
         with self.assertRaises(ValueError):
@@ -432,38 +435,65 @@ class ProxyCheckMonitorTest(unittest.TestCase):
         self.assertEqual((pc.call_args.args[0], pc.call_args.args[2]), (False, "slow_5000ms"))
 
 
-@unittest.skipUnless(os.environ.get("PAPERLITE_TEST_AMQP"), "设置 PAPERLITE_TEST_AMQP=amqp://... 才跑")
-class RabbitEndToEndTest(unittest.TestCase):
+@needs_pg
+class EventsEndToEndTest(unittest.TestCase):
+    """终端 → events 中转表 → 面板消费 → 汇总，全在 PostgreSQL。"""
+
     def test_publish_consume_aggregate(self):
         from paperlite.monitor.consumer import consume_forever
-        suffix = uuid.uuid4().hex[:8]
-        cfg = MonitorConfig(enabled=True, amqp_url=os.environ["PAPERLITE_TEST_AMQP"],
-                            exchange=f"pl-test-{suffix}", queue=f"pl-test-{suffix}", vendor="qg")
-        with tempfile.TemporaryDirectory() as tmp:
-            db = MonitorDB(Path(tmp) / "m.db")
-            stop = threading.Event()
-            t = threading.Thread(target=consume_forever, args=(cfg, db, stop), daemon=True)
-            t.start()
-            time.sleep(1.5)                              # 等队列声明好再发
-            mon.start(cfg, "e2e")
-            try:
-                mon.page("a.org", True, True, 200, "cloudflare", 1234)
-                mon.proxy_check(True, 300)
-                deadline = time.time() + 15
-                while time.time() < deadline and db.summary("1d")["pages"]["attempts"] < 1:
-                    time.sleep(0.3)
-                d = db.summary("1d")
-                self.assertEqual(d["pages"]["attempts"], 1)
-                self.assertEqual(d["vendors"][0]["vendor"], "qg")
-            finally:
-                mon.shutdown()
-                mon._reporter = mon.Reporter()
-                stop.set()
-                t.join(5)
-                import pika
-                conn = pika.BlockingConnection(pika.URLParameters(cfg.amqp_url))
-                ch = conn.channel()
-                ch.queue_delete(cfg.queue)
-                ch.exchange_delete(cfg.exchange)
-                conn.close()
-                db.close()
+        db = _monitor_db(self)
+        cfg = MonitorConfig(enabled=True, dsn=DSN, schema=db._schema, vendor="qg", flush_s=0.1)
+        stop = threading.Event()
+        t = threading.Thread(target=consume_forever, args=(cfg, db, stop), daemon=True)
+        t.start()
+        mon.start(cfg, "e2e")
+        try:
+            mon.page("a.org", True, True, 200, "cloudflare", 1234)
+            mon.proxy_check(True, 300)
+            deadline = time.time() + 15
+            while time.time() < deadline and db.summary("1d", cache_s=0)["pages"]["attempts"] < 1:
+                time.sleep(0.2)
+            d = db.summary("1d", cache_s=0)
+            self.assertEqual((d["pages"]["attempts"], d["ip"]["checked"]), (1, 1))
+            self.assertEqual(d["vendors"][0]["vendor"], "qg")
+            self.assertEqual(db.execute("SELECT count(*) n FROM events").fetchone()["n"], 0)   # 处理完就删
+        finally:
+            mon.shutdown()
+            mon._reporter = mon.Reporter()
+            stop.set()
+            t.join(5)
+
+    def test_consume_is_atomic_and_drops_invalid(self):
+        """取、写、删同一个事务：汇总写失败时这批事件留在表里，下次再处理；校验不过的直接丢弃。"""
+        from paperlite.monitor import events
+        db = _monitor_db(self)
+        with db._lock:
+            events.insert(db.conn, [page(time.time()), {"v": 9, "type": "page", "data": {}}])
+        with mock.patch.object(MonitorDB, "_ingest", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                db.consume()
+        self.assertEqual(db.execute("SELECT count(*) n FROM events").fetchone()["n"], 2)   # 回滚：一条没丢
+        self.assertEqual(db.consume(), 2)
+        self.assertEqual(db.summary("1d", cache_s=0)["pages"]["attempts"], 1)               # 坏的那条丢弃
+        self.assertEqual(db.execute("SELECT count(*) n FROM events").fetchone()["n"], 0)
+
+    def test_backlog_capped_when_dashboard_is_down(self):
+        from paperlite.monitor import events
+        db = _monitor_db(self)
+        db.backlog_max = 3
+        with db._lock:
+            events.insert(db.conn, [page(time.time() - i) for i in range(10)])
+        db.prune(force=True)
+        self.assertEqual(db.execute("SELECT count(*) n FROM events").fetchone()["n"], 3)    # 留最新的 3 条
+
+    def test_cli_test_command(self):
+        """paperlite-monitor test：写一条测试心跳；面板没在消费时也报告写入成功。"""
+        import contextlib, io
+        from paperlite.monitor import cli
+        db = _monitor_db(self)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli._test(MonitorConfig(dsn=DSN, schema=db._schema), wait_s=0.3)
+        self.assertIn("OK", buf.getvalue())
+        self.assertIn("没有取走", buf.getvalue())
+        self.assertEqual(db.consume(), 1)
