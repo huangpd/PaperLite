@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-paperlite/store.py
-────────────────────
+paperlite/curl/identity.py
+──────────────────────────
 curl 模式的身份池，存在 PostgreSQL（与任务队列同一个库、同一个 [pg] schema）：生产者和消费者只通过这里交互，
 可分属不同进程 / 机器。
 
@@ -33,7 +33,7 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from paperlite.cookies import jar_from_records, jar_to_records
+from paperlite.curl.cookies import jar_from_records, jar_to_records
 
 WORKER_STALE_S = 60   # 下载线程超过此时长无心跳即视为离线
 PENDING_STALE_S = 60  # 下载进程超过此时长未上报可领取任务数即视为离线，其上报作废
@@ -127,6 +127,7 @@ class IdentityStore:
                 self._conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
                 self._conn.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
             with self._conn.transaction():
+                # 锁名沿用旧模块名（pgqueue / store）：新旧版本同时连一个库时仍互斥，不要改
                 self._conn.execute("SELECT pg_advisory_xact_lock(hashtext('paperlite.store.schema'))")
                 self._conn.execute(_SCHEMA)
 

@@ -23,8 +23,8 @@ URL 文件 ────────▶ PostgreSQL 任务队列 ◀────�
 ```
 
 - 一份配置 = 一个批次（`[pg] batch`）。任务只存 PostgreSQL：进程按块领取（默认 1000 条）、带租约，块内在本地按顺序下载、结果攒批回写。一台机器和一百台机器是同一套机制。设计见 [PG 按块领取设计](pg-chunk-lease.md)。
-- worker（`browser_pool`、`consumer`）通过 `pgqueue.PgTaskSource` 的 `claim` / `finish` / `retry_later` / `challenged` 领任务、交结果，不直接写 SQL。
-- 浏览器模式不用身份池；curl 模式的生产者和下载线程只通过身份池（`store.py`）交换身份，没有直接调用。
+- worker（`browser.pool`、`curl.downloader`）通过 `taskq.PgTaskSource` 的 `claim` / `finish` / `retry_later` / `challenged` 领任务、交结果，不直接写 SQL。
+- 浏览器模式不用身份池；curl 模式的生产者和下载线程只通过身份池（`curl/identity.py`）交换身份，没有直接调用。
 - 身份池不存代理密码，只存 `ip:port`，下载线程用本地 `config.toml` 补鉴权。
 - 监控是旁路：业务代码只调用 `monitor.reporter` 的埋点函数，未启用时为空操作，绝不阻塞下载。
 
@@ -64,7 +64,7 @@ curl 模式的生产目标 = min(`max_identities`, 在线下载线程数, 可领
 
 ## 身份池在 PostgreSQL
 
-curl 模式的身份池（`store.py`）和任务队列在同一个库、同一个 `[pg]` schema，不需要另外部署别的服务：
+curl 模式的身份池（`curl/identity.py`）和任务队列在同一个库、同一个 `[pg]` schema，不需要另外部署别的服务：
 
 | 用途 | 表 / 做法 |
 |---|---|
@@ -116,7 +116,7 @@ curl 模式的身份池（`store.py`）和任务队列在同一个库、同一�
 
 ## 浏览器模式下载 PDF：拦截响应，流式写盘
 
-无界面 Chromium 打开 PDF 直链会把它当下载，`page.goto` 直接报错；靠"点下载按钮"又要按站点写规则。所以浏览器模式下 `url_type=pdf` 的任务用 CDP 的 Fetch 拦截（`pdf_capture.py`，参考 paper_downloader 的实现）：
+无界面 Chromium 打开 PDF 直链会把它当下载，`page.goto` 直接报错；靠"点下载按钮"又要按站点写规则。所以浏览器模式下 `url_type=pdf` 的任务用 CDP 的 Fetch 拦截（`browser/pdf_capture.py`，参考 paper_downloader 的实现）：
 
 - 打开前在页面上开拦截。途中任一响应的响应头是 PDF（`Content-Type` 含 pdf、`Content-Disposition` 是 `.pdf`），或地址像 PDF 且没说是 HTML，就用 `Fetch.takeResponseBodyAsStream` + `IO.read` 把响应体流式写盘，写完中止这个请求，浏览器不渲染、不下载它。明确是 HTML 的响应不截：`.pdf` 地址上也可能是挑战页或中转页。
 - 请求走的是浏览器自己的网络栈：同一 IP、同一 cookie、同一 TLS 指纹，过盾后的身份直接可用，不会因为换了下载工具再被挑战。

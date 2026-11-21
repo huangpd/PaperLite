@@ -1,7 +1,7 @@
-"""任务队列（paperlite.pgqueue，PostgreSQL 按块领取）。需要真实 PostgreSQL：
+"""任务队列（paperlite.taskq，PostgreSQL 按块领取）。需要真实 PostgreSQL：
 
     docker run -d --name paperlite-pg -e POSTGRES_PASSWORD=pl -e POSTGRES_DB=paperlite -p 5439:5432 postgres:16-alpine
-    PAPERLITE_TEST_PG=postgresql://postgres:pl@127.0.0.1:5439/paperlite uv run pytest tests/test_pgqueue.py
+    PAPERLITE_TEST_PG=postgresql://postgres:pl@127.0.0.1:5439/paperlite uv run pytest tests/test_taskq.py
 """
 
 import os
@@ -26,7 +26,7 @@ def _rows(n, hosts=("a.com",)):
 @unittest.skipUnless(DSN, "需要 PAPERLITE_TEST_PG")
 class PgQueueTest(unittest.TestCase):
     def setUp(self):
-        from paperlite import pgqueue
+        from paperlite import taskq as pgqueue
         self.pg = pgqueue
         self.schema = "t_" + uuid.uuid4().hex[:10]
         self.queues = []
@@ -189,7 +189,7 @@ class PgTaskSourceTest(unittest.TestCase):
     """PgTaskSource：给下载 worker 用的任务来源（按块领取、本地队列、攒批回写）。"""
 
     def setUp(self):
-        from paperlite import pgqueue
+        from paperlite import taskq as pgqueue
         self.pg = pgqueue
         self.schema = "s_" + uuid.uuid4().hex[:10]
         self.sources = []
@@ -298,9 +298,9 @@ class PgTaskSourceTest(unittest.TestCase):
 
     def test_curl_downloaders_on_three_machines_share_one_batch(self):
         """3 个 Downloader（模拟 3 台机器）各 2 线程，共享一个 PG 批次：每条恰好处理一次。"""
-        from tests.test_paperlite import FAKE_PDF, PROXY, FakeStore, Resp, ident
+        from tests.fakes import FAKE_PDF, PROXY, FakeStore, Resp, ident
         from paperlite.config import Limits
-        from paperlite.consumer import Downloader
+        from paperlite.curl.downloader import Downloader
 
         urls = [f"https://dl.acm.org/doi/pdf/10.1145/{i}" for i in range(30)]
         loader = self.src("loader")
@@ -343,9 +343,9 @@ class PgTaskSourceTest(unittest.TestCase):
 
     def test_browser_pools_on_two_machines_share_one_batch(self):
         """浏览器模式：2 个 BrowserPool（模拟 2 台机器）各 2 个浏览器；标题各不相同，巡检开着也不跳过任何任务。"""
-        from tests.test_paperlite import PROXY
-        from paperlite import browser_pool as bp
-        from paperlite.browser import RenderResult
+        from tests.fakes import PROXY
+        from paperlite.browser import pool as bp
+        from paperlite.browser.session import RenderResult
         from paperlite.config import Limits
         from paperlite.proxy import Lease
 
@@ -419,9 +419,9 @@ class PgTaskSourceTest(unittest.TestCase):
 
     def test_browser_title_dup_skips_rest_in_chunk(self):
         """浏览器模式块内巡检：一段 URL 全是同一个"Deleted DOI"页，触发后本块里剩下的同前缀任务不再渲染。"""
-        from tests.test_paperlite import PROXY
-        from paperlite import browser_pool as bp
-        from paperlite.browser import RenderResult
+        from tests.fakes import PROXY
+        from paperlite.browser import pool as bp
+        from paperlite.browser.session import RenderResult
         from paperlite.config import Limits
         from paperlite.proxy import Lease
 

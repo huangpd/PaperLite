@@ -4,7 +4,7 @@
 paperlite/tasks.py
 ────────────────────
 任务的公共定义：状态、链接类型、错误分类、Task，以及任务身份规则（URL 规范化、url_key、DOI 推导、文件路径）。
-存储在 pgqueue.py（PostgreSQL）；本模块不碰数据库。
+存储在 taskq/（PostgreSQL）；本模块不碰数据库。
 
 与 paper_downloader 的 PostgreSQL paper_pdf_resources 同名同义：
   - url_key = sha256(规范化 url)，唯一；重复导入不会重置已有任务

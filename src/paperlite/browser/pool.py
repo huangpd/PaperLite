@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-paperlite/browser_pool.py
-───────────────────────────
+paperlite/browser/pool.py
+─────────────────────────
 浏览器下载模式：每个 worker = 一个独立 CloakBrowser + 一个独立出口 IP。
 浏览器启动后不热身，直接打开领到的第一篇（探针）：打开了就说明这个 IP 能用，之后在同一浏览器里连续下多篇，
 每篇之间按 page_interval_s 随机间隔（默认 10–30s）以避开同域名频率限制。IP 临近过期就关掉浏览器、换新 IP 重开。
@@ -31,14 +31,14 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
-from paperlite.browser import BrowserSession
+from paperlite.browser.session import BrowserSession
 from paperlite.classify import classify_html
 from paperlite.config import Limits
-from paperlite.inspect import WindowInspector
+from paperlite.taskq.title_dup import WindowInspector
 from paperlite.logutil import log_event
 from paperlite.monitor import reporter as mon
 from paperlite.proxy import IpSource, Lease, ProxySettings, ProxyUnavailable
-from paperlite.pgqueue import PgTaskSource
+from paperlite.taskq import PgTaskSource
 from paperlite.tasks import Status, Task, UrlType, pdf_path
 
 logger = logging.getLogger(__name__)
@@ -92,7 +92,7 @@ class BrowserPool:
         self.stats = BrowserStats()
         self._drained = threading.Event()      # 所有任务领完
         self._live: set[str] = set()           # 当前开着浏览器的 worker（监控：在线浏览器数）
-        # db 是 pgqueue.PgTaskSource：巡检只跳本机领到的块
+        # db 是 taskq.PgTaskSource：巡检只跳本机领到的块
         self.inspector = (WindowInspector(db, cfg.title_dup_trigger, cfg.rule_min_precision,
                                           cfg.rule_min_support, cfg.title_window_size)
                           if cfg.title_dup_trigger else None)

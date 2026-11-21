@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 内部
+
+- 代码按功能分包，行为不变：任务队列进 `taskq/`（`queue.py` 放 SQL、`source.py` 放 worker 侧、`title_dup.py` 巡检），浏览器模式进 `browser/`（`session` / `pool` / `pdf_capture` / `turnstile`），curl 模式进 `curl/`（`producer` / `downloader` / `identity` / `cookies`）；`monitor/consumer.py` 改名 `ingest.py`。命令、配置不变；PG 里的锁名保持不变，新旧版本可以同时连一个库。测试按模块拆分。
+
 ## [0.3.0] - 2026-11-21
 
 ### 不兼容变更

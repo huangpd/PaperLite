@@ -29,7 +29,7 @@ def new_schema(test: unittest.TestCase) -> str:
 def make_source(test: unittest.TestCase, batch: str = "t", schema: str | None = None, worker: str = "w",
                 **kw):
     """一个独立 schema 上的 PgTaskSource。默认每条结果立即回写（flush_n=1），断言时不用等缓冲。"""
-    from paperlite.pgqueue import PgTaskQueue, PgTaskSource
+    from paperlite.taskq import PgTaskQueue, PgTaskSource
     schema = schema or new_schema(test)
     q = PgTaskQueue(DSN, batch, schema=schema, worker=worker)
     kw.setdefault("flush_n", 1)
@@ -40,7 +40,7 @@ def make_source(test: unittest.TestCase, batch: str = "t", schema: str | None = 
 
 def rows(src) -> list[dict]:
     """当前批次全部任务（导出列），按 id。"""
-    from paperlite.pgqueue import PgTaskQueue
+    from paperlite.taskq import PgTaskQueue
     return [dict(zip(PgTaskQueue.EXPORT_COLUMNS, r)) for r in src.q.rows()]
 
 
@@ -61,7 +61,7 @@ def pg_config(schema: str, batch: str = "t", extra: str = "") -> str:
 
 def make_store(test: unittest.TestCase, schema: str | None = None):
     """一个独立 schema 上的身份池（curl 模式）。"""
-    from paperlite.store import IdentityStore
+    from paperlite.curl.identity import IdentityStore
     store = IdentityStore(DSN, schema=schema or new_schema(test))
     test.addCleanup(store.close)
     return store

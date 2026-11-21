@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-paperlite/producer.py
-───────────────────────
-生产者：按需提取新 IP → 浏览器过盾 → 身份写入身份池（store.py，PostgreSQL）。
+paperlite/curl/producer.py
+──────────────────────────
+生产者：按需提取新 IP → 浏览器过盾 → 身份写入身份池（curl/identity.py，PostgreSQL）。
 
 消费者驱动：目标健康身份数 = min(max_identities, 在线下载线程数, 可领取任务数)。
 一个身份同一时间只给一个下载线程用，所以既不多于线程，也不多于剩下的活；没有在线下载线程、
 或任务已领完时目标为 0，不再过盾（不设"预热保底"：没人消费的身份只会白白耗掉 IP）。
-可领取任务数由各下载进程上报到身份池（store.report_pending）；没有任何上报（旧版下载进程）时只按线程数。
+可领取任务数由各下载进程上报到身份池（identity.report_pending）；没有任何上报（旧版下载进程）时只按线程数。
 健康 = 剩余寿命 > refill_before_s，所以在用身份临近过期前就会开始生产替补。
 过盾失败的 IP 直接丢弃：同一 IP 重试很少能过，换 IP 更快。
 对冲：实测成功的过盾多在 30s 内，卡住的（Turnstile 一直 "Verifying…"）会耗满超时；
@@ -25,12 +25,12 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from paperlite.browser import pass_challenge
+from paperlite.browser.session import pass_challenge
 from paperlite.config import Limits
-from paperlite.consumer import is_cf_denied, is_challenge, rate_limit_wait, session_for_identity
-from paperlite.cookies import jar_from_records
+from paperlite.curl.downloader import is_cf_denied, is_challenge, rate_limit_wait, session_for_identity
+from paperlite.curl.cookies import jar_from_records
 from paperlite.proxy import IpSource, ProxyUnavailable
-from paperlite.store import Identity, IdentityStore
+from paperlite.curl.identity import Identity, IdentityStore
 
 logger = logging.getLogger(__name__)
 

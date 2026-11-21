@@ -1,20 +1,18 @@
 import json
-import os
 import threading
 import time
 import unittest
-import uuid
 from http.cookiejar import CookieJar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 from urllib.parse import urlsplit
 
 from paperlite.config import Limits
-from paperlite.consumer import session_for_identity
-from paperlite.cookies import jar_from_records, jar_to_records
-from paperlite.producer import Producer
+from paperlite.curl.downloader import session_for_identity
+from paperlite.curl.cookies import jar_from_records, jar_to_records
+from paperlite.curl.producer import Producer
 from paperlite.proxy import ProxySettings
-from paperlite.store import Identity
+from paperlite.curl.identity import Identity
 from tests.pgutil import identity_row, make_store, needs_pg
 
 

@@ -2,24 +2,34 @@
 
 ```
 src/paperlite/
+  # 根目录：共享内核，两种模式都用；这里的模块不 import 下面的子包（cli 除外）
   cli.py              命令行入口：子命令解析、run / import / status / retry / export / inspect
   config.py           配置加载与校验：[pg] [proxy] [paths] [limits] [run]
   config.example.toml paperlite init 生成的配置模板
-  tasks.py            任务的公共定义：状态、错误分类、Task、URL 规范化、DOI 推导、文件路径（不碰数据库）
-  pgqueue.py          任务队列（PostgreSQL）：导入、切块、按块领取、租约、批量回写、重试、导出、巡检；
-                      PgTaskSource 是给下载 worker 的任务来源
-  browser_pool.py     浏览器模式：每个 worker 一个浏览器 + 一个 IP，过盾后连续下载
-  browser.py          单次过盾：经代理启动独立的 CloakBrowser 进程；BrowserSession.render 打开页面，要 PDF 时开拦截
-  pdf_capture.py      浏览器模式下载 PDF：CDP Fetch 拦截 PDF 响应、流式写盘、校验
-  turnstile.py        Turnstile 定位、点击与 token 服务
-  producer.py         curl 模式：按消费生产身份，控制过盾并发与熔断
-  store.py            curl 模式：身份池（PostgreSQL UNLOGGED 表，SKIP LOCKED 领用、租约、生产者锁）
-  consumer.py         curl 模式：下载线程、流式下载、身份健康判定
-  cookies.py          浏览器 / 身份池 cookie 记录与 CookieJar 互转
-  inspect.py          重复标题规则归纳
+  tasks.py            任务的公共定义：状态、错误分类、Task、URL 规范化与校验、DOI 推导、文件路径（不碰数据库）
   classify.py         non-PDF 分类：not_found、paywall、landing_page、blocked
   proxy.py            代理提取与分层体检（TCP / TLS / TTFB / 总耗时）
-  monitor/            指标上报（未启用时为空操作，按批写进 PG 的 events 表）与 paperlite-monitor 面板（取走、汇总）
+  logutil.py          日志格式（text / json）
+
+  taskq/              任务队列（PostgreSQL，按块领取）
+    queue.py          PgTaskQueue：全部 SQL —— 建表、导入、切块、领块 / 续租 / 回写、重试、导出、跳过规则
+    source.py         PgTaskSource + LeaseKeeper：下载 worker 这一侧（本地队列、攒批回写、后台续租）
+    title_dup.py      巡检：同标题重复 → 归纳 doi/url 规则、跳过疑似失效的任务
+
+  browser/            浏览器模式（默认）
+    session.py        单个浏览器：经代理启动 CloakBrowser、过盾、render 打开页面（要 PDF 时开拦截）、地理库
+    pool.py           worker 池：每个 worker 一个浏览器 + 一个 IP，首篇探测、换 IP、结果回写
+    pdf_capture.py    PDF 下载：CDP Fetch 拦截 PDF 响应、流式写盘、校验
+    turnstile.py      Turnstile 定位、点击与 token 服务
+
+  curl/               curl 模式
+    producer.py       生产者：按消费生产身份，控制过盾并发与熔断（过盾借用 browser.session）
+    downloader.py     下载线程：流式下载、身份健康判定
+    identity.py       身份池（PostgreSQL UNLOGGED 表，SKIP LOCKED 领用、租约、生产者锁），只有 curl 模式用
+    cookies.py        浏览器 / 身份池 cookie 记录与 CookieJar 互转
+
+  monitor/            监控：上报端（reporter / events / schema，未启用时为空操作）+ paperlite-monitor 面板
+                      （ingest 取走汇总、db 查询、dashboard 页面）
 tests/                pytest 测试（unittest 风格）
 tools/bench_pg_chunks.py  PG 队列调度压测：按块领取 vs 逐条领取
 deploy/pg/            PostgreSQL docker-compose
@@ -28,9 +38,11 @@ docs/                 文档
 
 ## 模块之间的关系
 
-- **任务队列**：`cli._open_db` 读 `[pg]` 返回 `pgqueue.PgTaskSource`，下面的 worker 都通过它领任务、回写结果。
-- **浏览器模式**：`cli` → `browser_pool` → `browser`（过盾）+ 任务队列（领任务、回写）+ `inspect`（巡检）。
-- **curl 模式**：`producer`（`browser` 过盾 → `store` 入池）与 `consumer`（`store` 领身份 + 任务队列领任务）只通过身份池交换数据。
+- **依赖方向**：`cli` → `browser` / `curl` / `taskq` → 根目录的共享模块 → `monitor.reporter`。反方向不允许；
+  `curl` 对 `browser` 的依赖只有过盾和一次性渲染（`browser.session`）。
+- **任务队列**：`cli._open_db` 读 `[pg]` 返回 `taskq.PgTaskSource`，下面的 worker 都通过它领任务、回写结果。
+- **浏览器模式**：`cli` → `browser.pool` → `browser.session`（过盾、渲染）+ 任务队列（领任务、回写）+ `taskq.title_dup`（巡检）。
+- **curl 模式**：`curl.producer`（`browser.session` 过盾 → `curl.identity` 入池）与 `curl.downloader`（`curl.identity` 领身份 + 任务队列领任务）只通过身份池交换数据。
 - **监控**：业务代码只调用 `monitor.reporter` 的 `page` / `browser_start` / `proxy_check`，心跳由 `cli` 挂上。
 
 设计取舍见[架构与设计说明](architecture.md)。

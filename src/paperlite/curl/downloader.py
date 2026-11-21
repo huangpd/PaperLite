@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-paperlite/consumer.py
-───────────────────────
-消费者：从 PostgreSQL 任务队列领任务、从身份池（store.py）领身份，用 curl_cffi 带 cookie、经同一出口 IP 下载 PDF 或网页（url_type=html 存 .html）。
+paperlite/curl/downloader.py
+────────────────────────────
+消费者：从 PostgreSQL 任务队列领任务、从身份池（curl/identity.py）领身份，用 curl_cffi 带 cookie、经同一出口 IP 下载 PDF 或网页（url_type=html 存 .html）。
 
 - 每个下载线程独占一个身份（IP+cookie），同一 IP 两次请求随机间隔 request_gap_s；
 - 线程只在有活可干（有 pending 任务）时登记心跳，生产者据此决定要多少身份；只剩别的线程的在途任务时
@@ -48,8 +48,8 @@ from curl_cffi import requests as curl_requests
 from paperlite.classify import classify_html, page_title
 from paperlite.config import Limits
 from paperlite.proxy import ProxySettings
-from paperlite.store import Identity, IdentityStore
-from paperlite.pgqueue import PgTaskSource
+from paperlite.curl.identity import Identity, IdentityStore
+from paperlite.taskq import PgTaskSource
 from paperlite.tasks import Status, Task, UrlType, pdf_path, url_host
 
 logger = logging.getLogger(__name__)
@@ -461,7 +461,7 @@ class Downloader:
 
     def _render_page(self, task: Task, ident: Identity, url: str, t0: float) -> tuple[bool, str]:
         """浏览器兜底：经身份的出口打开 url，跟完跳转、过挑战后保存；失败计一次重试（challenge_failed）。"""
-        from paperlite.browser import render_page
+        from paperlite.browser.session import render_page
 
         logger.info("网页跳到 %s 被挑战，改用浏览器: %s", url_host(url), task.url)
         with self._browser_slots:
