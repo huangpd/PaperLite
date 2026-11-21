@@ -183,6 +183,19 @@ def _read_csv_clustered(path: str):
         con.close()
 
 
+def _url_type(args) -> str:
+    """导入的默认链接类型：命令行 --type > 配置文件 [run] url_type > pdf。
+    以前 import 不写 --type 就固定是 pdf，和配置里写的 url_type = "html" 对不上，整批类型会记错。"""
+    if getattr(args, "type", None):
+        return args.type
+    try:
+        return config_mod.load_run(config_mod.resolve_path(args.config)).url_type
+    except FileNotFoundError:
+        return UrlType.PDF
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"配置错误: {e}")
+
+
 def _import(db: PgTaskSource, path: str, source: str = "", batch: str = "", url_type: str = UrlType.PDF) -> None:
     """url_type 是整批的默认类型；CSV 里的 url_type 列逐行覆盖。"""
     rows = ({**r, "source": r.get("source") or source, "batch_no": r.get("batch_no") or batch,
@@ -240,7 +253,7 @@ class _ProducerThread:
 def _download(args, cfg, proxy, store, with_producer: bool) -> None:
     db = _open_db(args)
     if args.urls:
-        _import(db, args.urls, url_type=args.type)
+        _import(db, args.urls, url_type=_url_type(args))
     hs = db.hosts()
     if len(hs) > 1:
         db.close()
@@ -400,7 +413,7 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
     """浏览器下载模式：每个浏览器+IP 过盾一次后连续下同域名多篇（整页存 .html）。不用 Redis 身份池。"""
     db = _open_db(args)
     if args.urls:
-        _import(db, args.urls, url_type=args.type)
+        _import(db, args.urls, url_type=_url_type(args))
     out = _storage_dir(args, _paths(args))
     try:
         pool = BrowserPool(cfg, proxy, db, out, args.workers, no_proxy=no_proxy)
@@ -428,8 +441,8 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
             monitor.close()
         db.close()
     s = pool.stats
-    logger.info("结束: 用时 %.1f 分钟，success %d，failed %d，启动浏览器 %d 个",
-                (time.monotonic() - t0) / 60, s.success, s.failed, s.browsers)
+    logger.info("结束: 用时 %.1f 分钟，success %d，non_pdf %d，failed %d，启动浏览器 %d 个",
+                (time.monotonic() - t0) / 60, s.success, s.non_pdf, s.failed, s.browsers)
 
 
 def _inspect(args) -> None:
@@ -469,11 +482,11 @@ def _browse_report(pool: BrowserPool, cfg: Limits, stop: threading.Event) -> Non
     while not stop.wait(30):
         c = pool.db.counts()
         now = time.monotonic()
-        done = s.success + s.failed
+        done = s.success + s.non_pdf + s.failed
         rate = (done - last_done) / max((now - last_t) / 60, 1e-9)
         last_done, last_t = done, now
-        logger.info("进度: 成功 %d 失败 %d 待下载 %d running %d | 浏览器 %d | 近 30s %.0f 篇/分钟",
-                    s.success, s.failed, c[Status.PENDING], c[Status.RUNNING], pool.workers, rate)
+        logger.info("进度: 成功 %d non_pdf %d 失败 %d 待下载 %d running %d | 浏览器 %d | 近 30s %.0f 篇/分钟",
+                    s.success, s.non_pdf, s.failed, c[Status.PENDING], c[Status.RUNNING], pool.workers, rate)
 
 
 def _raise_interrupt(signum, frame):
@@ -556,19 +569,20 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 url 列的 CSV；多主机可混")
     p.add_argument("--source", default="", help="写入 source")
     p.add_argument("--batch", default="", help="写入 batch_no")
-    p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="链接类型：pdf = 要 PDF 文件（默认）；html = 要网页本身，整页存为 .html。CSV 的 url_type 列逐行覆盖")
+    p.add_argument("--type", choices=UrlType.ALL, help="链接类型：pdf = 要 PDF 文件；html = 要网页本身，整页存为 .html。"
+                   "不写时取配置文件 [run] url_type（没有则 pdf）；CSV 的 url_type 列逐行覆盖")
     p = cmd("produce")
     p = cmd("download")
     p.add_argument("--storage", help="输出目录 PDF/HTML（覆盖 [paths].storage）；可挂载")
     p.add_argument("--urls", help="先导入这个文件（可选）")
-    p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
+    p.add_argument("--type", choices=UrlType.ALL, help="--urls 的链接类型，同 import --type")
     p.add_argument("--workers", type=int, default=20, help="下载线程数 = 同时在用的身份数，默认 20")
     p = cmd("run")
     p.add_argument("config_file", nargs="?", metavar="[配置文件]",
                    help="给了就按它的 [run] 段启动（paperlite run config.toml），其余 run 参数忽略；省略则用下面的参数临时跑")
     p.add_argument("--storage", help="输出目录 PDF/HTML（覆盖 [paths].storage）；可挂载")
     p.add_argument("--urls", help="先导入这个文件（可选）")
-    p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
+    p.add_argument("--type", choices=UrlType.ALL, help="--urls 的链接类型，同 import --type")
     p.add_argument("--workers", type=int, default=20,
                    help="并发数：浏览器模式 = 同时打开的浏览器数；--curl 模式 = 下载线程/身份数。默认 20")
     g = p.add_mutually_exclusive_group()
@@ -656,7 +670,7 @@ def main() -> None:
     if args.cmd == "import":
         db = _open_db(args)
         try:
-            _import(db, args.urls, args.source, args.batch, args.type)
+            _import(db, args.urls, args.source, args.batch, _url_type(args))
             logger.info("任务队列 %s", db.path)
         finally:
             db.close()

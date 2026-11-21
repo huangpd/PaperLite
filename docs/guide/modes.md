@@ -12,7 +12,7 @@ PaperLite 有两种下载方式，共用同一个 PostgreSQL 任务队列、存�
 |---|---|---|
 | 工作方式 | N 个 worker，各自独占浏览器与 IP，过盾一次后连续下载 | 浏览器过盾后把 IP + cookie + UA 存入身份池，`curl_cffi` 线程领用下载 |
 | 每批次主机数 | 任意混合 | 仅限一个 |
-| 跳转 / 网页 | 自动跟随，网页保存为 `.html` | 跟随 HTTP 跳转与中转页的 meta refresh；`url_type=html` 整页保存；跳到别的主机被挑战时改用浏览器打开 |
+| PDF / 网页 | 都能下。`url_type=pdf`：拦截浏览器收到的 PDF 响应，流式写盘（校验同 curl 模式）；最后停在网页上（摘要页、订阅页）记 `non_pdf`，网页存到 `non_pdf/`。`url_type=html`：整页存为 `.html`。都会自动跟随跳转 | 跟随 HTTP 跳转与中转页的 meta refresh；`url_type=html` 整页保存；跳到别的主机被挑战时改用浏览器打开 |
 | 外部依赖 | 无 | Redis（身份池） |
 | 巡检（重复标题跳过） | 有 | 无 |
 | 资源占用 | 每个 worker 一个浏览器进程 | 浏览器只用来过盾，下载线程很轻 |

@@ -9,7 +9,8 @@ src/paperlite/
   pgqueue.py          任务队列（PostgreSQL）：导入、切块、按块领取、租约、批量回写、重试、导出、巡检；
                       PgTaskSource 是给下载 worker 的任务来源
   browser_pool.py     浏览器模式：每个 worker 一个浏览器 + 一个 IP，过盾后连续下载
-  browser.py          单次过盾：经代理启动独立的 CloakBrowser 进程
+  browser.py          单次过盾：经代理启动独立的 CloakBrowser 进程；BrowserSession.render 打开页面，要 PDF 时开拦截
+  pdf_capture.py      浏览器模式下载 PDF：CDP Fetch 拦截 PDF 响应、流式写盘、校验
   turnstile.py        Turnstile 定位、点击与 token 服务
   producer.py         curl 模式：按消费生产身份，控制过盾并发与熔断
   store.py            curl 模式：Redis 身份池（Lua 原子领用、租约、生产者锁）

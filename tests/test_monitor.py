@@ -402,7 +402,7 @@ class BrowserPoolMonitorWiringTest(unittest.TestCase):
                 pass
             async def start(s):
                 pass
-            async def render(s, url, timeout_s, settle_s=2.0):
+            async def render(s, url, timeout_s, settle_s=2.0, **kw):
                 seen.append(pool.online())
                 return RenderResult(ok=True, seconds=1, status=200, url=url, title="T", html="x", waf="none")
             async def close(s):

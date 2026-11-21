@@ -358,7 +358,7 @@ class PgTaskSourceTest(unittest.TestCase):
                 pass
             async def start(s):
                 pass
-            async def render(s, url, timeout_s, settle_s=2.0):
+            async def render(s, url, timeout_s, settle_s=2.0, **kw):
                 with lock:
                     hits[url] = hits.get(url, 0) + 1
                 return RenderResult(ok=True, seconds=0.1, url=url, status=200, title=f"P{url}", html="<html/>")
@@ -436,7 +436,7 @@ class PgTaskSourceTest(unittest.TestCase):
                 pass
             async def start(s):
                 pass
-            async def render(s, url, timeout_s, settle_s=2.0):
+            async def render(s, url, timeout_s, settle_s=2.0, **kw):
                 if "/pii/" in url:
                     rendered.append(url)
                 title = "Deleted DOI" if "/pii/A" in url else f"Paper {url[-3:]}"
