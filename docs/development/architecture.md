@@ -64,7 +64,7 @@ curl 模式的生产目标 = min(`max_identities`, 在线下载线程数, 可领
 
 ## 身份池在 PostgreSQL
 
-curl 模式的身份池（`store.py`）和任务队列在同一个库、同一个 `[pg]` schema，不需要另外部署 Redis：
+curl 模式的身份池（`store.py`）和任务队列在同一个库、同一个 `[pg]` schema，不需要另外部署别的服务：
 
 | 用途 | 表 / 做法 |
 |---|---|
@@ -76,7 +76,7 @@ curl 模式的身份池（`store.py`）和任务队列在同一个库、同一�
 
 ## 只依赖 PostgreSQL
 
-任务队列、curl 模式的身份池、监控都在同一个 PostgreSQL 里，不需要 Redis、RabbitMQ：
+任务队列、curl 模式的身份池、监控都在同一个 PostgreSQL 里，不需要其他中间件：
 
 - 任务：`[pg] schema` 的 `pl_tasks` / `pl_chunks` / `pl_skip_rules`。
 - 身份池：同一 schema 的 `pl_identities` 等 UNLOGGED 表（见上）。

@@ -1,5 +1,5 @@
 """
-监控事件的中转表（替代原来的 RabbitMQ）：上报端按批 INSERT，面板端在一个事务里取走（DELETE … RETURNING）、汇总入库。
+监控事件的中转表：上报端按批 INSERT，面板端在一个事务里取走（DELETE … RETURNING）、汇总入库。
 
   events   UNLOGGED：内容只在两端之间停留几秒，不写 WAL；PG 崩溃最多丢这几秒的指标。
            面板长期不开时由面板的 prune 按 backlog_max 截掉最旧的。

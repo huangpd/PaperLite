@@ -8,7 +8,7 @@
 2. 环境变量 `PAPERLITE_CONFIG`
 3. 当前目录的 `config.toml`
 
-写了不认识的段或字段会直接报错，防止拼写错误被静默忽略。旧版的 `[queue]`、`[landing]`、`[paths] db`、`[limits] redis_url` / `key_prefix`、`[run] pg`、`[limits] volume_stop_after`、`[monitor] db` / `amqp_url` / `exchange` / `queue` / `queue_max_length` 会报错并提示怎么改。
+写了不认识的段或字段会直接报错，防止拼写错误被静默忽略。旧版已移除的字段（任务库路径、后端切换、热身页、卷期停止、外部中间件的连接地址等）也会报错，并提示删掉哪几行、改成什么。
 
 命令行覆盖：`--storage`（`run`、`download` 可用）优先于 `[paths].storage`。给 `run` 传入配置文件时以 `[run]` 段为准，命令行上的其他 `run` 参数会被忽略。
 

@@ -101,7 +101,7 @@ class Limits:
     def from_dict(cls, raw: dict[str, Any]) -> "Limits":
         for old in ("redis_url", "key_prefix"):
             if old in raw:
-                raise ValueError(f"[limits] {old} 已移除：curl 模式的身份池改存 PostgreSQL（与任务队列同一个 [pg]），删掉这一行即可")
+                raise ValueError(f"[limits] {old} 已移除：curl 模式的身份池在 PostgreSQL（与任务队列同一个 [pg]），删掉这一行即可")
         if "volume_stop_after" in raw:
             raise ValueError("[limits] volume_stop_after 已移除（卷期停止只适用 ACM 式 DOI，不通用），删掉这一行即可")
         _reject_unknown("limits", raw, cls)

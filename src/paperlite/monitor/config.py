@@ -38,7 +38,7 @@ class MonitorConfig:
             raise ValueError("[monitor] db 已移除：面板改存 PostgreSQL（[monitor] dsn，留空则用 [pg] 的 dsn），删掉 db 即可")
         old = sorted(set(raw) & {"amqp_url", "exchange", "queue", "queue_max_length"})
         if old:
-            raise ValueError(f"[monitor] {', '.join(old)} 已移除：监控不再用 RabbitMQ，上报和面板都直接连 PostgreSQL"
+            raise ValueError(f"[monitor] {', '.join(old)} 已移除：监控的上报和面板都直接连 PostgreSQL"
                              "（[monitor] dsn，留空则用 [pg] 的 dsn），删掉这几行即可")
         known = {f.name for f in fields(cls)}
         unknown = set(raw) - known

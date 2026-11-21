@@ -247,7 +247,7 @@ SELECT count(*) FROM events;      -- 待处理事件：面板在跑时应接近 
 | `retention_days` | `30` | 面板 | 小时汇总保留天数 |
 | `raw_retention_hours` | `6` | 面板 | 原始事件保留小时数 |
 
-旧版的 `amqp_url`、`exchange`、`queue`、`queue_max_length`、`db` 写了会报错并提示删掉。
+旧版已移除的配置项写了会报错，并提示删掉哪几行。
 
 ## 日常运维
 

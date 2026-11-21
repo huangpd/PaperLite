@@ -201,7 +201,7 @@ class MonitorDB:
             for t in ("page_h", "browser_h", "proxy_h", "proxy_reason_h", "fleet_h"):
                 n += self.execute(f"DELETE FROM {t} WHERE hour < ?", (hour_cut,)).rowcount
             n += self.execute("DELETE FROM instance WHERE last_seen < ?", (cut,)).rowcount
-            # 面板长期没开、中转表积压太多：丢最旧的（与原来 RabbitMQ 队列的 drop-head 一样）
+            # 面板长期没开、中转表积压太多：丢最旧的
             n += self.execute("DELETE FROM events WHERE id <= (SELECT max(id) FROM events) - ?",
                               (self.backlog_max,)).rowcount
         self._cache.clear()

@@ -36,7 +36,7 @@ class MonitorConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             MonitorConfig.from_dict({"enable": True})
         for old in ({"amqp_url": "amqp://x"}, {"exchange": "e"}, {"queue": "q"}, {"queue_max_length": 1}):
-            with self.assertRaisesRegex(ValueError, "RabbitMQ"):          # 旧配置：提示改连 PG
+            with self.assertRaisesRegex(ValueError, "PostgreSQL"):        # 旧配置：提示改连 PG
                 MonitorConfig.from_dict(old)
 
     def test_load_from_toml_and_missing_file(self):

@@ -23,7 +23,7 @@ uv run paperlite <命令>                   # 运行；子命令见 docs/referen
 **两种模式**（`run` 默认 browser，`--curl` 切 curl）：
 
 - **浏览器模式**（主，`browser_pool.py`）：N 个 worker 各独占一个浏览器+IP，过盾后串行领任务下载。**不用身份池**。各种主机混在一个库里，每页各自过盾、跟跳转。
-- **curl 模式**（`consumer.py` + `producer.py` + `store.py`，经身份池握手，无直接调用）：`producer` 按"健康身份数 vs 在线下载线程数 vs 可领取任务数"开浏览器过盾攒身份进身份池；`consumer` 下载线程从任务队列领任务、从 `store.py` 领身份。身份池在 PostgreSQL（与任务队列同一个 `[pg]`，UNLOGGED 表 `pl_identities` / `pl_id_hosts` / `pl_id_workers` / `pl_id_pending`；`FOR UPDATE SKIP LOCKED` 领取、`holder` + `lease_until` 租约、续租和归还都校验 `holder`），不再用 Redis，别加回来。身份池不存代理密码，只存 `ip:port`，消费者用本地 `config.toml` 补鉴权。须单主机。
+- **curl 模式**（`consumer.py` + `producer.py` + `store.py`，经身份池握手，无直接调用）：`producer` 按"健康身份数 vs 在线下载线程数 vs 可领取任务数"开浏览器过盾攒身份进身份池；`consumer` 下载线程从任务队列领任务、从 `store.py` 领身份。身份池在 PostgreSQL（与任务队列同一个 `[pg]`，UNLOGGED 表 `pl_identities` / `pl_id_hosts` / `pl_id_workers` / `pl_id_pending`；`FOR UPDATE SKIP LOCKED` 领取、`holder` + `lease_until` 租约、续租和归还都校验 `holder`），不要再引入别的中间件。身份池不存代理密码，只存 `ip:port`，消费者用本地 `config.toml` 补鉴权。须单主机。
 
 **配置结构**（`config.py`）：`[pg]`(dataclass `PgConfig`，必填)=任务队列；`[proxy]`=代理；`[limits]`(dataclass `Limits`)=并发与行为；`[paths]`(dataclass `Paths`)=`storage`/`log_dir`；`[run]`=启动参数（mode 默认 browser）。命令行 `--storage` 覆盖。没有 `--db`/`--pg`/`--out`/`--host`/站点概念；旧字段（`[paths] db`、`[queue]`、`[run] pg`、`volume_stop_after`、`[monitor] db`）会报错提示。
 
@@ -39,7 +39,7 @@ uv run paperlite <命令>                   # 运行；子命令见 docs/referen
 - 按块领取（`pgqueue.py`）：领块不改任务状态（库里没有 running），回写只改仍是 pending 的行（至少一次、重复无害）；要重试的留在 pending 写 `next_attempt_at`，块做完由 `requeue_leftovers` 切进下一代；租约丢了放弃本地剩余任务。详见 pg-chunk-lease.md。
 - 巡检（`inspect.py` + `pgqueue.py` 的 `skip_reason`/`pl_skip_rules`）：浏览器模式下，任何**真加载出来**的页（成功页 + 404 等失效页，`browser_pool._observe` 在成功和 404 分支都喂、不喂 `r.ok=False` 的过盾超时页）标题重复到 `title_dup_trigger` 次就归纳规则。候选取 doi/url 最长公共前缀及其 `_coarsen`（限 `_MAX_COARSEN` 位，防退化成 `/pii/S`），选规则**偏最具体**（最长前缀）而非命中最多，用已采数据验 precision/support 达标才标 pending 跳过。只看内存滑动窗口，按 `(doi_prefix, url_prefix)` 去重，只跳本机领到的块（`PgTaskSource.flag_suspects`）；`paperlite inspect` 另对全批次做（`PgTaskQueue.flag_suspects`）——详见 docs/development/postmortems.md。
 
-**监控（`monitor/`）是旁路**：业务代码只调 `monitor.reporter` 的 `page`/`browser_start`/`proxy_check`（未启用时 no-op、不连库；启用后按批写进 PG 的 `paperlite_monitor.events`，面板 `MonitorDB.consume` 一个事务里取走、汇总、删掉；不再用 RabbitMQ），心跳由 `cli._attach_monitor` 挂上。改监控绝不能让下载阻塞或抛错；新增埋点只加一行调用，别把业务逻辑搬进 monitor。指标口径（按尝试计、耗时只算已加载页、WAF = 站点前面是哪家）见 `docs/guide/monitoring.md`「指标口径」，部署见同一文档。面板查询只读小时汇总表（`*_h`），别改回扫原始事件表——那是 30 天 52 秒的旧方案。
+**监控（`monitor/`）是旁路**：业务代码只调 `monitor.reporter` 的 `page`/`browser_start`/`proxy_check`（未启用时 no-op、不连库；启用后按批写进 PG 的 `paperlite_monitor.events`，面板 `MonitorDB.consume` 一个事务里取走、汇总、删掉；不要再引入别的中间件），心跳由 `cli._attach_monitor` 挂上。改监控绝不能让下载阻塞或抛错；新增埋点只加一行调用，别把业务逻辑搬进 monitor。指标口径（按尝试计、耗时只算已加载页、WAF = 站点前面是哪家）见 `docs/guide/monitoring.md`「指标口径」，部署见同一文档。面板查询只读小时汇总表（`*_h`），别改回扫原始事件表——那是 30 天 52 秒的旧方案。
 
 ## 约束
 
