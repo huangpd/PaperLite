@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-PaperLite 是从 `paper_downloader/cookie_pool/` 拆出的独立项目：大批量 PDF/网页下载（过 Cloudflare）。**一份 config = 一个批次**（`[pg] batch`），各种主机的 URL 混进一个 PostgreSQL 任务队列，默认用**浏览器模式**统一跑（每浏览器+IP 过盾后连续下、跟跳转、整页存 `.html`，不用 Redis）。另有 **curl 模式**（单主机 cookie 池：浏览器过盾存 cookie、curl_cffi 领用批量下，用 Redis），日常少用。**任务只存 PostgreSQL**（单机多机同一套实现，不要再加第二种存储）：`pgqueue.PgTaskQueue` 放全部 SQL（导入、切块、领块、续租、回写、reset、rows、全批次巡检），`pgqueue.PgTaskSource` 是给 worker 的任务来源（按块领取 → 本地队列 → 攒批回写）；`cli._open_db` 读 `[pg]` 建它们。一台和一百台机器是同一套机制。`tasks.py` 只剩公共定义（Status、ERROR_KINDS、Task、url_key、derive_doi、pdf_path），不碰数据库。输出在 `[paths] storage`（可挂载）。监控面板数据也在 PG（`[monitor] dsn`，留空用 `[pg] dsn`；schema `paperlite_monitor`）。
+PaperLite 是从 `paper_downloader/cookie_pool/` 拆出的独立项目：大批量 PDF/网页下载（过 Cloudflare）。**一份 config = 一个批次**（`[pg] batch`），各种主机的 URL 混进一个 PostgreSQL 任务队列，默认用**浏览器模式**统一跑（每浏览器+IP 过盾后连续下、跟跳转、整页存 `.html`，不用 Redis）。另有 **curl 模式**（单主机 cookie 池：浏览器过盾存 cookie、curl_cffi 领用批量下，用 Redis），日常少用。**任务只存 PostgreSQL**（单机多机同一套实现，不要再加第二种存储）：`pgqueue.PgTaskQueue` 放全部 SQL（导入、切块、领块、续租、回写、reset、rows、全批次巡检），`pgqueue.PgTaskSource` 是给 worker 的任务来源（按块领取 → 本地队列 → 攒批回写）；`cli._open_db` 读 `[pg]` 建它们。一台和一百台机器是同一套机制。`tasks.py` 只剩公共定义（Status、ERROR_KINDS、Task、url_key、derive_doi、pdf_path、`url_problem`），不碰数据库；`url_problem` 在导入时剔除明显坏的链接（内网 IP、非法主机名），只拦明显坏的，公网 IP 放行。输出在 `[paths] storage`（可挂载）。监控面板数据也在 PG（`[monitor] dsn`，留空用 `[pg] dsn`；schema `paperlite_monitor`）。
 
 文档：`README.md` / `README.zh-CN.md` 只是概览（中英同步）；详细文档在 `docs/`（索引 `docs/README.md`）——`docs/reference/`（配置、命令、任务库表结构）、`docs/guide/`（运行模式、部署 PostgreSQL、多机部署、运维、监控、Turnstile、故障排查）、`docs/development/pg-chunk-lease.md`（按块领取设计）、`docs/development/architecture.md`（设计取舍）、`docs/development/postmortems.md`（踩过的坑）。`docs/getting-started.md` 中英两份同步，其余 docs 只写中文。改动涉及过盾/熔断/巡检/按块领取的行为语义时，先读 architecture.md 对应小节——那里写明了"为什么这样设计"，别无意中改回被否决的方案。改了命令、参数或配置字段，同步更新 `docs/reference/` 与 `config.example.toml`，并在 `CHANGELOG.md` 的 Unreleased 下记一笔。
 
@@ -28,7 +28,9 @@ uv run paperlite <命令>                   # 运行；子命令见 docs/referen
 
 **配置结构**（`config.py`）：`[pg]`(dataclass `PgConfig`，必填)=任务队列；`[proxy]`=代理；`[limits]`(dataclass `Limits`)=并发与行为；`[paths]`(dataclass `Paths`)=`storage`/`log_dir`；`[run]`=启动参数（mode 默认 browser）。命令行 `--storage` 覆盖。没有 `--db`/`--pg`/`--out`/`--host`/站点概念；旧字段（`[paths] db`、`[queue]`、`[run] pg`、`volume_stop_after`、`[monitor] db`）会报错提示。
 
-**身份坏不坏的判定是核心陷阱**（见 docs/development/postmortems.md 与 architecture.md）：带有效 cookie 仍被挑战时，**先用落地页验身份**——落地页正常说明只是这条 URL 被站点单独盯上（`challenge_count+1` 排后面），落地页也被挑战才算身份坏、丢弃。不要用"下一条也被挑战"来判身份，被盯上的论文成批相邻会误杀好身份。
+**身份坏不坏的判定是核心陷阱**（见 docs/development/postmortems.md 与 architecture.md）：带有效 cookie 仍被挑战时，**先用参照链接验身份**（最近下载成功的链接，没有时用首页；不再有配置的落地页）——参照正常说明只是这条 URL 被站点单独盯上（`challenge_count+1` 排后面），参照也打不开才算身份坏、丢弃。不要用"下一条也被挑战"来判身份，被盯上的论文成批相邻会误杀好身份。
+
+**浏览器模式不热身**：新浏览器领到的第一篇就是探针（`browser_pool._do_task(probe=True)`），首篇失败任务放回不计次数、换 IP；同一主机连续 `_PROBE_STREAK` 个新浏览器首篇失败就按站点问题正常计次，别改成无限换 IP。
 
 **易改错的行为语义**，动之前先对齐 architecture.md / postmortems.md：
 

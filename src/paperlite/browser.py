@@ -3,7 +3,7 @@
 """
 paperlite/browser.py
 ──────────────────────
-用一个独立 CloakBrowser 进程经指定代理打开落地页，等 Cloudflare 挑战通过后导出 cookie。
+用一个独立 CloakBrowser 进程经指定代理打开站点页面（curl 模式的生产者用站点首页），等 Cloudflare 挑战通过后导出 cookie。
 遇到交互式 Turnstile（复选框）时自动点击，见 paperlite/turnstile.py。
 
 每次过盾单独 launch：CloakBrowser 的指纹种子（--fingerprint）是启动参数，同一进程内所有 context 共用，

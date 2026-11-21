@@ -36,6 +36,7 @@ from paperlite.cookies import jar_from_records, jar_to_records
 
 WORKER_STALE_S = 60   # 下载线程超过此时长无心跳即视为离线
 PENDING_STALE_S = 60  # 下载进程超过此时长未上报可领取任务数即视为离线，其上报作废
+_GOOD_URL_TTL_S = 86400            # 最近成功链接保留一天：批次停了很久再跑时它可能已不代表现状
 
 # 原子地取出一个剩余寿命 ≥ min_left 的空闲身份（优先最早过期的，先用掉快过期的），转入 inuse 并加占用锁。
 _CLAIM_LUA = """
@@ -245,6 +246,13 @@ class IdentityStore:
 
     def note_success(self, host: str) -> None:
         self.r.set(self._k(host, "fresh_rejects"), 0)
+
+    def note_good_url(self, host: str, url: str) -> None:
+        """记下该主机最近一次下载成功的链接（各下载进程共享）：生产者验收新身份、消费者复验身份时拿它当参照。"""
+        self.r.set(self._k(host, "good_url"), url, ex=_GOOD_URL_TTL_S)
+
+    def good_url(self, host: str) -> Optional[str]:
+        return self.r.get(self._k(host, "good_url"))
 
     def note_fresh_reject(self, host: str) -> int:
         return int(self.r.incr(self._k(host, "fresh_rejects")))

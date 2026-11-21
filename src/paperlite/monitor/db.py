@@ -373,22 +373,18 @@ class MonitorDB:
         return sorted(vendors.values(), key=lambda v: -v["attempts"])
 
     def _waf(self, q, rows: list[dict], h0, h1) -> list[dict]:
-        """过盾：页面采集 + 浏览器热身落地页（不含启动异常），凡识别出 WAF 的都算一次；passed = 页面真加载出来。"""
+        """过盾：页面采集里凡识别出 WAF 的都算一次；passed = 页面真加载出来。
+        浏览器不再热身，新浏览器的首篇本身就是一次页面采集，不再另加浏览器启动的记录（否则会重复计数）。"""
         pages: dict[str, dict] = defaultdict(lambda: {"n": 0, "passed": 0, "ms": 0.0})
         hists = defaultdict(list)
         for x in rows:
             p = pages[x["waf"]]
             p["n"] += x["n"]; p["passed"] += x["passed"]; p["ms"] += x["ms_sum"] or 0
             hists[x["waf"]].append(x["hist"])
-        land = {x["waf"]: x for x in q(
-            "SELECT waf, SUM(n) n, SUM(ok) ok, SUM(s_sum) s FROM browser_h WHERE hour >= ? AND hour < ? "
-            "AND kind != 'exception' GROUP BY waf", (h0, h1)).fetchall()}
         out = []
         for w in schema.WAFS:
-            p, b = pages.get(w), land.get(w)     # pages 是 defaultdict，.get 不会凭空建键
-            n = (p["n"] if p else 0) + (b["n"] if b else 0)
-            passed = (p["passed"] if p else 0) + (b["ok"] if b else 0)
-            ms = (p["ms"] or 0 if p else 0) + ((b["s"] or 0) * 1000 if b else 0)
+            p = pages.get(w)                     # pages 是 defaultdict，.get 不会凭空建键
+            n, passed, ms = (p["n"], p["passed"], p["ms"]) if p else (0, 0, 0.0)
             out.append({"waf": w, "attempts": n, "passed": passed, "pass_rate": _rate(passed, n),
                         "avg_ms": _div(ms, passed), "p95_ms": _pct(_merge(hists.get(w, [])), 0.95)})
         return out

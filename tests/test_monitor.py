@@ -162,7 +162,8 @@ class MonitorDBTest(unittest.TestCase):
         self.assertEqual([x["host"] for x in d["domains"]], ["a.org"])
         self.assertEqual(self.db.summary("7d", now=now)["pages"]["attempts"], 5)
 
-    def test_waf_buckets_include_browser_landing(self):
+    def test_waf_buckets_count_pages_only(self):
+        """浏览器不热身后，新浏览器首篇本身就是一次页面采集；浏览器启动记录不再算进 WAF，避免重复计数。"""
         now = self.now
         self.db.ingest([
             page(now, waf="cloudflare"), page(now, waf="datadome", passed=False, ok=False),
@@ -175,7 +176,7 @@ class MonitorDBTest(unittest.TestCase):
         w = {x["waf"]: x for x in self.db.summary("1d", now=now)["waf"]}
         self.assertEqual((w["cloudflare"]["attempts"], w["cloudflare"]["pass_rate"]), (1, 1.0))
         self.assertEqual((w["datadome"]["attempts"], w["datadome"]["pass_rate"]), (1, 0.0))
-        self.assertEqual((w["aws_waf"]["attempts"], w["aws_waf"]["avg_ms"]), (1, 20000))
+        self.assertEqual((w["aws_waf"]["attempts"], w["aws_waf"]["avg_ms"]), (0, None))
         b = self.db.summary("1d", now=now)["browser"]
         self.assertEqual((b["starts"], b["start_ok"], b["exceptions"]), (2, 1, 1))
 
@@ -413,7 +414,7 @@ class BrowserPoolMonitorWiringTest(unittest.TestCase):
             pool = bp.BrowserPool(Limits(page_interval_s=(0, 0)), None, self.db, Path(self.tmp.name) / "o",
                                   workers=1, no_proxy=True)
             pool.run()
-        self.assertEqual(seen, [0, 1, 1])               # 落地页时还没算在线；之后两篇都在线
+        self.assertEqual(seen, [0, 1])                  # 首篇（探针）时还没算在线；首篇打开后第二篇算在线
         self.assertEqual(pool.online(), 0)              # 收工后归零
         self.assertEqual(bs.call_args.args[:2], (True, "ok"))
 

@@ -170,7 +170,7 @@ class RedisCookieReplayTest(unittest.TestCase):
         ips = mock.Mock()
         ips.s = self.proxy
         producer = Producer(Limits(), self.store, ips, original.host)
-        producer.landing = "http://dl.example.test/renew"
+        producer.home = "http://dl.example.test/renew"          # 还没有成功链接、也没有队列：用首页验收
         self.assertTrue(producer._curl_usable(original))
         self.store.add(original)
         claimed = self.store.claim(original.host, "worker", 20, 60)

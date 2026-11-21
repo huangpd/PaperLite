@@ -16,6 +16,7 @@ paperlite/tasks.py
 """
 
 import hashlib
+import ipaddress
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,7 @@ ERROR_KINDS = ("not_found", "paywall", "landing_page", "blocked", "network", "se
 
 _DOI_IN_PATH_RE = re.compile(r"(10\.\d{4,9}/[^\s?#]+)", re.IGNORECASE)
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_LABEL_RE = re.compile(r"^(?!-)[a-z0-9_-]{1,63}(?<!-)$")     # 域名的一段（IDN 已是 xn-- 形式；下划线浏览器能访问，放行）
 _MAX_STEM_LEN = 180
 
 
@@ -82,6 +84,40 @@ def derive_doi(url: str) -> str:
     if m:
         return re.sub(r"(?:\.pdf|/)$", "", m.group(1), flags=re.IGNORECASE).lower()
     return f"url-{url_key(url).hex()[:16]}"
+
+
+def url_problem(url: str) -> str | None:
+    """
+    明显下载不到的链接返回原因，正常返回 None。导入时据此直接剔除，不入库、不占下载队列。
+    只拦明显坏的（来自 doi.org 登记数据里出版商填错的地址），公网 IP 形式的主机放行——有些小期刊就是 IP 建站：
+      bad_scheme    不是 http / https
+      no_host       没有主机名（http://、http:///x）
+      private_ip    内网 / 本机 / 保留地址：10.x、172.16–31.x、192.168.x、127.x、169.254.x、0.x 等
+      bad_host      主机名不合法：以点开头或结尾（https://.asm.org/…）、没有点（http://0、http://null、
+                    https://opgadmin/…）、含非法字符、空段、顶级域是纯数字
+    """
+    try:
+        p = urlsplit(url.strip())
+        host = p.hostname or ""
+        p.port                                # 端口不是数字时这里抛 ValueError
+    except ValueError:                        # 端口不合法、IPv6 方括号不配对等
+        return "bad_host"
+    if p.scheme.lower() not in ("http", "https"):
+        return "bad_scheme"
+    if not host:
+        return "no_host"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        return "private_ip" if not ip.is_global else None
+    if host.endswith(".") and not host.endswith(".."):
+        host = host[:-1]                      # example.com. 是合法的完整域名写法
+    labels = host.split(".")
+    if len(labels) < 2 or any(not _LABEL_RE.match(x) for x in labels) or labels[-1].isdigit():
+        return "bad_host"
+    return None
 
 
 def pdf_path(base_dir: Path, doi: str, suffix: str = ".pdf") -> Path:

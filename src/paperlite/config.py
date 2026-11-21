@@ -13,14 +13,13 @@ paperlite/config.py
   [limits]   并发与行为（浏览器数、过盾超时、请求间隔、熔断、巡检阈值……）
   [paths]    位置：storage（输出 PDF/HTML，可挂载）、log_dir
   [run]      paperlite run config.toml 时的启动参数
-  [landing]  主机 → 过盾落地页（可选）
   [monitor]  监控上报与面板（可选，见 monitor/config.py）
 """
 
 import os
 import tomllib
 from importlib import resources
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -83,7 +82,6 @@ class Limits:
     debug_dir: str = ""               # 过盾失败截图目录，空则不截图
     max_fresh_rejects: int = 5        # 连续这么多个新身份一篇没下成就被拒 → 熔断暂停生产
     breaker_pause_s: float = 600      # 熔断暂停时长；之后放一个身份试探
-    landing: dict[str, str] = field(default_factory=dict)   # 主机 → 过盾落地页
     # 消费
     min_left_s: float = 20            # 身份剩余寿命低于此值不再发请求
     lease_ttl_s: float = 120          # 下载线程占用身份的心跳 TTL；进程崩溃后到期自动归还
@@ -101,11 +99,8 @@ class Limits:
     rule_min_precision: float = 0.98  # 归纳出的规则在已采数据上的最低精确率，防止把真文章误标
     rule_min_support: int = 10        # 规则在已采数据上的最低命中数
 
-    def landing_for(self, host: str) -> str:
-        return self.landing.get(host) or f"https://{host}/"
-
     @classmethod
-    def from_dict(cls, raw: dict[str, Any], landing: dict[str, str] | None = None) -> "Limits":
+    def from_dict(cls, raw: dict[str, Any]) -> "Limits":
         if "volume_stop_after" in raw:
             raise ValueError("[limits] volume_stop_after 已移除（卷期停止只适用 ACM 式 DOI，不通用），删掉这一行即可")
         _reject_unknown("limits", raw, cls)
@@ -122,7 +117,6 @@ class Limits:
             raise ValueError("title_dup_trigger 不能小于 0")
         if trigger and window < trigger:
             raise ValueError("title_window_size 不能小于 title_dup_trigger")
-        kwargs["landing"] = {str(k).lower(): str(v) for k, v in (landing or {}).items()}
         return cls(**kwargs)
 
 
@@ -194,16 +188,18 @@ def _read(path: Path) -> dict[str, Any]:
                                 f"或用 --config / 环境变量 {CONFIG_ENV} 指定）")
     with open(path, "rb") as f:
         raw = tomllib.load(f)
+    if "landing" in raw:
+        raise ValueError("[landing] 已移除：不再用固定落地页热身，浏览器直接拿队列里的真实链接过盾，删掉 [landing] 即可")
     if "queue" in raw:
         raise ValueError("[queue] 已移除：任务队列只用 PostgreSQL（[pg] 段），删掉 [queue] 即可")
-    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "landing", "monitor", "pg"})   # [monitor] 见 monitor/config.py
+    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "monitor", "pg"})   # [monitor] 见 monitor/config.py
     return raw
 
 
 def load_limits(path: Path | None = None) -> Limits:
-    """只读 [limits] / [landing]，不校验代理。"""
+    """只读 [limits]，不校验代理。"""
     raw = _read(path or resolve_path())
-    return Limits.from_dict(raw.get("limits", {}), raw.get("landing", {}))
+    return Limits.from_dict(raw.get("limits", {}))
 
 
 def load_paths(path: Path | None = None) -> Paths:
@@ -215,7 +211,7 @@ def load_paths(path: Path | None = None) -> Paths:
 def load(path: Path | None = None) -> tuple[Limits, ProxySettings]:
     """读 [limits] + [proxy]（校验代理）。run / produce / download 用。"""
     raw = _read(path or resolve_path())
-    return (Limits.from_dict(raw.get("limits", {}), raw.get("landing", {})),
+    return (Limits.from_dict(raw.get("limits", {})),
             proxy_settings(raw.get("proxy", {})))
 
 
@@ -234,7 +230,7 @@ def load_pg(path: Path | None = None) -> PgConfig:
 
 
 def _reject_unknown(section: str, raw: dict, cls, allowed: set[str] | None = None) -> None:
-    known = allowed if allowed is not None else {f.name for f in fields(cls)} - {"landing"}
+    known = allowed if allowed is not None else {f.name for f in fields(cls)}
     unknown = set(raw) - known
     if unknown:
         raise ValueError(f"[{section}] 有不支持的配置项: {', '.join(sorted(unknown))}")

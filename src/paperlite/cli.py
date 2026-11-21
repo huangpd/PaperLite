@@ -193,15 +193,36 @@ def _import(db: PgTaskSource, path: str, source: str = "", batch: str = "", url_
     except ValueError as e:
         raise SystemExit(str(e))
     logger.info("导入 %s：新增 %d，已存在 %d（已存在的不重置）", path, added, existed)
+    _report_rejected(path, db.q.last_rejected)
+
+
+def _report_rejected(path: str, rejected: list) -> None:
+    """明显坏的链接没入库：按原因打一行日志，明细写到输入文件旁边的 <文件名>.bad_url.csv。"""
+    if not rejected:
+        return
+    from collections import Counter
+    by = Counter(reason for _, reason in rejected)
+    out = Path(path).with_name(Path(path).name + ".bad_url.csv")
+    try:
+        with open(out, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["doi", "url", "reason"])
+            for r, reason in rejected:
+                w.writerow([r.get("doi") or r.get("paper_uid") or "", r.get("url") or r.get("pdf_url") or "", reason])
+        where = f"，明细见 {out}"
+    except OSError as e:
+        where = f"（明细写不了 {out}: {e}）"
+    logger.warning("剔除明显下载不到的链接 %d 条，未入库：%s%s", len(rejected),
+                   "，".join(f"{k} {n}" for k, n in by.most_common()), where)
 
 
 class _ProducerThread:
     """后台线程跑生产者。结束用 finished 事件判断：信号打断 Thread.join() 后 is_alive() 可能误报已结束。"""
 
-    def __init__(self, cfg, store, proxy, host) -> None:
+    def __init__(self, cfg, store, proxy, host, sample_url=None) -> None:
         self.stop = threading.Event()
         self.finished = threading.Event()
-        self._producer = Producer(cfg, store, IpSource(proxy), host)
+        self._producer = Producer(cfg, store, IpSource(proxy), host, sample_url=sample_url)
         threading.Thread(target=self._run, name="producer", daemon=True).start()
 
     def _run(self) -> None:
@@ -238,7 +259,8 @@ def _download(args, cfg, proxy, store, with_producer: bool) -> None:
     if not c[Status.PENDING]:
         db.close()
         return
-    producer = _ProducerThread(cfg, store, proxy, dl.host) if with_producer else None
+    producer = (_ProducerThread(cfg, store, proxy, dl.host, sample_url=lambda: db.q.sample_pending_url(dl.host))
+                if with_producer else None)
     stop = threading.Event()
     threading.Thread(target=_report, args=(dl, store, cfg, stop), daemon=True, name="report").start()
     monitor = _attach_monitor(args, lambda: _snapshot("curl", dl.db, dl.stats, 0, args.workers))
@@ -681,15 +703,17 @@ def main() -> None:
     if args.cmd == "produce":
         db = _open_db(args)
         host = db.host()
-        db.close()
         if not host:
+            db.close()
             raise SystemExit("任务队列是空的，先 import")
-        producer = _ProducerThread(cfg, store, proxy, host)
+        producer = _ProducerThread(cfg, store, proxy, host, sample_url=lambda: db.q.sample_pending_url(host))
         try:
             while not producer.finished.wait(1):
                 pass
         except KeyboardInterrupt:
             producer.shutdown(cfg.pass_timeout_s + 30)
+        finally:
+            db.close()
     else:
         _download(args, cfg, proxy, store, with_producer=args.cmd == "run")
 

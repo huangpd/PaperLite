@@ -20,7 +20,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
-from .tasks import ERROR_KINDS, Status, Task, UrlType, derive_doi, url_host, url_key
+from .tasks import ERROR_KINDS, Status, Task, UrlType, derive_doi, url_host, url_key, url_problem
 
 import psycopg
 from psycopg import sql
@@ -152,6 +152,7 @@ class PgTaskQueue:
     def __init__(self, dsn: str, batch: str, *, schema: Optional[str] = None, worker: str = "") -> None:
         self.batch = batch
         self.worker = worker
+        self.last_rejected: list[tuple[dict, str]] = []    # 最近一次 import_urls 剔除的 (原始行, 原因)
         self._lock = threading.Lock()
         self._conn = psycopg.connect(dsn, autocommit=True)
         with self._lock:
@@ -173,8 +174,10 @@ class PgTaskQueue:
         """
         rows：dict，含 url（或 pdf_url），可选 doi / source / batch_no / url_type。先 COPY 进临时表，
         再按 (host, doi) 排序插入：id 顺序即领取顺序，导入前不需要排序。返回 (新增, 已存在)。
+        明显下载不到的链接（内网 IP、主机名不合法等，见 tasks.url_problem）不入库，记在 last_rejected 里。
         """
         seen = 0
+        self.last_rejected = []
         with self._lock, self._conn.transaction():
             c = self._conn
             c.execute("CREATE TEMP TABLE pl_import (url_key bytea, doi text, url text, url_type text, host text, "
@@ -182,9 +185,11 @@ class PgTaskQueue:
             with c.cursor().copy("COPY pl_import FROM STDIN") as cp:
                 for r in rows:
                     url = (r.get("url") or r.get("pdf_url") or "").strip()
+                    problem = url_problem(url)
+                    if problem:
+                        self.last_rejected.append((r, problem))
+                        continue
                     h = url_host(url)
-                    if not h:
-                        raise ValueError(f"不是有效链接: {url}")
                     doi = (r.get("doi") or r.get("paper_uid") or "").strip().lower() or derive_doi(url)
                     kind = (r.get("url_type") or UrlType.PDF).strip().lower()
                     if kind not in UrlType.ALL:
@@ -410,6 +415,17 @@ class PgTaskQueue:
             where += " AND left(url, %s) = %s"; args += [len(url_prefix), url_prefix]
         return where, args
 
+    def sample_pending_url(self, host: str) -> Optional[str]:
+        """该主机一条还没下载、也没被挑战过的链接（从待领 / 领取中的块里取，走块索引，不扫全表）。
+        curl 模式的生产者在批次刚开始、还没有成功链接时，用它验收新身份。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT t.url FROM pl_chunks k JOIN pl_tasks t ON t.chunk_id = k.chunk_id "
+                "WHERE k.batch = %s AND k.host = %s AND k.status IN ('queued', 'leased') "
+                "AND t.status = 'pending' AND t.skip_reason IS NULL AND t.challenge_count = 0 LIMIT 1",
+                (self.batch, host)).fetchone()
+        return row[0] if row else None
+
     def crawled_titles(self, cap: int = 100_000) -> list[tuple[str, str, str]]:
         """已采成功任务的 (doi, url, title)，供巡检归纳；超量按 id 取前 cap 条。"""
         with self._lock:
@@ -498,8 +514,8 @@ class PgTaskQueue:
         return QueueStats(tasks, chunks)
 
     def hosts(self) -> list[str]:
-        """本批次的主机，任务多的在前。第一个用作浏览器热身 / curl 模式的主机：不能按排序取第一个——
-        数据里混进一条 https://.asm.org/… 这样的坏链接，就会让整个批次的热身都失败。"""
+        """本批次的主机，任务多的在前。第一个用作 curl 模式的主机和日志 / 监控里的主机标签：不按排序取第一个——
+        数据里混进一条 https://.asm.org/… 这样的坏链接时，排序第一的就是它。"""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT host FROM pl_chunks WHERE batch = %s GROUP BY host ORDER BY sum(size) DESC, host",

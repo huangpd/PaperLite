@@ -20,7 +20,7 @@ from paperlite.logutil import JsonFormatter
 from paperlite.producer import Producer
 from paperlite.proxy import Lease, ProxySettings, parse_deadline
 from paperlite.store import Identity
-from paperlite.tasks import Status, UrlType, derive_doi, pdf_path, url_key
+from paperlite.tasks import Status, UrlType, derive_doi, pdf_path, url_key, url_problem
 from tests.pgutil import DSN, execute, make_source, needs_pg, new_schema, pg_config, row as pg_row, rows as pg_rows
 
 FAKE_PDF = b"%PDF-1.4\n" + b"0" * 2048          # 超过最小文件大小（1024 字节）
@@ -38,10 +38,8 @@ def ident(**kw) -> Identity:
 
 class ConfigTest(unittest.TestCase):
     def test_from_dict(self):
-        cfg = Limits.from_dict({"request_gap_s": [1, 2]}, landing={"DL.ACM.ORG": "https://x/"})
+        cfg = Limits.from_dict({"request_gap_s": [1, 2]})
         self.assertEqual(cfg.request_gap_s, (1.0, 2.0))
-        self.assertEqual(cfg.landing_for("dl.acm.org"), "https://x/")
-        self.assertEqual(cfg.landing_for("other.org"), "https://other.org/")
 
     def test_rejects_unknown_and_bad_gap(self):
         with self.assertRaises(ValueError):
@@ -129,10 +127,14 @@ class ConfigTest(unittest.TestCase):
     def test_load_file(self):
         from paperlite.config import load
         with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
-            f.write('[proxy]\napi_url = "https://a/"\n[limits]\nmax_browsers = 3\n[landing]\n"h.org" = "https://h.org/x"\n')
+            f.write('[proxy]\napi_url = "https://a/"\n[limits]\nmax_browsers = 3\n')
         try:
             cfg, proxy = load(Path(f.name))
-            self.assertEqual((cfg.max_browsers, cfg.landing_for("h.org"), proxy.api_url), (3, "https://h.org/x", "https://a/"))
+            self.assertEqual((cfg.max_browsers, proxy.api_url), (3, "https://a/"))
+            with open(f.name, "a") as g:
+                g.write('[landing]\n"h.org" = "https://h.org/x"\n')
+            with self.assertRaisesRegex(ValueError, r"\[landing\] 已移除"):      # 不再有固定落地页
+                load(Path(f.name))
         finally:
             os.unlink(f.name)
 
@@ -187,6 +189,41 @@ class IdentityRulesTest(unittest.TestCase):
         self.assertEqual(len(p.parent.name), 2)              # out/<h0:2>/<h2:4>/
         self.assertEqual(url_key("HTTPS://DL.ACM.org/a#x"), url_key("https://dl.acm.org/a"))
         self.assertNotEqual(url_key("https://dl.acm.org/A"), url_key("https://dl.acm.org/a"))
+
+
+class UrlProblemTest(unittest.TestCase):
+    """导入时剔除明显下载不到的链接（来自 hw1 两个批次里的真实坏数据）。"""
+
+    def test_obviously_bad(self):
+        cases = {
+            "https://10.65.16.77/index.php/sociobiology/article/view/3300": "private_ip",
+            "http://192.168.1.111/index.php/ForoEducacional/article/view/779": "private_ip",
+            "https://192.168.7.25:443/index.php/assc/article/view/6870": "private_ip",
+            "http://172.20.1.1/a": "private_ip",
+            "http://127.0.0.1/a": "private_ip",
+            "http://[::1]/a": "private_ip",
+            "https://.asm.org/content/177/11/3358": "bad_host",
+            "http://0": "bad_host",
+            "http://null/10.1017/S0022112011000036": "bad_host",
+            "http://http://sociologiaitaliana.egeaonline.it/it/21": "bad_host",
+            "https://opgadmin/oe/abstract.cfm?doi=10.1364/OE.473012": "bad_host",
+            "https://x..org/a": "bad_host",
+            "http://x.org:abc/": "bad_host",
+            "ftp://ftp.example.org/a.pdf": "bad_scheme",
+            "http:///path": "no_host",
+            "": "bad_scheme",
+        }
+        for url, reason in cases.items():
+            self.assertEqual(url_problem(url), reason, url)
+
+    def test_normal_kept(self):
+        for url in ("https://www.sciencedirect.com/science/article/pii/S0092867424000011",
+                    "https://linkinghub.elsevier.com/retrieve/pii/0001691855900019",
+                    "HTTPS://WWW.Nature.COM/articles/x", "https://example.com./a", "https://a_b.example.com/x",
+                    "https://xn--fiqs8s.cn/a",
+                    "http://219.238.6.200/x", "http://155.206.11.181:90/content/x",     # 公网 IP 建站：放行
+                    "http://10040.indexcopernicus.com/abstracted.php?level=5&ICID=1138423"):   # 合法但打不开：交给下载
+            self.assertIsNone(url_problem(url), url)
 
 
 @needs_pg
@@ -442,6 +479,16 @@ class TaskSourceTest(unittest.TestCase):
         got = sorted((r["doi"], r["source"], r["batch_no"]) for r in pg_rows(self.db))
         self.assertEqual(got, [("10.1145/2", None, None), ("10.9999/custom", "s", "b7")])   # doi 转小写
 
+    def test_bad_urls_rejected_not_imported(self):
+        rows = [{"url": "https://dl.acm.org/doi/pdf/10.1145/1", "doi": "10.1145/1"},
+                {"url": "https://10.65.16.77/a", "doi": "10.13102/x"},
+                {"url": "https://.asm.org/content/1", "doi": "10.1128/y"},
+                {"url": "", "doi": "10.1/empty"}]
+        self.assertEqual(self.db.import_urls(rows), (1, 0))                 # 坏的不算新增也不算已存在
+        self.assertEqual([reason for _, reason in self.db.q.last_rejected], ["private_ip", "bad_host", "bad_scheme"])
+        self.assertEqual([r["doi"] for r in pg_rows(self.db)], ["10.1145/1"])
+        self.assertEqual(self.db.hosts(), ["dl.acm.org"])
+
     def test_check_constraints(self):
         import psycopg
         from paperlite.pgqueue import Result
@@ -494,7 +541,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
         with open(cfg, "rb") as f:
             raw = tomllib.load(f)
-        self.assertEqual(set(raw), {"pg", "proxy", "limits", "paths", "run", "landing", "monitor"})
+        self.assertEqual(set(raw), {"pg", "proxy", "limits", "paths", "run", "monitor"})
         self.assertEqual(set(raw["pg"]), {"dsn", "batch"})
         self.assertFalse(raw["monitor"]["enabled"])               # 模板默认不上报
         with self.assertRaises(SystemExit):                     # 已存在不覆盖
@@ -512,7 +559,8 @@ class CliTest(unittest.TestCase):
     def test_removed_legacy_settings_explained(self):
         from paperlite import config
         for text, needle in (('[paths]\ndb = "t.db"\n', "[paths] db"), ("[queue]\nbackend = 'pg'\n", "[queue]"),
-                             ("[run]\npg = true\n", "[run] pg"), ("[limits]\nvolume_stop_after = 3\n", "volume_stop_after")):
+                             ("[run]\npg = true\n", "[run] pg"), ("[limits]\nvolume_stop_after = 3\n", "volume_stop_after"),
+                             ('[landing]\n"h.org" = "https://h.org/"\n', "[landing]")):
             Path("c.toml").write_text(text)
             with self.assertRaises(ValueError) as e:
                 config.load_limits(Path("c.toml")); config.load_paths(Path("c.toml")); config.load_run(Path("c.toml"))
@@ -523,8 +571,10 @@ class CliTest(unittest.TestCase):
         schema = new_schema(self)
         Path("config.toml").write_text(pg_config(schema, batch="cli"))
         f = Path("mixed.txt")
-        f.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\nhttps://example.org/a.pdf\n")
+        f.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\nhttps://example.org/a.pdf\nhttp://192.168.1.111/x\n")
         self.run_cli("import", "--urls", str(f))
+        bad = Path("mixed.txt.bad_url.csv").read_text().splitlines()
+        self.assertEqual(bad, ["doi,url,reason", ",http://192.168.1.111/x,private_ip"])   # 文本文件没有 doi 列
         db = make_source(self, batch="cli", schema=schema)
         self.assertEqual(sorted(db.hosts()), ["dl.acm.org", "example.org"])   # 多主机同一批次
         self.assertEqual(db.counts()[Status.PENDING], 2)
@@ -544,6 +594,36 @@ class CliTest(unittest.TestCase):
             self.run_cli("status")
         self.assertIn("pending 2", buf.getvalue())
         self.assertIn("块:", buf.getvalue())
+
+
+class ProbeUrlTest(unittest.TestCase):
+    """不热身：curl 模式验收新身份、复验身份都用真实链接，不用配置的落地页。"""
+
+    def producer(self, store, sample=None):
+        from paperlite.producer import Producer
+        return Producer(Limits(), store, mock.Mock(), "dl.acm.org", sample_url=sample)
+
+    def test_producer_probe_priority(self):
+        store = FakeStore([])
+        p = self.producer(store, sample=lambda: "https://dl.acm.org/doi/pdf/10.1145/9")
+        self.assertEqual(p._probe_url(), ("https://dl.acm.org/doi/pdf/10.1145/9", False))   # 队列里的待下载链接：宽松判定
+        store.good = "https://dl.acm.org/doi/pdf/10.1145/1"
+        self.assertEqual(p._probe_url(), (store.good, True))                              # 最近成功链接优先：严格判定
+        self.assertEqual(self.producer(FakeStore([]))._probe_url(), ("https://dl.acm.org/", True))   # 都没有：首页
+        broken = self.producer(FakeStore([]), sample=mock.Mock(side_effect=RuntimeError("pg down")))
+        self.assertEqual(broken._probe_url(), ("https://dl.acm.org/", True))             # 取不到不影响生产
+
+    def test_lenient_acceptance_with_pending_link(self):
+        """队列里的待下载链接本身可能是 404：只要没被挑战、没被封，身份就算可用。"""
+        p = self.producer(FakeStore([]), sample=lambda: "https://dl.acm.org/doi/pdf/10.1145/gone")
+        p.ips.s = PROXY
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.get.return_value = Resp(404, b"<title>ACM Error: 404</title>")
+        with mock.patch("paperlite.producer.session_for_identity", return_value=session):
+            self.assertTrue(p._curl_usable(ident()))
+            session.get.return_value = Resp(403, b"challenge-platform", {"cf-mitigated": "challenge"})
+            self.assertFalse(p._curl_usable(ident()))
 
 
 class ProducerTargetTest(unittest.TestCase):
@@ -778,6 +858,12 @@ class FakeStore:
     def clear_pending(self, host, consumer):
         self.pending_cleared = True
 
+    def note_good_url(self, host, url):
+        self.good = url
+
+    def good_url(self, host):
+        return getattr(self, "good", None)
+
 
 @needs_pg
 class DownloaderTest(unittest.TestCase):
@@ -915,16 +1001,21 @@ class DownloaderTest(unittest.TestCase):
         self.assertEqual(store.fresh_rejects, 1)            # 1.1.1.1 被拒计入；2.2.2.2 连不上不计，任务判失败后结束
 
     def test_url_challenge_keeps_identity(self):
-        # 站点单独盯上 bad 这条：带同一 cookie 访问落地页和别的论文都正常
+        # 站点单独盯上 bad 这条：带同一 cookie 访问首页和别的论文都正常
+        calls = []
+
         def site(u):
+            calls.append(u)
             if "bad" in u:
                 return Resp(403, b"challenge-platform", {"cf-mitigated": "challenge"})
-            return Resp(200, b"<title>landing</title>") if "/doi/pdf/" not in u else Resp(200, FAKE_PDF)
+            return Resp(200, b"<title>home</title>") if "/doi/pdf/" not in u else Resp(200, FAKE_PDF)
         store = FakeStore([ident()])
-        self.cfg = Limits(request_gap_s=(0, 0), max_url_challenges=2,
-                              landing={"dl.acm.org": "https://dl.acm.org/doi/10.1145/landing"})
+        self.cfg = Limits(request_gap_s=(0, 0), max_url_challenges=2)
         bad, good = "https://dl.acm.org/doi/pdf/10.1145/bad", "https://dl.acm.org/doi/pdf/10.1145/good"
         dl = self.run_with(store, {"1.2.3.4": site}, [bad, good])
+        # 第一次复验时还没有成功链接 → 用首页；good 下成功后，第二次复验用的就是它
+        self.assertEqual(calls, [bad, "https://dl.acm.org/", good, bad, good])
+        self.assertEqual(store.good, good)                   # 最近成功链接也同步给了生产者
         self.assertEqual((dl.stats.success, dl.stats.failed, dl.stats.challenged, dl.stats.rejected), (1, 1, 2, 0))
         self.assertEqual(store.discarded, [])                # 身份没被误杀
         self.assertEqual(store.fresh_rejects, 0)             # 也不计入熔断
@@ -1123,32 +1214,76 @@ class BrowserPoolTest(unittest.TestCase):
         self.assertEqual((r["status"], r["error_kind"], r["http_status"]), ("failed", "not_found", 404))
 
     def test_render_failure_retries_then_fails(self):
+        """整站打不开：前 3 个新浏览器的首篇失败算 IP 的（换 IP、不计次数），之后认定是站点问题、正常计次判死，
+        不会为一个打不开的站无限换 IP。"""
         from paperlite.browser import RenderResult
         url = "https://www.sciencedirect.com/science/article/abs/pii/stuck"
-        def resp(u):
-            if u == self.cfg.landing_for("www.sciencedirect.com"):
-                return self._ok(u)                               # 落地页能过盾
-            return RenderResult(ok=False, seconds=5.0, error="TimeoutError: 页面未稳定")
+        resp = lambda u: RenderResult(ok=False, seconds=5.0, error="TimeoutError: 页面未稳定")
         pool = self.run_pool(resp, [url], n_leases=9)
-        self.assertEqual((pool.stats.success, pool.stats.failed), (0, 1))
+        self.assertEqual((pool.stats.success, pool.stats.failed, pool.stats.probe_failed), (0, 1, 3))
         r = self.row(url)
         self.assertEqual((r["status"], r["error_kind"], r["challenge_count"]), ("failed", "challenge_failed", 2))
 
-    def test_proxy_net_error_switches_ip_without_counting(self):
-        """IP 中途失效（ERR_TUNNEL_CONNECTION_FAILED）：不计挑战次数、任务放回；连续 2 次就换 IP。"""
+    def test_first_page_failure_blamed_on_ip_not_task(self):
+        """不热身：新浏览器第一篇就打不开 → 换 IP、任务放回不计次数；下一个 IP 打开了就照常连续下。"""
         from paperlite.browser import RenderResult
-        landing = self.cfg.landing_for("www.sciencedirect.com")
-        url = "https://www.sciencedirect.com/science/article/abs/pii/net"
-        dead = {"n": 2}                                          # 第一个 IP 上的前两次文章渲染都是隧道错误
+        urls = [f"https://www.sciencedirect.com/science/article/abs/pii/{i}" for i in range(3)]
+        bad_ip = {"left": 1}
         def resp(u):
-            if u != landing and dead["n"] > 0:
+            if bad_ip["left"]:
+                bad_ip["left"] -= 1
+                return RenderResult(ok=False, seconds=90.0, error="TimeoutError: 90s 内未通过挑战")
+            return self._ok(u)
+        pool = self.run_pool(resp, urls)
+        self.assertEqual((pool.stats.success, pool.stats.failed), (3, 0))
+        self.assertEqual((pool.stats.probe_failed, pool.stats.browsers), (1, 1))   # 换了一次 IP，第二个浏览器连下三篇
+        self.assertTrue(all(r["challenge_count"] == 0 and r["retry_count"] == 0 for r in pg_rows(self.db)))
+
+    def test_bad_hosts_first_do_not_stop_no_proxy_worker(self):
+        """不走代理、批次开头是格式合法但打不开的站点（明显坏的在导入时已剔除）：worker 不会因此收工，
+        后面的正常站点照常下载，打不开的最终判死。"""
+        from paperlite.browser import RenderResult
+        self.cfg = Limits(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, max_url_challenges=1)
+        bad = ["http://10040.indexcopernicus.com/abstracted.php?ICID=1", "http://219.238.6.200/a"]
+        good = [f"https://link.springer.com/article/{i}" for i in range(3)]
+        def resp(u):
+            if u in bad:
+                return RenderResult(ok=False, seconds=1, error="Error: Page.goto: net::ERR_CONNECTION_TIMED_OUT")
+            return self._ok(u)
+        from paperlite import browser_pool as bp
+        self.db.import_urls({"url": u, "url_type": "html"} for u in bad + good)
+
+        class FakeSession:
+            def __init__(s, *a, **k):
+                pass
+            async def start(s):
+                pass
+            async def render(s, url, timeout_s, settle_s=2.0):
+                return resp(url)
+            async def close(s):
+                pass
+        with mock.patch.object(bp, "BrowserSession", FakeSession):
+            pool = BrowserPool(self.cfg, None, self.db, self.out, 1, no_proxy=True)
+            pool.run()
+        self.assertEqual((pool.stats.success, pool.stats.failed), (3, 2))
+        # 两个坏主机各让一个新浏览器首篇失败（不计次数、重开浏览器）；浏览器在正常站点上打开后，
+        # 坏链接下一轮被领到时已不是首篇，正常计次判死
+        self.assertEqual(pool.stats.probe_failed, 2)
+
+    def test_proxy_net_error_switches_ip_without_counting(self):
+        """IP 中途失效（ERR_TUNNEL_CONNECTION_FAILED）：不计挑战次数、任务放回、换 IP。"""
+        from paperlite.browser import RenderResult
+        url = "https://www.sciencedirect.com/science/article/abs/pii/net"
+        dead = {"n": 2}                                          # 前两个浏览器的首篇都是隧道错误
+        def resp(u):
+            if dead["n"] > 0:
                 dead["n"] -= 1
                 return RenderResult(ok=False, seconds=0.1,
                                     error=f"Error: Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at {u}")
             return self._ok(u)
         pool = self.run_pool(resp, [url])                        # max_url_challenges=2：若计数早就判死了
         self.assertEqual((pool.stats.success, pool.stats.failed), (1, 0))
-        self.assertEqual(pool.stats.browsers, 2)                 # 换过一次 IP
+        self.assertEqual((pool.stats.probe_failed, pool.stats.browsers), (2, 1))   # 换过两次 IP
         r = self.row(url)
         self.assertEqual((r["status"], r["challenge_count"], r["retry_count"]), ("success", 0, 0))
 

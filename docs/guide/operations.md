@@ -28,6 +28,7 @@ paperlite import --urls pages.txt --type html     # 要网页本身而不是 PDF
 - CSV 需要 `url` 列，可选 `doi`、`source`、`batch_no`、`url_type`（逐行覆盖 `--type`）。
 - 入库时按 (主机, DOI) 排序、切成块（默认 1000 条，`[pg] chunk_size`）：同一出版商、同一期刊的 DOI 前缀相同，排序后连在一起，一块只打一个站点。没有 `doi` 列时从 URL 里认 DOI，认不出的用 URL 哈希。
 - CSV 格式错误（如未加引号的逗号）会报出行号并中止导入。
+- 明显下载不到的链接直接剔除、不入库：内网 / 本机 IP（`10.x`、`172.16–31.x`、`192.168.x`、`127.x` 等）、主机名不合法（`https://.asm.org/…`、`http://0`、`http://null/…`）、不是 http/https。日志里打一行按原因的计数，明细写到输入文件旁边的 `<文件名>.bad_url.csv`。公网 IP 形式的主机放行（有些小期刊就是 IP 建站），打不开的交给下载时处理。
 - 重复导入不会重置已有任务，日志里的"已存在"就是这些行。
 
 ## 看进度
@@ -78,14 +79,7 @@ paperlite inspect --reset     # 清除所有规则，放回全部被跳过的任
 
 不需要按站点配置，主机直接取自任务队列里的 URL。
 
-- 每个新浏览器先在批次里任务最多的主机上热身过盾，默认地址 `https://{host}/`。
-- 首页不适合热身（不触发挑战，或会跳到别处）时，在 `[landing]` 覆盖：
-
-  ```toml
-  [landing]
-  "www.example.org" = "https://www.example.org/journal/abc"
-  ```
-
+- 不需要配置热身页：浏览器直接拿队列里的真实链接过盾，curl 模式用真实链接验收身份。
 - curl 模式还要检查 `classify.py` 里的 non-PDF 判定规则（按 ACM 编写）是否适用。
 
 ## 日志
