@@ -509,7 +509,7 @@ class CliTest(unittest.TestCase):
             self.run_cli("import", "--urls", str(urls))
         self.assertIn("[pg]", str(e.exception))
 
-    def test_removed_sqlite_settings_explained(self):
+    def test_removed_legacy_settings_explained(self):
         from paperlite import config
         for text, needle in (('[paths]\ndb = "t.db"\n', "[paths] db"), ("[queue]\nbackend = 'pg'\n", "[queue]"),
                              ("[run]\npg = true\n", "[run] pg"), ("[limits]\nvolume_stop_after = 3\n", "volume_stop_after")):

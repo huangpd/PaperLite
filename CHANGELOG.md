@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
 ### 不兼容变更
 
 - **任务队列只用 PostgreSQL**，移除 SQLite 任务库：配置文件必须有 `[pg]`（`dsn`、`batch`）。删除 `[paths] db`、`--db`、`[queue]`、`--pg`、`[run] pg`；旧配置里写了这些会报错并提示怎么改。没有迁移工具：已有的 `tasks.db` 批次需要把原始 CSV 重新导入。
@@ -18,7 +20,12 @@
 - `inspect` 对全批次巡检；下载时浏览器模式在本机块内实时巡检；两者的规则都记入 `pl_skip_rules`，`inspect --list` 可查。
 - `export` 流式导出，`retry` 放回后自动切进下一代块；导入保留 `source`、`batch_no`。
 - `deploy/pg/docker-compose.yml`；`tools/bench_pg_chunks.py`（PG 队列调度压测）。
-- CI 发布前起 PostgreSQL 服务跑全量测试。
+- CI：每次推送连 PostgreSQL 跑全量测试（`ci.yml`）；发布前同样跑。
+
+### 修复
+
+- 浏览器热身用批次里任务最多的主机，不再用排序第一的主机（数据里一条 `https://.asm.org/…` 坏链接曾让整个批次热身失败）。
+- 某一块的任务全被巡检跳过时，curl 模式的下载线程不再误判为还有可领任务。
 
 ### 文档
 
@@ -133,7 +140,8 @@
 
 - 首个版本。
 
-[Unreleased]: https://github.com/huangpd/PaperLite/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/huangpd/PaperLite/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/huangpd/PaperLite/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/huangpd/PaperLite/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/huangpd/PaperLite/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/huangpd/PaperLite/compare/v0.2.2...v0.2.3
