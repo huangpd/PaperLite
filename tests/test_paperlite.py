@@ -20,7 +20,8 @@ from paperlite.logutil import JsonFormatter
 from paperlite.producer import Producer
 from paperlite.proxy import Lease, ProxySettings, parse_deadline
 from paperlite.store import Identity
-from paperlite.tasks import Status, TaskDB, UrlType, derive_doi, derive_volume, pdf_path, url_key
+from paperlite.tasks import Status, UrlType, derive_doi, pdf_path, url_key
+from tests.pgutil import DSN, execute, make_source, needs_pg, new_schema, pg_config, row as pg_row, rows as pg_rows
 
 FAKE_PDF = b"%PDF-1.4\n" + b"0" * 2048          # 超过最小文件大小（1024 字节）
 PROXY = ProxySettings(api_url="https://api.example/get?key=k", username="u", password="p@ss")
@@ -188,22 +189,18 @@ class IdentityRulesTest(unittest.TestCase):
         self.assertNotEqual(url_key("https://dl.acm.org/A"), url_key("https://dl.acm.org/a"))
 
 
+@needs_pg
 class InspectTest(unittest.TestCase):
-    """巡检：同标题重复触发 → doi/url 规则 → 标记疑似封面的 pending。"""
+    """巡检（全批次，paperlite inspect）：同标题重复触发 → doi/url 规则 → 已采之外的 pending 记跳过、不再领取。"""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.db = TaskDB(Path(self.tmp.name) / "tasks.db")
-
-    def tearDown(self):
-        self.db.close()
-        self.tmp.cleanup()
+        self.src = make_source(self, chunk_size=100)
+        self.q = self.src.q
 
     def _add(self, doi, url, status=None, title=None):
-        self.db.import_urls([{"url": url, "doi": doi}])
-        if status:                              # 领取后写成最终结果（模拟已采）
-            t = self.db.claim("w")
-            self.db.finish(t, status, title=title)
+        self.q.import_urls([{"url": url, "doi": doi}])
+        if status:                              # 直接写成最终结果（模拟已采）
+            execute(self.src, "UPDATE pl_tasks SET status = %s, title = %s WHERE url = %s", (status, title, url))
 
     def test_dup_title_induces_rule_and_flags_pending(self):
         host = "https://ex.org/pii/"
@@ -215,20 +212,24 @@ class InspectTest(unittest.TestCase):
             self._add(f"10.1/cov.{i:03d}", f"{host}COV{i:03d}")
         for i in range(6, 9):                    # 3 篇未采真文章
             self._add(f"10.1/art.{i}", f"{host}ART{i}")
+        self.q.build_chunks(100)
 
         from paperlite.inspect import inspect
-        rules, flagged = inspect(self.db, trigger=10, min_precision=0.98, min_support=10)
-        self.assertEqual((rules, flagged), (1, 8))           # 一条规则，标记 8 篇未采封面
-        self.assertEqual(self.db.suspect_count(), 8)
+        rules, flagged = inspect(self.q, trigger=10, min_precision=0.98, min_support=10)
+        self.assertEqual((rules, flagged), (1, 8))           # 一条规则，跳过 8 篇未采封面
+        self.assertEqual(self.q.skip_counts(), {"title_dup": 8})
         # 领取只拿得到真文章，封面被跳过
-        claimed = [self.db.claim(f"w{i}") for i in range(5)]
-        got = {t.doi for t in claimed if t}
-        self.assertTrue(got <= {"10.1/art.6", "10.1/art.7", "10.1/art.8"})
-        self.assertFalse(any((t and t.doi.startswith("10.1/cov")) for t in claimed))
-        # 规则落库，可清除
-        self.assertEqual(len(self.db.skip_rules()), 1)
-        self.assertEqual(self.db.clear_suspects(), 8)
-        self.assertEqual(self.db.suspect_count(), 0)
+        got = set()
+        while (t := self.src.claim("w")) is not None:
+            got.add(t.doi)
+            self.src.finish(t, Status.SUCCESS)
+        self.assertEqual(got, {"10.1/art.6", "10.1/art.7", "10.1/art.8"})
+        # 规则落库，可清除；清除后放回的任务重新可领
+        rules = self.q.skip_rules()
+        self.assertEqual([(r["scope"], r["flagged"]) for r in rules], [("batch", 8)])
+        self.assertEqual(self.q.clear_skips("title_dup"), 8)
+        self.assertEqual((self.q.skip_counts(), self.q.skip_rules()), ({}, []))
+        self.assertTrue(self.q.has_work())
 
     def test_scattered_covers_not_flagged_by_precision_guard(self):
         # 封面和真文章 doi/url 交错，唯一公共前缀会命中真文章 → precision 不达标 → 不标记
@@ -238,9 +239,9 @@ class InspectTest(unittest.TestCase):
         for i in range(100, 110):               # 未采，和上面同刊前缀
             self._add(f"10.1/j.{i}", f"https://ex.org/p/{i}")
         from paperlite.inspect import inspect
-        rules, flagged = inspect(self.db, trigger=10, min_precision=0.98, min_support=10)
+        rules, flagged = inspect(self.q, trigger=10, min_precision=0.98, min_support=10)
         self.assertEqual((rules, flagged), (0, 0))           # 护栏生效，不误标
-        self.assertEqual(self.db.suspect_count(), 0)
+        self.assertEqual(self.q.skip_counts(), {})
 
 
 class WindowInspectorTest(unittest.TestCase):
@@ -330,6 +331,7 @@ class WindowInspectorTest(unittest.TestCase):
         self.assertNotEqual(up, "https://www.sciencedirect.com/science/article/abs/pii/S")  # 没退化成整站宽前缀
 
 
+@needs_pg
 class BrowserObserveWiringTest(unittest.TestCase):
     """浏览器模式：不止成功页，404 等已加载的失效页也要喂给巡检器（不再只在成功分支调）。"""
 
@@ -341,7 +343,7 @@ class BrowserObserveWiringTest(unittest.TestCase):
         from paperlite.config import Limits
         from paperlite.proxy import Lease
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
-        db = TaskDB(Path(tmp.name) / "tasks.db"); self.addCleanup(db.close)
+        db = make_source(self)
         db.import_urls([{"url": "https://www.sciencedirect.com/science/article/abs/pii/S1"}])
         pool = BrowserPool(Limits(), None, db, Path(tmp.name) / "out", workers=1, no_proxy=True)
         pool.inspector = mock.Mock()
@@ -364,7 +366,7 @@ class BrowserObserveWiringTest(unittest.TestCase):
         from paperlite.config import Limits
         from paperlite.proxy import Lease
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
-        db = TaskDB(Path(tmp.name) / "tasks.db"); self.addCleanup(db.close)
+        db = make_source(self)
         db.import_urls([{"url": "https://www.sciencedirect.com/science/article/abs/pii/S2"}])
         pool = BrowserPool(Limits(), None, db, Path(tmp.name) / "out", workers=1, no_proxy=True)
         pool.inspector = mock.Mock()
@@ -376,191 +378,91 @@ class BrowserObserveWiringTest(unittest.TestCase):
         pool.inspector.observe.assert_not_called()
 
 
-class TaskDBTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.db = TaskDB(Path(self.tmp.name) / "tasks.db")
+@needs_pg
+class TaskSourceTest(unittest.TestCase):
+    """worker 看到的任务队列语义（PgTaskSource）：导入、领取、重试、挑战排后、重置。"""
 
-    def tearDown(self):
-        self.db.close()
-        self.tmp.cleanup()
+    def setUp(self):
+        self.db = make_source(self)
 
     def urls(self, *ids):
         return [{"pdf_url": f"https://dl.acm.org/doi/pdf/10.1145/{i}"} for i in ids]
 
-    def test_import_dedups_and_keeps_one_host(self):
+    def test_import_dedups_and_keeps_hosts(self):
         self.assertEqual(self.db.import_urls(self.urls(1, 2, 2)), (2, 1))
         t = self.db.claim("w")
         self.db.finish(t, Status.SUCCESS)
         self.assertEqual(self.db.import_urls(self.urls(1, 3)), (1, 1))   # 重复导入不重置
         self.assertEqual(self.db.counts()[Status.SUCCESS], 1)
         self.assertEqual(self.db.host(), "dl.acm.org")
-        # 允许混合主机：再导入别的主机不报错，host() 仍是第一个，hosts() 两个都在
-        self.assertEqual(self.db.import_urls([{"url": "https://other.org/x.pdf"}]), (1, 0))
-        self.assertEqual(self.db.host(), "dl.acm.org")
-        self.assertEqual(self.db.hosts(), ["dl.acm.org", "other.org"])
+        self.assertEqual(self.db.import_urls([{"url": "https://other.org/x.pdf"}]), (1, 0))   # 允许混合主机
+        self.assertEqual(sorted(self.db.hosts()), ["dl.acm.org", "other.org"])
 
-    def test_claim_retry_and_reset(self):
+    def test_retry_and_reset(self):
         self.db.import_urls(self.urls(1))
         t = self.db.claim("w")
-        self.assertIsNone(self.db.claim("w2"))                          # 已被领走
         self.db.retry_later(t, count=False)                             # cookie 被拒：不计重试
-        t = self.db.claim("w")
+        t = self.db.claim("w")                                          # 本块做完 → 切下一代再领
         self.assertEqual(t.retry_count, 0)
         self.db.retry_later(t, count=True, error_kind="network", error_message="timeout")
         t = self.db.claim("w")
         self.assertEqual(t.retry_count, 1)
         self.db.finish(t, Status.FAILED, error_kind="network")
-        self.assertEqual(self.db.kind_counts(), [("failed", "network", 1, 0)])
-        self.assertEqual(self.db.reset(Status.FAILED, "network"), 1)
+        self.assertIsNone(self.db.claim("w"))
+        self.assertEqual(self.db.kind_counts(), [("failed", "network", 1)])
+        self.assertEqual(self.db.q.reset(Status.FAILED, "network"), 1)
         self.assertEqual(self.db.claim("w").retry_count, 0)
 
     def test_challenged_task_goes_last_then_fails(self):
         self.db.import_urls(self.urls(1, 2))
         t1 = self.db.claim("w")
         self.assertFalse(self.db.challenged(t1, max_challenges=2, exit_ip="1.1.1.1", message="403"))
-        self.assertEqual(self.db.claim("w").url, self.urls(2)[0]["pdf_url"])   # 被挑战的排到后面
+        t2 = self.db.claim("w")
+        self.assertEqual(t2.url, self.urls(2)[0]["pdf_url"])               # 被挑战的排到后面
+        self.db.finish(t2, Status.SUCCESS)
         t1 = self.db.claim("w")
         self.assertEqual(t1.challenge_count, 1)
         self.assertTrue(self.db.challenged(t1, max_challenges=2, exit_ip="2.2.2.2", message="403"))
-        self.assertEqual(self.db.kind_counts(), [("failed", "challenge_failed", 1, 0)])
-        self.db.reset(Status.FAILED, "challenge_failed")
+        self.assertEqual(self.db.kind_counts(), [("failed", "challenge_failed", 1), ("success", None, 1)])
+        self.db.q.reset(Status.FAILED, "challenge_failed")
         self.assertEqual(self.db.claim("w").challenge_count, 0)
-
-    def test_old_schema_rejected(self):
-        import sqlite3
-        path = Path(self.tmp.name) / "old.db"
-        conn = sqlite3.connect(path)
-        conn.execute("CREATE TABLE paper_pdf_resources (id INTEGER PRIMARY KEY, retry_count INTEGER)")
-        conn.close()
-        with self.assertRaises(RuntimeError):
-            TaskDB(path)
 
     def test_url_type_imported_and_claimed(self):
         self.db.import_urls([{"pdf_url": "https://dl.acm.org/doi/10.1145/1", "url_type": "html"},
                              {"pdf_url": "https://dl.acm.org/doi/pdf/10.1145/2"}])
-        self.assertEqual([self.db.claim("w").url_type for _ in range(2)], [UrlType.HTML, UrlType.PDF])
-        self.assertEqual([r["url_type"] for r in self.db.rows()], ["html", "pdf"])
-        self.assertEqual(self.db.type_counts()["html"][Status.RUNNING], 1)
+        self.assertEqual(sorted(self.db.claim("w").url_type for _ in range(2)), [UrlType.HTML, UrlType.PDF])
+        self.assertEqual(sorted(r["url_type"] for r in pg_rows(self.db)), ["html", "pdf"])
         with self.assertRaises(ValueError):
             self.db.import_urls([{"pdf_url": "https://dl.acm.org/doi/10.1145/3", "url_type": "page"}])
 
-    def test_old_db_gets_url_type_column(self):
-        import sqlite3
-        self.db.import_urls(self.urls(1))
-        self.db.close()
-        conn = sqlite3.connect(self.db.path)
-        conn.execute("ALTER TABLE paper_pdf_resources DROP COLUMN url_type")      # 模拟 0.1.2 的库
-        conn.commit()
-        conn.close()
-        self.db = TaskDB(self.db.path)
-        self.assertEqual(self.db.claim("w").url_type, UrlType.PDF)
-        self.db.import_urls([{"pdf_url": "https://dl.acm.org/doi/10.1145/2", "url_type": "html"}])
-        self.assertEqual(self.db.claim("w").url_type, UrlType.HTML)
-
     def test_doi_imported_from_column_else_derived(self):
-        self.db.import_urls([{"url": "https://dl.acm.org/doi/10.1145/1", "doi": "10.9999/CUSTOM"},
+        self.db.import_urls([{"url": "https://dl.acm.org/doi/10.1145/1", "doi": "10.9999/CUSTOM", "source": "s",
+                              "batch_no": "b7"},
                              {"url": "https://dl.acm.org/doi/10.1145/2"}])      # 第二条无 doi → 回退推导
-        dois = sorted(r["doi"] for r in self.db.rows())
-        self.assertEqual(dois, ["10.1145/2", "10.9999/custom"])               # 导入的 doi 转小写；缺省从 URL 推
-
-    def test_old_db_renames_pdf_url_and_paper_uid(self):
-        import sqlite3
-        self.db.import_urls(self.urls(1))
-        self.db.close()
-        conn = sqlite3.connect(self.db.path)                                  # 模拟 0.1.3 之前：列名还是 pdf_url / paper_uid，无 title
-        conn.execute("ALTER TABLE paper_pdf_resources RENAME COLUMN url TO pdf_url")
-        conn.execute("ALTER TABLE paper_pdf_resources RENAME COLUMN doi TO paper_uid")
-        conn.execute("ALTER TABLE paper_pdf_resources DROP COLUMN title")
-        conn.commit()
-        conn.close()
-        self.db = TaskDB(self.db.path)                                        # 打开时自动 RENAME 回来 + 补 title
-        t = self.db.claim("w")
-        self.assertTrue(t.url.startswith("https://dl.acm.org") and t.doi)
-        self.assertIn("title", [d[0] for d in self.db._conn.execute("SELECT * FROM paper_pdf_resources").description])
+        got = sorted((r["doi"], r["source"], r["batch_no"]) for r in pg_rows(self.db))
+        self.assertEqual(got, [("10.1145/2", None, None), ("10.9999/custom", "s", "b7")])   # doi 转小写
 
     def test_check_constraints(self):
-        import sqlite3
+        import psycopg
+        from paperlite.pgqueue import Result
         self.db.import_urls(self.urls(1))
         t = self.db.claim("w")
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.db.finish(t, Status.NON_PDF, error_kind="subscription")   # 不在类别表里
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.db.q.report([Result(t.id, Status.NON_PDF, error_kind="subscription")])   # 不在类别表里
 
-    def test_download_lock_reclaims_running(self):
-        self.db.import_urls(self.urls(1, 2))
-        self.db.claim("crashed-process")
-        self.assertEqual(self.db.lock_for_download(), 1)
-        other = TaskDB(self.db.path)
-        with self.assertRaises(RuntimeError):
-            other.lock_for_download()                                   # 同一个库只允许一个下载进程
-        other.close()
-
-
-class VolumeStopTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.db = TaskDB(Path(self.tmp.name) / "tasks.db", volume_stop_after=3)
-
-    def tearDown(self):
-        self.db.close()
-        self.tmp.cleanup()
-
-    def load(self, vol, n, start=1):
-        self.db.import_urls({"pdf_url": f"https://dl.acm.org/doi/pdf/10.1145/{vol}.{vol + i}"} for i in range(start, start + n))
-
-    def test_derive_volume(self):
-        self.assertEqual(derive_volume("10.1145/1012326.1012328"), "1012326")
-        self.assertIsNone(derive_volume("10.1145/3779295"))
-        self.assertIsNone(derive_volume("url-abcd"))
-
-    def test_unverified_volume_limited_to_n_in_flight(self):
-        self.load(1000, 6)
-        self.load(2000, 2)
-        got = [self.db.claim("w") for _ in range(6)]
-        vols = [t.doi.split("/")[1].split(".")[0] for t in got if t]
-        self.assertEqual(vols, ["1000", "1000", "1000", "2000", "2000"])   # 卷期 1000 最多放 3 篇，其余线程去别的卷期
-        self.assertIsNone(got[5])
-        self.db.finish(got[0], Status.SUCCESS)                               # 下到一篇 PDF → 卷期确认，放开
-        self.assertIsNotNone(self.db.claim("w"))
-
-    def test_three_no_pdf_stops_rest_of_volume(self):
-        self.load(1000, 10)
-        tasks = [self.db.claim("w") for _ in range(3)]
-        self.assertIsNone(self.db.finish(tasks[0], Status.NON_PDF, error_kind="not_found"))
-        self.assertIsNone(self.db.finish(tasks[1], Status.NON_PDF, error_kind="paywall"))
-        self.assertEqual(self.db.finish(tasks[2], Status.NON_PDF, error_kind="not_found"), ("1000", 7))
-        self.assertFalse(self.db.has_status(Status.PENDING))
-        self.assertEqual(self.db.volume_summary(), (1, 7))
-        r = [x for x in self.db.rows() if x["inferred"]][0]
-        self.assertEqual((r["status"], r["error_kind"]), ("non_pdf", "not_found"))   # 取样本里最多的类别
-        self.assertIn("按卷期推断", r["error_message"])
-        self.assertEqual(self.db.reset_stopped_volumes(), (1, 10))                    # 重新核实：样本 + 推断全放回
-        self.assertEqual(self.db.counts()[Status.PENDING], 10)
-
-    def test_volume_with_pdf_never_stops(self):
-        self.load(1000, 6)
+    def test_export_rows_stream(self):
+        self.db.import_urls(self.urls(1, 2, 3))
         t = self.db.claim("w")
-        self.db.finish(t, Status.SUCCESS)
-        for _ in range(4):                                                    # 卷首语、(abstract) 之类
-            self.assertIsNone(self.db.finish(self.db.claim("w"), Status.NON_PDF, error_kind="landing_page"))
-        self.assertTrue(self.db.has_status(Status.PENDING))
-
-    def test_network_failures_do_not_count(self):
-        self.load(1000, 5)
-        for _ in range(3):
-            self.db.finish(self.db.claim("w"), Status.FAILED, error_kind="network")
-        self.assertIsNotNone(self.db.claim("w"))
-
-    def test_new_style_doi_not_grouped(self):
-        self.db.import_urls({"pdf_url": f"https://dl.acm.org/doi/pdf/10.1145/{n}"} for n in (3779295, 3779296, 3779297, 3779298))
-        self.assertEqual(len([self.db.claim("w") for _ in range(4)]), 4)
+        self.db.finish(t, Status.NON_PDF, error_kind="paywall")
+        self.assertEqual(len(list(self.db.q.rows())), 3)
+        self.assertEqual([r[2] for r in self.db.q.rows(Status.NON_PDF)], [t.url])
 
 
-class CliDbOptionTest(unittest.TestCase):
-    """--db 让任务库和输出目录分开（输出目录在 goofys 等对象存储挂载上时，任务库放本地盘）。"""
+class CliTest(unittest.TestCase):
+    """命令行：配置文件里的 [pg] 就是任务队列；没有 [pg] 报错。"""
 
     def setUp(self):
-        # 在空的临时目录里跑：不读项目根目录的 config.toml，也不会把那里的 pdfs/ 当成"唯一的站点"
+        # 在空的临时目录里跑：不读项目根目录的 config.toml
         self._cwd = os.getcwd()
         self._tmp_cwd = tempfile.TemporaryDirectory()
         os.chdir(self._tmp_cwd.name)
@@ -592,53 +494,56 @@ class CliDbOptionTest(unittest.TestCase):
         self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
         with open(cfg, "rb") as f:
             raw = tomllib.load(f)
-        self.assertEqual(set(raw), {"proxy", "limits", "paths", "run", "landing", "monitor", "queue"})
+        self.assertEqual(set(raw), {"pg", "proxy", "limits", "paths", "run", "landing", "monitor"})
+        self.assertEqual(set(raw["pg"]), {"dsn", "batch"})
         self.assertFalse(raw["monitor"]["enabled"])               # 模板默认不上报
         with self.assertRaises(SystemExit):                     # 已存在不覆盖
             self.run_cli("init")
         self.run_cli("init", "--force")
 
-    def test_db_arg_locates_db(self):
-        # 任务库由 --db 指定，与输出目录无关；import/retry/export 只认 --db
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            urls = tmp / "urls.txt"
-            urls.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\nhttps://dl.acm.org/doi/pdf/10.1145/1.3\n")
-            db = tmp / "local" / "acm.db"
-            self.run_cli("import", "--db", str(db), "--urls", str(urls))
-            self.assertTrue(db.exists())
-            self.run_cli("retry", "--db", str(db), "--status", "failed")
-            csv_path = tmp / "x.csv"
-            self.run_cli("export", "--db", str(db), "--file", str(csv_path))
-            self.assertEqual(len(csv_path.read_text().strip().splitlines()), 3)
-            with self.assertRaises(SystemExit):                               # 库不存在
-                self.run_cli("export", "--db", str(tmp / "nope.db"), "--file", str(csv_path))
+    def test_missing_pg_section_fails(self):
+        Path("config.toml").write_text("[paths]\n")
+        urls = Path("u.txt")
+        urls.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\n")
+        with self.assertRaises(SystemExit) as e:
+            self.run_cli("import", "--urls", str(urls))
+        self.assertIn("[pg]", str(e.exception))
 
-    def test_mixed_hosts_go_into_one_db(self):
-        # 弱化站点：各种主机混着导进同一个库，不按主机分目录
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            f = tmp / "mixed.txt"
-            f.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\nhttps://example.org/a.pdf\n")
-            db = tmp / "t.db"
-            self.run_cli("import", "--db", str(db), "--urls", str(f))
-            d = TaskDB(db)
-            try:
-                self.assertEqual(sorted(d.hosts()), ["dl.acm.org", "example.org"])   # 多主机同库
-                self.assertEqual(sum(d.counts().values()), 2)
-            finally:
-                d.close()
+    def test_removed_sqlite_settings_explained(self):
+        from paperlite import config
+        for text, needle in (('[paths]\ndb = "t.db"\n', "[paths] db"), ("[queue]\nbackend = 'pg'\n", "[queue]"),
+                             ("[run]\npg = true\n", "[run] pg"), ("[limits]\nvolume_stop_after = 3\n", "volume_stop_after")):
+            Path("c.toml").write_text(text)
+            with self.assertRaises(ValueError) as e:
+                config.load_limits(Path("c.toml")); config.load_paths(Path("c.toml")); config.load_run(Path("c.toml"))
+            self.assertIn(needle, str(e.exception))
 
-    def test_db_from_config_paths(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            cfg = tmp / "c.toml"
-            dbfile = tmp / "local" / "t.db"
-            cfg.write_text(f'[paths]\ndb = "{dbfile}"\n')         # import 只读 [paths]，不要求 [proxy]
-            urls = tmp / "u.txt"
-            urls.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\n")
-            self.run_cli("--config", str(cfg), "import", "--urls", str(urls))
-            self.assertTrue(dbfile.exists())                     # 用 [paths].db 的位置
+    @needs_pg
+    def test_import_retry_export_status_via_pg(self):
+        schema = new_schema(self)
+        Path("config.toml").write_text(pg_config(schema, batch="cli"))
+        f = Path("mixed.txt")
+        f.write_text("https://dl.acm.org/doi/pdf/10.1145/1.2\nhttps://example.org/a.pdf\n")
+        self.run_cli("import", "--urls", str(f))
+        db = make_source(self, batch="cli", schema=schema)
+        self.assertEqual(sorted(db.hosts()), ["dl.acm.org", "example.org"])   # 多主机同一批次
+        self.assertEqual(db.counts()[Status.PENDING], 2)
+        t = db.claim("w")
+        db.finish(t, Status.FAILED, error_kind="network")
+        db.close()
+        self.run_cli("retry", "--status", "failed", "--kind", "network")
+        csv_path = Path("x.csv")
+        self.run_cli("export", "--file", str(csv_path))
+        lines = csv_path.read_text().strip().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[0].startswith("id,doi,url"))
+        self.assertNotIn("failed", "".join(lines[1:]))                       # 已放回 pending
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.run_cli("status")
+        self.assertIn("pending 2", buf.getvalue())
+        self.assertIn("块:", buf.getvalue())
 
 
 class ProducerTargetTest(unittest.TestCase):
@@ -874,16 +779,14 @@ class FakeStore:
         self.pending_cleared = True
 
 
+@needs_pg
 class DownloaderTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.out = Path(self.tmp.name)
-        self.db = TaskDB(self.out / "tasks.db")
+        self.db = make_source(self)
         self.cfg = Limits(request_gap_s=(0, 0))
-
-    def tearDown(self):
-        self.db.close()
-        self.tmp.cleanup()
 
     def run_with(self, store, responses_by_ip, urls, url_type="pdf"):
         self.db.import_urls({"pdf_url": u, "url_type": url_type} for u in urls)
@@ -899,7 +802,7 @@ class DownloaderTest(unittest.TestCase):
         return dl
 
     def row(self, url):
-        return next(r for r in self.db.rows() if r["url"] == url)
+        return pg_row(self.db, url)
 
     def test_reports_pending_and_clears_on_exit(self):
         store = FakeStore([ident(exit_ip="1.1.1.1")])
@@ -912,7 +815,7 @@ class DownloaderTest(unittest.TestCase):
         """剩下的 pending 全被巡检标记跳过：线程不登记在线、直接退出，不再拉着生产者过盾"""
         url = "https://dl.acm.org/doi/pdf/10.1145/9"
         self.db.import_urls([{"pdf_url": url}])
-        self.db._conn.execute("UPDATE paper_pdf_resources SET flag = 'suspect_cover'")
+        execute(self.db, "UPDATE pl_tasks SET skip_reason = 'title_dup'")
         store = FakeStore([ident(exit_ip="1.1.1.1")])
         dl = Downloader(self.cfg, store, PROXY, self.db, self.out, workers=2)
         finished = threading.Event()
@@ -1055,18 +958,6 @@ class DownloaderTest(unittest.TestCase):
         self.assertEqual(getattr(store, "alive_calls", 0), 0)
         self.assertEqual(store.ready and len(store.ready), 1)   # 身份没被领走
 
-    def test_volume_stop_saves_requests(self):
-        calls = []
-
-        def site(u):
-            calls.append(u)
-            return Resp(404, b"<title>ACM Error: 404</title>")
-        self.cfg = Limits(request_gap_s=(0, 0), volume_stop_after=3)
-        urls = [f"https://dl.acm.org/doi/pdf/10.1145/1012326.{1012327 + i}" for i in range(11)]
-        dl = self.run_with(FakeStore([ident()]), {"1.2.3.4": site}, urls)
-        self.assertEqual(len(calls), 3)                     # 11 篇只请求了 3 篇
-        self.assertEqual((dl.stats.non_pdf, dl.stats.volumes_stopped, dl.stats.inferred), (3, 1, 8))
-
     def test_streamed_pdf_strips_leading_junk(self):
         body = b"\r\n\xef\xbb\xbf%PDF-1.7\n" + b"x" * 5000
         url = "https://dl.acm.org/doi/pdf/10.1145/1"
@@ -1138,18 +1029,16 @@ class DownloaderTest(unittest.TestCase):
         self.assertEqual((r["status"], r["error_kind"], r["retry_count"]), ("failed", "network", 1))
 
 
+@needs_pg
 class BrowserPoolTest(unittest.TestCase):
     """浏览器下载模式：用假 BrowserSession / IpSource 驱动，不开真浏览器。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.out = Path(self.tmp.name)
-        self.db = TaskDB(self.out / "tasks.db")
+        self.db = make_source(self)
         self.cfg = Limits(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, max_url_challenges=2)
-
-    def tearDown(self):
-        self.db.close()
-        self.tmp.cleanup()
 
     def run_pool(self, responses, urls, workers=1, n_leases=3):
         from paperlite import browser_pool as bp
@@ -1186,7 +1075,7 @@ class BrowserPoolTest(unittest.TestCase):
         return pool
 
     def row(self, url):
-        return next(r for r in self.db.rows() if r["url"] == url)
+        return pg_row(self.db, url)
 
     def _ok(self, url):
         from paperlite.browser import RenderResult
@@ -1217,9 +1106,9 @@ class BrowserPoolTest(unittest.TestCase):
 
         pool = self.run_pool(cover, urls)
         self.assertEqual(pool.stats.success, 3)
-        rows = self.db.rows()
+        rows = pg_rows(self.db)
         self.assertEqual(sum(r["status"] == "success" for r in rows), 3)
-        self.assertEqual(self.db.suspect_count(), 3)
+        self.assertEqual(self.db.q.skip_counts(), {"title_dup": 3})
 
     def test_404_fails_without_retry(self):
         from paperlite.browser import RenderResult
@@ -1461,12 +1350,14 @@ class CliArgsTest(unittest.TestCase):
         self.fails("--version")          # version action 直接退出
         self.fails("不是命令")            # 未知命令报错退出
 
-    # 所有操作命令可加 --db 指定任务库（覆盖 [paths].db）；没有 --out/--host 了
-    def test_db_arg_on_commands(self):
+    # 任务队列只在 [pg]：--db / --pg 已移除；没有 --out/--host 了
+    def test_no_db_or_pg_flags(self):
         for name in ("import", "run", "produce", "download", "status", "inspect", "retry", "export"):
             argv = [name] + (["--urls", "x.txt"] if name == "import" else
                              ["--status", "failed"] if name == "retry" else [])
-            self.assertEqual(self.parse(*argv, "--db", "d.db").db, "d.db", name)
+            self.parse(*argv)
+            self.fails(*argv, "--db", "d.db")
+            self.fails(*argv, "--pg")
         self.assertEqual(self.parse("run", "--storage", "/mnt/x").storage, "/mnt/x")   # run/download 另有 --storage
         self.fails("status", "--out", "o")        # --out 已移除
         self.fails("import", "--host", "h")       # --host 已移除
@@ -1516,24 +1407,24 @@ class CliArgsTest(unittest.TestCase):
         self.assertEqual(self.parse("download").workers, 20)
         self.assertEqual(self.parse("download", "--workers", "8").workers, 8)
 
-    # 文档 retry：必须二选一；--status 只接受 failed/non_pdf；--kind 配合
+    # 文档 retry：--status 必填，只接受 failed/non_pdf；--kind 配合；--stopped-volumes 随卷期停止移除
     def test_retry(self):
         from paperlite.cli import ERROR_KINDS
-        self.fails("retry")                                    # 缺 required 互斥组
+        self.fails("retry")                                    # 缺 --status
         self.assertEqual(self.parse("retry", "--status", "failed").status, "failed")
         self.assertEqual(self.parse("retry", "--status", "non_pdf").status, "non_pdf")
-        self.assertTrue(self.parse("retry", "--stopped-volumes").stopped_volumes)
-        self.fails("retry", "--status", "failed", "--stopped-volumes")   # 互斥
+        self.fails("retry", "--stopped-volumes")
         self.fails("retry", "--status", "pending")             # 非法 choice
         self.assertIn("network", ERROR_KINDS)
         self.assertEqual(self.parse("retry", "--status", "failed", "--kind", "network").kind, "network")
 
-    # 文档 export：--status 为全部状态之一；--file 默认标准输出（-）
+    # 文档 export：--status 为 pending / success / failed / non_pdf 之一；--file 默认标准输出（-）
     def test_export(self):
         from paperlite.tasks import Status
         self.assertEqual(self.parse("export").file, "-")
-        for s in Status.ALL:
+        for s in (Status.PENDING, Status.SUCCESS, Status.FAILED, Status.NON_PDF):
             self.assertEqual(self.parse("export", "--status", s).status, s)
+        self.fails("export", "--status", "running")            # running 只是进程内计数，不落库
         self.fails("export", "--status", "bogus")
 
     # 文档 inspect 行：--trigger/--min-precision/--min-support/--list/--reset

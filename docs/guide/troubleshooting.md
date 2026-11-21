@@ -9,9 +9,8 @@
 | `uv run paperlite` 卡住不动 | `uv run` 会按 `uv.lock` 从默认源重新同步依赖。受限网络下直接调用 `.venv/bin/paperlite` |
 | `uv pip install` 不走国内镜像 | uv 不读 `pip.conf`，要用 `--index-url https://pypi.tuna.tsinghua.edu.cn/simple` 指定 |
 | 首次启动卡在下载 GeoIP 库 | `geoip = true` 需要约 70MB 的 GeoLite2 库。连不上时按报错提示手动放到 `~/.cloakbrowser/geoip/GeoLite2-City.mmdb`，或设 `geoip = false`（WebRTC 伪造仍由 `webrtc_spoof` 保留） |
-| 启动报任务库被占用 | 同一个任务库同时只允许一个下载进程。检查是否有残留的 `paperlite run` |
-| `database is locked` / 随机 I/O 错误 | `[paths].db` 放在了 goofys、s3fs 等 FUSE 挂载上。任务库必须放本地盘 |
 | 配置项报"未知字段" | 字段名写错或放错了段，对照[配置参考](../reference/configuration.md) |
+| 报 `[paths] db` / `[queue]` / `[run] pg` / `volume_stop_after` 已移除 | 旧版配置。任务队列只用 PostgreSQL：删掉这些字段，填好 `[pg]` 的 `dsn` 和 `batch` |
 
 ## 导入
 
@@ -32,8 +31,7 @@
 | 生产者"熔断"告警 | 连续多个新身份一用就被拒，通常是代理配额用完或代理整体被封。暂停 `breaker_pause_s` 后自动试探 |
 | 浏览器过盾一直停在 "Verifying…" | 过盾要么很快、要么卡死。超过 `hedge_after_s` 会自动补位一个浏览器，超过 `pass_timeout_s` 放弃这个 IP |
 | `non_pdf` 很多 | 先抽几条看 `error_kind`：`not_found` 是 DOI 不存在，`paywall` 是出口没有订阅，`landing_page` 是只有摘要页。不是程序错误 |
-| 某个卷期整批 `non_pdf` 且 `inferred=1` | curl 模式的卷期停止推断出来的，没有实际请求。怀疑误判时 `retry --stopped-volumes` |
-| 很多 pending 不再被领取 | 巡检规则把它们标记为跳过了。`inspect --list` 查看，`inspect --reset` 放回 |
+| 很多 pending 不再被领取 | 巡检规则把它们标记为跳过了（`status` 里的"巡检跳过"）。`inspect --list` 查看，`inspect --reset` 放回 |
 | 大 PDF 下载失败 `extract_failed` | 超过 `max_file_size_mb`，或文件太小、前 1024 字节里没有 `%PDF-` |
 
 ## curl 模式
@@ -44,15 +42,14 @@
 | 身份入池后马上被拒 | 浏览器能过盾不代表 curl 能下。把 `[landing]` 配成真实文章页，让验收更接近实际下载 |
 | 升级后 cookie 异常 | 生产者和下载线程要同时重启 |
 
-## PostgreSQL 后端
+## PostgreSQL 与任务队列
 
 | 现象 | 原因与处理 |
 |---|---|
-| 报"PG 队列需要 psycopg" | 安装 `pip install 'paperlite[pg]'` |
-| 报"连接 PostgreSQL 失败" | 检查 `[pg] dsn`、网络与 `pg_hba.conf`；`dsn` 必须指向主库 |
-| 报"没有 [pg] 段" | 配了 `[queue] backend = "pg"` 或加了 `--pg`，但缺少 `[pg]` 的 `dsn` 和 `batch` |
-| 报"--db 只用于 sqlite 后端" | PG 后端下不能用 `--db`；要临时操作本地库，去掉配置里的 `backend = "pg"` |
-| `export` / `retry` 报不支持 | PG 后端暂不支持，用 SQL 查询或放回，见[多机部署](multi-machine.md#6-看进度) |
+| 报"连接 PostgreSQL 失败" | 检查 `[pg] dsn`、网络、安全组与 `pg_hba.conf`；`dsn` 必须指向主库。见[部署 PostgreSQL](postgres.md) |
+| 报"没有 [pg] 段" | 配置文件缺 `[pg]` 的 `dsn` 和 `batch`；`paperlite init` 生成的模板里有 |
+| `status` 显示的任务数不对 | `batch` 写错了：不同 `batch` 是不同批次，互不可见 |
+| 报 too many connections | 每个下载进程占 1 条连接，加上面板 1 条。调大 `max_connections`，或加 pgbouncer（transaction 模式） |
 | 机器 `kill -9` 后它的块没人接 | 等租约过期（默认 `lease_s = 1800` 秒）后自动回收；正常退出（Ctrl+C / SIGTERM）会立刻交还 |
 | 同一块反复被领取（`attempts` 很高） | 可能是毒块：块里某条任务每次都让进程崩溃。查出后手动处理，见[多机部署](multi-machine.md#8-当前限制) |
 | 下载机启动后很快退出 | 当前批次已没有可领的块。`paperlite status` 看是否还有 `queued`，或重试任务还没到 `retry_delay_s` |

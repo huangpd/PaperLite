@@ -3,17 +3,14 @@
 """
 paperlite/pgqueue.py
 ────────────────────
-PostgreSQL 任务队列后端（[queue] backend = "pg"）：按块领取，供多台机器共享一个批次。设计说明见 docs/development/pg-chunk-lease.md。
+任务队列（PostgreSQL）：按块领取，一台或多台机器共享一个批次。设计说明见 docs/development/pg-chunk-lease.md。
 
-与单机 tasks.py（SQLite + flock，逐条按顺序领取）的区别：
   - 块 = 按 (host, doi) 排好序后连续的一段任务（默认 1000 条），导入后由 build_chunks 切好，任务记 chunk_id
   - 机器一次领一块（pl_chunks 上 FOR UPDATE SKIP LOCKED），带租约；续租失败说明块被别人回收了
   - 块内任务领取时不改状态（不写 running），结果攒批回写；回写只改仍是 pending 的行，重复上报无害
   - 该稍后重试的任务记 next_attempt_at，留在原块；块做完即 done。requeue_leftovers 把到点的剩余任务
-    重新切成下一代块（generation + 1），相当于单机版"被挑战/失败的排到后面"
+    重新切成下一代块（generation + 1）：被挑战 / 要重试的任务排到后面
   - 租约过期（机器挂了）的块在下一次领取时被放回 queued，由别的机器接手
-
-依赖可选：pip install 'paperlite[pg]'（psycopg 3）。只在选了 PG 后端时由 cli._open_pg 导入，SQLite 后端不受影响。
 """
 
 import logging
@@ -25,19 +22,15 @@ from typing import Iterable, Optional, Sequence
 
 from .tasks import ERROR_KINDS, Status, Task, UrlType, derive_doi, url_host, url_key
 
-try:  # 可选依赖：只有用到 PG 队列时才需要
-    import psycopg
-    from psycopg import sql
-except ImportError:  # pragma: no cover
-    psycopg = None
-    sql = None
+import psycopg
+from psycopg import sql
 
 logger = logging.getLogger("paperlite")
 
 _WAIT = object()                       # PgTaskSource 内部：本进程还有块在收尾，稍后再领
 RETRY = "retry"                       # report 用：放回 pending，next_attempt_at 之后再领
 SKIP = "skip"                         # report 用：块内推断跳过，保持 pending、写 skip_reason，不再领取
-SKIP_REASONS = ("title_dup",)         # 巡检（同标题重复）；PG 模式不做卷期停止
+SKIP_REASONS = ("title_dup",)         # 巡检（同标题重复）
 
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_LEASE_S = 1800                # 30 分钟；正常一块 10～30 分钟，worker 每 lease/6 续一次
@@ -51,13 +44,15 @@ CREATE TABLE IF NOT EXISTS pl_tasks (
     url             text        NOT NULL,
     url_type        text        NOT NULL DEFAULT 'pdf' CHECK (url_type IN ('pdf', 'html')),
     host            text        NOT NULL,
+    source          text,
+    batch_no        text,
     chunk_id        bigint,
     status          text        NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'success', 'failed', 'non_pdf')),
     retry_count     int         NOT NULL DEFAULT 0,
     challenge_count int         NOT NULL DEFAULT 0,
     next_attempt_at timestamptz,
-    skip_reason     text        CHECK (skip_reason IN ('title_dup')),  -- 块内巡检跳过，不再领取
+    skip_reason     text        CHECK (skip_reason IN ('title_dup')),  -- 巡检跳过，不再领取
     http_status     int,
     error_kind      text        CHECK (error_kind IN ({", ".join(f"'{k}'" for k in ERROR_KINDS)})),
     error_message   text,
@@ -72,6 +67,8 @@ CREATE TABLE IF NOT EXISTS pl_tasks (
     updated_at      timestamptz NOT NULL DEFAULT now()
 ) WITH (fillfactor = 80);
 ALTER TABLE pl_tasks ADD COLUMN IF NOT EXISTS skip_reason text;
+ALTER TABLE pl_tasks ADD COLUMN IF NOT EXISTS source text;
+ALTER TABLE pl_tasks ADD COLUMN IF NOT EXISTS batch_no text;
 CREATE INDEX IF NOT EXISTS pl_tasks_chunk   ON pl_tasks (chunk_id, challenge_count, id) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS pl_tasks_unchunk ON pl_tasks (batch, id) WHERE status = 'pending' AND chunk_id IS NULL;
 CREATE INDEX IF NOT EXISTS pl_tasks_status  ON pl_tasks (batch, status, error_kind);
@@ -94,6 +91,19 @@ CREATE TABLE IF NOT EXISTS pl_chunks (
 );
 CREATE INDEX IF NOT EXISTS pl_chunks_queue ON pl_chunks (batch, generation, order_key) WHERE status = 'queued';
 CREATE INDEX IF NOT EXISTS pl_chunks_lease ON pl_chunks (lease_until) WHERE status = 'leased';
+
+CREATE TABLE IF NOT EXISTS pl_skip_rules (
+    batch       text        NOT NULL,
+    doi_prefix  text        NOT NULL,          -- 空串 = 不限 doi
+    url_prefix  text        NOT NULL,          -- 空串 = 不限 url
+    title       text        NOT NULL,          -- 触发的坏标题（样本）
+    support     int         NOT NULL,          -- 已采数据里命中规则的条数
+    precision   real        NOT NULL,          -- 命中条目里坏标题的占比
+    flagged     int         NOT NULL,          -- 据此跳过的 pending 数（多次触发累加）
+    scope       text        NOT NULL,          -- batch = inspect 全批次；chunk = 下载时本机块内
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (batch, doi_prefix, url_prefix)
+);
 """
 
 
@@ -140,8 +150,6 @@ class PgTaskQueue:
     """
 
     def __init__(self, dsn: str, batch: str, *, schema: Optional[str] = None, worker: str = "") -> None:
-        if psycopg is None:
-            raise RuntimeError("PG 队列需要 psycopg：pip install 'paperlite[pg]'")
         self.batch = batch
         self.worker = worker
         self._lock = threading.Lock()
@@ -163,14 +171,14 @@ class PgTaskQueue:
 
     def import_urls(self, rows: Iterable[dict]) -> tuple[int, int]:
         """
-        与 TaskDB.import_urls 同样的输入。先 COPY 进临时表，再按 (host, doi) 排序插入：
-        id 顺序即领取顺序，导入前不需要再排序。返回 (新增, 已存在)。
+        rows：dict，含 url（或 pdf_url），可选 doi / source / batch_no / url_type。先 COPY 进临时表，
+        再按 (host, doi) 排序插入：id 顺序即领取顺序，导入前不需要排序。返回 (新增, 已存在)。
         """
         seen = 0
         with self._lock, self._conn.transaction():
             c = self._conn
-            c.execute("CREATE TEMP TABLE pl_import (url_key bytea, doi text, url text, url_type text, host text) "
-                      "ON COMMIT DROP")
+            c.execute("CREATE TEMP TABLE pl_import (url_key bytea, doi text, url text, url_type text, host text, "
+                      "source text, batch_no text) ON COMMIT DROP")
             with c.cursor().copy("COPY pl_import FROM STDIN") as cp:
                 for r in rows:
                     url = (r.get("url") or r.get("pdf_url") or "").strip()
@@ -181,12 +189,13 @@ class PgTaskQueue:
                     kind = (r.get("url_type") or UrlType.PDF).strip().lower()
                     if kind not in UrlType.ALL:
                         raise ValueError(f"url_type 只能是 {' / '.join(UrlType.ALL)}，不是 {kind!r}: {url}")
-                    cp.write_row((url_key(url), doi, url, kind, h))
+                    cp.write_row((url_key(url), doi, url, kind, h,
+                                  (r.get("source") or "").strip() or None, (r.get("batch_no") or "").strip() or None))
                     seen += 1
             # 同一 url 多行只留 doi 最小的一行；按 (host, doi) 顺序插入，id 顺序即领取顺序
             added = c.execute(
-                "INSERT INTO pl_tasks (batch, url_key, doi, url, url_type, host) "
-                "SELECT %s, url_key, doi, url, url_type, host FROM ("
+                "INSERT INTO pl_tasks (batch, url_key, doi, url, url_type, host, source, batch_no) "
+                "SELECT %s, url_key, doi, url, url_type, host, source, batch_no FROM ("
                 "  SELECT DISTINCT ON (url_key) * FROM pl_import ORDER BY url_key, doi"
                 ") d ORDER BY host, doi "
                 "ON CONFLICT (url_key) DO NOTHING", (self.batch,)).rowcount
@@ -299,13 +308,14 @@ class PgTaskQueue:
                 (chunk_id, self.worker)).rowcount == 1
 
     def has_work(self) -> bool:
-        """还有可领的：queued 块，或 done 块里到点待重试的剩余任务（requeue_leftovers 能切出新块）。"""
+        """还有可领的：queued 块里有可领任务，或 done 块里到点待重试的剩余任务（requeue_leftovers 能切出新块）。
+        只看块是否 queued 不够：块里任务可能全被巡检跳过，领到也是空块。"""
         with self._lock:
             return self._conn.execute(
-                "SELECT EXISTS (SELECT 1 FROM pl_chunks WHERE batch = %(b)s AND status = 'queued') "
-                "OR EXISTS (SELECT 1 FROM pl_chunks k JOIN pl_tasks t ON t.chunk_id = k.chunk_id "
-                "  WHERE k.batch = %(b)s AND k.status = 'done' AND t.status = 'pending' AND t.skip_reason IS NULL "
-                "  AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= now()))", {"b": self.batch}).fetchone()[0]
+                "SELECT EXISTS (SELECT 1 FROM pl_chunks k JOIN pl_tasks t ON t.chunk_id = k.chunk_id "
+                "  WHERE k.batch = %(b)s AND k.status IN ('queued', 'done') AND t.status = 'pending' "
+                "  AND t.skip_reason IS NULL AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= now()))",
+                {"b": self.batch}).fetchone()[0]
 
     def complete(self, chunk_id: int) -> bool:
         """块处理完：记 done。返回 False = 租约已不属于本机（结果已写入，不影响）。"""
@@ -382,9 +392,99 @@ class PgTaskQueue:
                 "UPDATE pl_tasks SET skip_reason = NULL, error_kind = NULL, error_message = NULL, chunk_id = NULL, "
                 "updated_at = now() WHERE batch = %s AND status = 'pending' AND skip_reason IS NOT NULL "
                 "AND (%s::text IS NULL OR skip_reason = %s)", (self.batch, reason, reason)).rowcount
+            if reason in (None, "title_dup"):
+                c.execute("DELETE FROM pl_skip_rules WHERE batch = %s", (self.batch,))
         if n:
             self.build_chunks(size, generation=gen)
         return n
+
+    # ── 巡检（全批次，paperlite inspect 用；下载时的块内巡检见 PgTaskSource）──────
+
+    @staticmethod
+    def _prefix_where(doi_prefix: str, url_prefix: str) -> tuple[str, list]:
+        """前缀匹配用 left()（避免 LIKE 的 % _ 通配问题）；空前缀 = 不限该维度。"""
+        where, args = "", []
+        if doi_prefix:
+            where += " AND left(doi, %s) = %s"; args += [len(doi_prefix), doi_prefix]
+        if url_prefix:
+            where += " AND left(url, %s) = %s"; args += [len(url_prefix), url_prefix]
+        return where, args
+
+    def crawled_titles(self, cap: int = 100_000) -> list[tuple[str, str, str]]:
+        """已采成功任务的 (doi, url, title)，供巡检归纳；超量按 id 取前 cap 条。"""
+        with self._lock:
+            return [tuple(r) for r in self._conn.execute(
+                "SELECT doi, url, title FROM pl_tasks WHERE batch = %s AND status = 'success' "
+                "AND title IS NOT NULL ORDER BY id LIMIT %s", (self.batch, cap))]
+
+    def count_pending_matching(self, doi_prefix: str, url_prefix: str) -> int:
+        """全批次未采（pending 且未跳过）任务里 doi/url 命中前缀的条数。"""
+        where, args = self._prefix_where(doi_prefix, url_prefix)
+        with self._lock:
+            return self._conn.execute(
+                "SELECT count(*) FROM pl_tasks WHERE batch = %s AND status = 'pending' AND skip_reason IS NULL"
+                + where, [self.batch, *args]).fetchone()[0]
+
+    def flag_suspects(self, doi_prefix: str, url_prefix: str, title: str, support: int, precision: float) -> int:
+        """全批次：命中规则的 pending 记 skip_reason = title_dup（不再领取），规则记入 pl_skip_rules。
+        已在别的机器本地队列里的任务这次照常下载（它们不会再回库查标记）。返回本次跳过数。"""
+        where, args = self._prefix_where(doi_prefix, url_prefix)
+        msg = f"巡检：标题 {title[:80]!r} 重复，规则 doi~{doi_prefix!r} url~{url_prefix!r}（precision {precision:.3f}），未请求"
+        with self._lock, self._conn.transaction():
+            n = self._conn.execute(
+                "UPDATE pl_tasks SET skip_reason = 'title_dup', error_message = %s, updated_at = now() "
+                "WHERE batch = %s AND status = 'pending' AND skip_reason IS NULL" + where,
+                [msg, self.batch, *args]).rowcount
+            self._record_rule(doi_prefix, url_prefix, title, support, precision, n, "batch")
+        return n
+
+    def record_rule(self, doi_prefix: str, url_prefix: str, title: str, support: int, precision: float,
+                    flagged: int, scope: str) -> None:
+        with self._lock:
+            self._record_rule(doi_prefix, url_prefix, title, support, precision, flagged, scope)
+
+    def _record_rule(self, doi_prefix, url_prefix, title, support, precision, flagged, scope) -> None:
+        """调用方持锁。同一规则多次触发（多台机器各自块内触发）累加 flagged。"""
+        self._conn.execute(
+            "INSERT INTO pl_skip_rules (batch, doi_prefix, url_prefix, title, support, precision, flagged, scope) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (batch, doi_prefix, url_prefix) DO UPDATE SET "
+            "flagged = pl_skip_rules.flagged + excluded.flagged, support = greatest(pl_skip_rules.support, excluded.support)",
+            (self.batch, doi_prefix, url_prefix, title, support, round(precision, 4), flagged, scope))
+
+    def skip_rules(self) -> list[dict]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT doi_prefix, url_prefix, title, support, precision, flagged, scope, created_at "
+                "FROM pl_skip_rules WHERE batch = %s ORDER BY created_at", (self.batch,))
+            names = [d.name for d in cur.description]
+            return [dict(zip(names, r)) for r in cur]
+
+    # ── 重试与导出 ──────────────────────────────────────────
+
+    def reset(self, status: str, error_kind: Optional[str] = None) -> int:
+        """把指定状态（可再按 error_kind 筛）的任务放回 pending、清零重试计数；之后由 requeue_leftovers
+        切进下一代块（任一下载机领不到块时会自动切）。返回放回的任务数。"""
+        if status not in Status.FINAL:
+            raise ValueError(f"只能重置 {', '.join(Status.FINAL)}")
+        with self._lock:
+            return self._conn.execute(
+                "UPDATE pl_tasks SET status = 'pending', retry_count = 0, challenge_count = 0, next_attempt_at = NULL, "
+                "updated_at = now() WHERE batch = %s AND status = %s AND (%s::text IS NULL OR error_kind = %s)",
+                (self.batch, status, error_kind, error_kind)).rowcount
+
+    EXPORT_COLUMNS = ("id", "doi", "url", "url_type", "host", "source", "batch_no", "final_url", "title", "status",
+                      "error_kind", "skip_reason", "http_status", "file_size", "elapsed_ms", "exit_ip", "retry_count",
+                      "challenge_count", "file_path", "error_message", "worker", "chunk_id", "updated_at")
+
+    def rows(self, status: Optional[str] = None, fetch: int = 10_000):
+        """逐行产出导出用的任务（按 id）；用服务端游标，几百万行也不占满内存。"""
+        cols = ", ".join(self.EXPORT_COLUMNS)
+        with self._lock, self._conn.transaction():
+            with self._conn.cursor(name="pl_export") as cur:
+                cur.itersize = fetch
+                cur.execute(f"SELECT {cols} FROM pl_tasks WHERE batch = %s AND (%s::text IS NULL OR status = %s) "
+                            "ORDER BY id", (self.batch, status, status))
+                yield from cur
 
     # ── 查询 ────────────────────────────────────────────────
 
@@ -408,9 +508,9 @@ class PgTaskQueue:
                                           (self.batch,)).fetchall()
         return [r[0] for r in rows]
 
-    def kind_counts(self) -> list[tuple[str, str, int, int]]:
+    def kind_counts(self) -> list[tuple[str, str, int]]:
         with self._lock:
-            return [(s, k, n, 0) for s, k, n in self._conn.execute(
+            return [(s, k, n) for s, k, n in self._conn.execute(
                 "SELECT status, error_kind, count(*) FROM pl_tasks WHERE batch = %s AND status <> 'pending' "
                 "GROUP BY status, error_kind ORDER BY status, count(*) DESC", (self.batch,))]
 
@@ -453,7 +553,7 @@ class LeaseKeeper:
                 time.sleep(1)
 
 
-# ── TaskDB 的多机替身 ─────────────────────────────────────────
+# ── 给下载 worker 用的任务来源 ─────────────────────────────────────
 
 def _prefix_match(t: Task, doi_prefix: str, url_prefix: str) -> bool:
     return (not doi_prefix or t.doi.startswith(doi_prefix)) and (not url_prefix or t.url.startswith(url_prefix))
@@ -467,29 +567,26 @@ class _Active:
 
 class PgTaskSource:
     """
-    给下载 worker（consumer.Downloader / browser_pool.BrowserPool）用的任务来源，接口与 TaskDB 中
-    worker 用到的那部分一致：claim / finish / retry_later / challenged / count_claimable / has_status /
-    host / hosts / counts。内部：按块领取 → 本地队列 → 结果攒批回写。
+    给下载 worker（consumer.Downloader / browser_pool.BrowserPool）用的任务来源：claim / finish / retry_later /
+    challenged / count_claimable / has_status / host / hosts / counts。内部：按块领取 → 本地队列 → 结果攒批回写。
 
     - 本地队列空了就领下一块（上一块还有在途任务也照领，线程不空等）；没块了先 requeue_leftovers 再试
     - 一块的任务全部出结果 → 回写缓冲 → complete；租约丢了 → 丢弃本地还没领的任务，在途的结果照常上报
     - 结果每 flush_n 条或 flush_s 秒回写一次；关闭时回写剩余结果、交还没做完的块
-    - 巡检只在本机领到的块里做，不查、不改全库（见 docs/development/pg-chunk-lease.md）：浏览器模式的 WindowInspector
-      调 count_pending_matching / flag_suspects，只看、只跳本地队列，记 skip_reason = title_dup；
-      跳过的任务保持 pending，不再领取，clear_skips 可放回
-    - 不做卷期停止（依赖 ACM 式 DOI 结构，不通用）：volume_stop_after 被忽略，finish 恒返回 None
+    - 下载时的巡检只在本机领到的块里做，不查、不改全库（见 docs/development/pg-chunk-lease.md）：浏览器模式的
+      WindowInspector 调 count_pending_matching / flag_suspects，只看、只跳本地队列，记 skip_reason = title_dup，
+      规则记入 pl_skip_rules；跳过的任务保持 pending，不再领取，clear_skips 可放回
     """
 
     def __init__(self, queue: PgTaskQueue, *, chunk_size: int = DEFAULT_CHUNK_SIZE,
                  lease_s: float = DEFAULT_LEASE_S, flush_n: int = 500, flush_s: float = 5.0,
                  retry_delay_s: float = 0.0, remote_check_s: float = 5.0) -> None:
         self.q = queue
-        self.path = f"pg:{queue.batch}"            # 日志里代替 TaskDB.path
+        self.path = f"pg:{queue.batch}"            # 日志里显示的任务队列名
         self.chunk_size, self.lease_s = chunk_size, lease_s
         self.flush_n, self.flush_s = flush_n, flush_s
         self.retry_delay_s = retry_delay_s
         self.remote_check_s = remote_check_s
-        self.volume_stop_after = 0                 # Downloader 会赋值；PG 模式不做卷期停止，忽略
         self._lock = threading.RLock()
         self._local: "deque[Task]" = deque()
         self._chunks: dict[int, _Active] = {}
@@ -502,7 +599,7 @@ class PgTaskSource:
         self._flusher = threading.Thread(target=self._flush_loop, name="pg-flush", daemon=True)
         self._flusher.start()
 
-    # ── 导入（CLI import --pg）───────────────────────────────
+    # ── 导入（CLI import / run --urls）───────────────────────
 
     def import_urls(self, rows: Iterable[dict]) -> tuple[int, int]:
         added, existed = self.q.import_urls(rows)
@@ -575,12 +672,11 @@ class PgTaskSource:
     def finish(self, task: Task, status: str, *, http_status: Optional[int] = None, file_path: str = None,
                file_size: Optional[int] = None, elapsed_ms: Optional[int] = None, exit_ip: str = None,
                error_kind: Optional[str] = None, error_message: Optional[str] = None,
-               final_url: Optional[str] = None, title: Optional[str] = None) -> Optional[tuple[str, int]]:
+               final_url: Optional[str] = None, title: Optional[str] = None) -> None:
         assert status in Status.FINAL, status
         self._done(task, Result(task.id, status, http_status=http_status, error_kind=error_kind,
                                 error_message=error_message, file_path=file_path, file_size=file_size,
                                 elapsed_ms=elapsed_ms, exit_ip=exit_ip, final_url=final_url, title=title))
-        return None
 
     # ── 巡检钩子：browser_pool 的 WindowInspector 调用，只作用于本地队列 ──────
 
@@ -592,7 +688,13 @@ class PgTaskSource:
         msg = (f"巡检（本机块内）：标题 {title[:80]!r} 重复，规则 doi~{doi_prefix!r} url~{url_prefix!r}"
                f"（precision {precision:.3f}，命中 {support}），未请求")
         with self._lock:
-            return self._skip_local(lambda t: _prefix_match(t, doi_prefix, url_prefix), "title_dup", None, msg)
+            n = self._skip_local(lambda t: _prefix_match(t, doi_prefix, url_prefix), "title_dup", None, msg)
+        if n:
+            try:
+                self.q.record_rule(doi_prefix, url_prefix, title, support, precision, n, "chunk")
+            except Exception as e:                  # 规则记录只供 inspect --list 查看，失败不影响跳过
+                logger.warning("记录巡检规则失败: %s", e)
+        return n
 
     def _skip_local(self, pred, reason: str, error_kind: Optional[str], message: str) -> int:
         """调用方持锁：把本地队列里满足 pred 的任务记为跳过（不请求）。返回跳过数。"""
@@ -687,10 +789,6 @@ class PgTaskSource:
 
     # ── 查询与生命周期（CLI 用）─────────────────────────────
 
-    def lock_for_download(self) -> int:
-        """多机共享，没有独占锁；在途任务由租约保证。"""
-        return 0
-
     def host(self) -> Optional[str]:
         hs = self.q.hosts()
         return hs[0] if hs else None
@@ -711,11 +809,8 @@ class PgTaskSource:
     def type_counts(self) -> dict[str, dict[str, int]]:
         return self.q.type_counts()
 
-    def kind_counts(self) -> list[tuple[str, str, int, int]]:
+    def kind_counts(self) -> list[tuple[str, str, int]]:
         return self.q.kind_counts()
-
-    def volume_summary(self) -> tuple[int, int]:
-        return 0, 0
 
     def close(self) -> None:
         """回写剩余结果；没做完的块交还（放回 queued），别的机器马上能领。"""

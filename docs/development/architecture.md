@@ -1,13 +1,13 @@
 # 架构与设计说明
 
-本文解释 PaperLite 关键行为"为什么这样做"。以下行为都是有意为之，很多来自真实事故（见[事故复盘](postmortems.md)）。改动过盾、熔断、卷期停止、巡检的语义前，先读对应小节，避免无意中改回被否决的方案。
+本文解释 PaperLite 关键行为"为什么这样做"。以下行为都是有意为之，很多来自真实事故（见[事故复盘](postmortems.md)）。改动过盾、熔断、巡检、按块领取的语义前，先读对应小节，避免无意中改回被否决的方案。
 
 ## 总体结构
 
 ```
-          import                       run
-URL 文件 ────────▶ 任务队列 ◀───────────────────┐
-             SQLite（单机）或 PostgreSQL（多机） │ 领任务 / 回写结果
+          import                         run（一台或多台机器）
+URL 文件 ────────▶ PostgreSQL 任务队列 ◀──────────┐
+                  pl_tasks / pl_chunks            │ 按块领取 / 批量回写
                                                 │
         ┌───────────── 浏览器模式 ──────────────┤
         │  N 个 worker，各自一个浏览器 + 一个 IP │
@@ -19,14 +19,11 @@ URL 文件 ────────▶ 任务队列 ◀────────�
         │  下载线程：领身份 + 领任务 ─▶ curl_cffi 下载
         └────────────────────────────────────────
 
-  旁路：monitor.reporter ─▶ RabbitMQ ─▶ paperlite-monitor 面板
+  旁路：monitor.reporter ─▶ RabbitMQ ─▶ paperlite-monitor 面板 ─▶ PostgreSQL（schema paperlite_monitor）
 ```
 
-- 一份配置 = 一个批次。任务队列有两种后端，由 `[queue] backend` 选择：
-  - **SQLite**（`tasks.TaskDB`）：一个任务库同时只允许一个下载进程（`flock`），逐条领取。
-  - **PostgreSQL**（`pgqueue.PgTaskSource`）：多台机器共享一个批次，按块领取、带租约。设计见 [PG 按块领取设计](pg-chunk-lease.md)。
-
-  两者对 worker 暴露同一组接口（`claim` / `finish` / `retry_later` / `challenged` …），`browser_pool`、`consumer` 不感知后端。
+- 一份配置 = 一个批次（`[pg] batch`）。任务只存 PostgreSQL：进程按块领取（默认 1000 条）、带租约，块内在本地按顺序下载、结果攒批回写。一台机器和一百台机器是同一套机制。设计见 [PG 按块领取设计](pg-chunk-lease.md)。
+- worker（`browser_pool`、`consumer`）通过 `pgqueue.PgTaskSource` 的 `claim` / `finish` / `retry_later` / `challenged` 领任务、交结果，不直接写 SQL。
 - 浏览器模式不碰 Redis；curl 模式的生产者和下载线程只通过 Redis 交换身份，没有直接调用。
 - Redis 不存代理密码，只存 `ip:port`，下载线程用本地 `config.toml` 补鉴权。
 - 监控是旁路：业务代码只调用 `monitor.reporter` 的埋点函数，未启用时为空操作，绝不阻塞下载。
@@ -74,11 +71,9 @@ curl 模式的生产目标 = min(`max_identities`, 在线下载线程数, 可领
 
 连续 `max_fresh_rejects` 个新身份首次使用即被拒时，生产者暂停 `breaker_pause_s` 并告警，之后放行一个身份试探。这样可以避免代理配额耗尽时一分钟内烧掉数百个 IP。网络错误不计入阈值。
 
-## 卷期停止
+## 不做卷期停止
 
-curl 模式、SQLite 后端（PostgreSQL 后端不做：卷期号只能从 ACM 式 DOI 里认，太针对单个出版商）。缺失的 PDF 往往以整个卷期为单位出现。对尚未下到 PDF 的卷期，同时最多放出 `volume_stop_after` 个任务；若全部为 non-PDF（`not_found` / `paywall` / `landing_page`），则把该卷期其余任务标记为 `non_pdf` 并记 `inferred=1`。下到过 PDF 的卷期永远不会被停止。
-
-卷期号从 ACM 式 DOI（`10.xxxx/数字.数字`）中提取，其他格式的 DOI 不参与。
+旧版（SQLite 时期）在 curl 模式下有"卷期停止"：同一卷期接连几篇都没有 PDF，就把该卷期其余任务直接记为 `non_pdf`、不再请求。它只能从 ACM 式 DOI（`10.xxxx/数字.数字`）里认出卷期，对别的出版商不起作用，而且推断出来的结果没有实际请求过，容易误判。随 SQLite 一起移除；"成片失效"由下面的重复标题巡检覆盖。
 
 ## 流式下载
 
@@ -94,12 +89,21 @@ curl 模式、SQLite 后端（PostgreSQL 后端不做：卷期号只能从 ACM �
 
 该机制宁可少跳过，也不误跳仍然有效的任务。
 
-PostgreSQL 后端下巡检只作用于本机领到的块：规则归纳和精确率护栏不变，命中的任务记 `skip_reason = title_dup`，不影响别的机器手里的块。导入时按 (主机, DOI) 排过序，同一期刊基本在同一块里，信号大部分都在本机。早期版本的问题和修复过程见[事故复盘](postmortems.md)。
+巡检有两处：
 
-## CSV 导入按 DOI 排序
+- **下载时（浏览器模式）**：`WindowInspector` 只看本进程最近 `title_window_size` 条已加载页，命中后只跳过**本进程领到的块**里的任务，不查、不改全库，也不需要跨机器协调。导入时按 (主机, DOI) 排过序，同一期刊基本在同一块里，信号大部分都在本机。
+- **`paperlite inspect`**：用全批次已采数据归纳，跳过全批次命中的 pending。已经发到别的机器本地队列里的任务这一轮照常下载（它们不会回库查标记）。
 
-同一出版商、同一期刊的 DOI 前缀相同。导入时用 DuckDB 按 DOI 排序再插入，任务 id 连号，浏览器按 id 领取时同一站点的任务连在一起，少在站点间来回切换，卷期停止和巡检的信号也更集中。
+两处命中的任务都记 `skip_reason = title_dup`（保持 pending、不再领取），规则都记入 `pl_skip_rules`。早期版本的问题和修复过程见[事故复盘](postmortems.md)。
 
-## 存储分离
+## 导入按 (主机, DOI) 排序
 
-任务库只能放本地盘：SQLite 依赖随机写、文件锁和 mmap，FUSE 挂载都不支持。输出文件只有顺序写，可以放对象存储挂载。两者在 `[paths]` 中分别配置，不互相推导。文件路径按 `sha256(doi)` 的前两级分桶，避免单目录文件过多。
+同一出版商、同一期刊的 DOI 前缀相同。导入时在 PostgreSQL 里按 (主机, DOI) 排序再插入、切块：一块只打一个站点，同一期刊的任务连在一起，浏览器少在站点间来回切换，巡检的信号也集中在同一块里。
+
+## 为什么只用 PostgreSQL
+
+早期版本用本地 SQLite 文件做任务库，后来加了 PostgreSQL 支持多机。两套并存时，每个功能都要两边各做一遍、各测一遍，功能也对不齐（SQLite 没有多机，PG 缺导出和重试）。PostgreSQL 用一条 `docker run` 就能起来，单机用它也没有额外负担，所以统一成 PostgreSQL：任务队列和监控面板数据都在里面（不同 schema）。
+
+## 输出存储
+
+输出文件只有顺序写，可以放 goofys、s3fs 等对象存储挂载（`[paths] storage`）。文件路径按 `sha256(doi)` 的前两级分桶，避免单目录文件过多；DOI 全局唯一，不同站点的文件也不会撞。

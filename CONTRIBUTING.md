@@ -13,24 +13,25 @@ uv run paperlite --version
 
 ## 测试
 
-测试是 `unittest.TestCase` 子类，用 pytest 运行。依赖外部服务的用例由环境变量控制，没有设置时自动跳过。
+测试是 `unittest.TestCase` 子类，用 pytest 运行。依赖外部服务的用例由环境变量控制，没有设置时自动跳过。任务队列和监控面板都在 PostgreSQL 里，**大部分用例需要 PG**（每个用例建一个临时 schema，用完删掉）：
 
 ```bash
+docker run -d --name paperlite-pg -e POSTGRES_PASSWORD=pl -e POSTGRES_DB=paperlite -p 5439:5432 postgres:16-alpine
+export PAPERLITE_TEST_PG=postgresql://postgres:pl@127.0.0.1:5439/paperlite
+
 uv run pytest                                                   # 跳过依赖 Redis / RabbitMQ 的用例
 PAPERLITE_TEST_REDIS=redis://127.0.0.1:6379/0 uv run pytest     # 包含 Redis 用例
 PAPERLITE_TEST_AMQP=amqp://guest:guest@127.0.0.1:5672/%2F uv run pytest tests/test_monitor.py
-
-# PostgreSQL 后端
-docker run -d --name paperlite-pg -e POSTGRES_PASSWORD=pl -e POSTGRES_DB=paperlite -p 5439:5432 postgres:16-alpine
-PAPERLITE_TEST_PG=postgresql://postgres:pl@127.0.0.1:5439/paperlite uv run --extra pg pytest
 uv run pytest tests/test_paperlite.py::ConfigTest::test_from_dict   # 单个用例
 ```
 
-改动 `store.py`、`producer.py`、`consumer.py` 的 Redis 逻辑后，提交前务必起本机 Redis 全量跑一遍。改动 `pgqueue.py`，或改了 worker 调用任务队列的方式（两个后端都要兼容）时，用 `PAPERLITE_TEST_PG` 跑一遍。
+不设 `PAPERLITE_TEST_PG` 时只跑不需要数据库的用例（配置、分类、参数解析等），不能代替完整测试。GitHub Actions 发布前会起一个 PG 服务跑全量。
+
+改动 `store.py`、`producer.py`、`consumer.py` 的 Redis 逻辑后，提交前务必起本机 Redis 全量跑一遍。PG 相关的测试辅助在 `tests/pgutil.py`（`make_source`、`needs_pg`、`pg_config`）。
 
 ## 改代码之前
 
-- 先读[架构与设计说明](docs/development/architecture.md)和[事故复盘](docs/development/postmortems.md)。过盾判定、熔断、卷期停止、巡检的很多"看起来可以简化"的地方，都是被事故否决过的方案。
+- 先读[架构与设计说明](docs/development/architecture.md)和[事故复盘](docs/development/postmortems.md)。过盾判定、熔断、巡检、按块领取的很多"看起来可以简化"的地方，都是被事故否决过的方案。
 - 模块分工见[项目结构](docs/development/project-layout.md)。
 - 监控是旁路：不能让监控阻塞下载或抛错，新增埋点只加一行调用。
 

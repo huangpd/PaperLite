@@ -30,7 +30,8 @@ from paperlite.inspect import WindowInspector
 from paperlite.logutil import log_event
 from paperlite.monitor import reporter as mon
 from paperlite.proxy import IpSource, Lease, ProxySettings, ProxyUnavailable
-from paperlite.tasks import Status, Task, TaskDB, UrlType, pdf_path
+from paperlite.pgqueue import PgTaskSource
+from paperlite.tasks import Status, Task, UrlType, pdf_path
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,7 @@ class BrowserStats:
 class BrowserPool:
     """N 个 worker 协程并发，每个 worker 独占一个 浏览器+IP，串行领取任务下载。"""
 
-    def __init__(self, cfg: Limits, proxy: Optional[ProxySettings], db: TaskDB, out: Path, workers: int,
+    def __init__(self, cfg: Limits, proxy: Optional[ProxySettings], db: PgTaskSource, out: Path, workers: int,
                  no_proxy: bool = False) -> None:
         if workers > cfg.max_browsers:
             logger.info("worker 数 %d 超过 max_browsers %d，按 %d 运行", workers, cfg.max_browsers, cfg.max_browsers)
@@ -74,13 +75,13 @@ class BrowserPool:
         self.ips = None if no_proxy else IpSource(proxy)
         self.hosts = db.hosts()
         if not self.hosts:
-            raise ValueError("任务库里没有任务，无法确定主机")
+            raise ValueError("任务队列里没有任务，无法确定主机")
         self.host = db.host() or self.hosts[0]      # 热身落地页用第一个主机；其它主机的页面在首次渲染时各自过盾
         self.landing = cfg.landing_for(self.host)
         self.stats = BrowserStats()
         self._drained = threading.Event()      # 所有任务领完
         self._live: set[str] = set()           # 当前开着浏览器的 worker（监控：在线浏览器数）
-        # db 可以是 TaskDB（标记全库）或 pgqueue.PgTaskSource（只跳本机领到的块）
+        # db 是 pgqueue.PgTaskSource：巡检只跳本机领到的块
         self.inspector = (WindowInspector(db, cfg.title_dup_trigger, cfg.rule_min_precision,
                                           cfg.rule_min_support, cfg.title_window_size)
                           if cfg.title_dup_trigger else None)

@@ -1,4 +1,4 @@
-# RabbitMQ（监控消息总线）。用法见 docs/MONITOR.md：
+# RabbitMQ（监控消息总线）。用法见 docs/guide/monitoring.md：
 #   echo "MQ_ADMIN_PASS=$(openssl rand -hex 24)" > .env && chmod 600 .env && docker compose up -d
 services:
   rabbitmq:

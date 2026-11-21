@@ -1,4 +1,4 @@
-"""PG 按块领取原型（paperlite.pgqueue）。需要真实 PostgreSQL：
+"""任务队列（paperlite.pgqueue，PostgreSQL 按块领取）。需要真实 PostgreSQL：
 
     docker run -d --name paperlite-pg -e POSTGRES_PASSWORD=pl -e POSTGRES_DB=paperlite -p 5439:5432 postgres:16-alpine
     PAPERLITE_TEST_PG=postgresql://postgres:pl@127.0.0.1:5439/paperlite uv run pytest tests/test_pgqueue.py
@@ -176,7 +176,7 @@ class PgQueueTest(unittest.TestCase):
 
 @unittest.skipUnless(DSN, "需要 PAPERLITE_TEST_PG")
 class PgTaskSourceTest(unittest.TestCase):
-    """PgTaskSource：TaskDB 的多机替身（worker 侧接口一致）。"""
+    """PgTaskSource：给下载 worker 用的任务来源（按块领取、本地队列、攒批回写）。"""
 
     def setUp(self):
         from paperlite import pgqueue
@@ -404,20 +404,8 @@ class PgTaskSourceTest(unittest.TestCase):
             rest.append(t.doi)
             b.finish(t, "success")
         self.assertEqual(sorted(rest), [f"10.1/x{i:02d}" for i in range(5, 10)])
-
-    def test_volume_stop_after_is_ignored(self):
-        """PG 模式不做卷期停止：同卷期接连没有 PDF 也照常逐条请求。"""
-        s = self.src("a", chunk_size=100)
-        s.volume_stop_after = 2
-        s.import_urls({"doi": f"10.1145/100.{i}", "url": f"https://dl.acm.org/doi/pdf/10.1145/100.{i}"}
-                      for i in range(1, 6))
-        n = 0
-        while (t := s.claim("x")) is not None:
-            n += 1
-            self.assertIsNone(s.finish(t, "non_pdf", error_kind="paywall"))
-        self.assertEqual(n, 5)
-        s._flush()
-        self.assertEqual(self.queue().skip_counts(), {})
+        rules = q.skip_rules()                                # 块内触发的规则也记下来，inspect --list 可查
+        self.assertEqual([(r["doi_prefix"], r["scope"], r["flagged"]) for r in rules], [("10.1/x", "chunk", 4)])
 
     def test_browser_title_dup_skips_rest_in_chunk(self):
         """浏览器模式块内巡检：一段 URL 全是同一个"Deleted DOI"页，触发后本块里剩下的同前缀任务不再渲染。"""
@@ -469,7 +457,7 @@ class PgTaskSourceTest(unittest.TestCase):
 
 
 class PgConfigTest(unittest.TestCase):
-    """[queue] backend / [pg] 段解析与 --pg 开关（不需要 PostgreSQL）。"""
+    """[pg] 段解析（不需要 PostgreSQL）。"""
 
     def test_from_dict(self):
         from paperlite.config import PgConfig
@@ -487,57 +475,8 @@ class PgConfigTest(unittest.TestCase):
             p.write_text('[pg]\ndsn = "postgresql://h/db"\nbatch = "b"\n')
             self.assertEqual(config.load_pg(p).batch, "b")
             p.write_text("[paths]\n")
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, r"\[pg\]"):
                 config.load_pg(p)
-
-    def test_queue_backend(self):
-        from paperlite import config
-        self.assertEqual(config.QueueConfig().backend, "sqlite")
-        self.assertEqual(config.QueueConfig.from_dict({"backend": "pg"}).backend, "pg")
-        for bad in ({"backend": "mysql"}, {"nope": 1}):
-            with self.assertRaises(ValueError):
-                config.QueueConfig.from_dict(bad)
-        with self.assertRaisesRegex(ValueError, r"\[queue\] backend"):
-            config.RunConfig.from_dict({"pg": True})          # 后端只在 [queue] 选，[run] 没有 pg
-
-    def test_backend_selects_queue_for_every_command(self):
-        import argparse
-        from paperlite.cli import _use_pg, _configured_run_args
-        from paperlite import config
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / "config.toml"
-            ns = lambda **kw: argparse.Namespace(config=str(p), **kw)
-            p.write_text("[paths]\n")
-            self.assertFalse(_use_pg(ns()))                    # 没写 [queue] = sqlite
-            self.assertTrue(_use_pg(ns(pg=True)))              # --pg 单次覆盖
-            p.write_text('[queue]\nbackend = "pg"\n[pg]\ndsn = "postgresql://h/db"\nbatch = "b"\n')
-            self.assertTrue(_use_pg(ns()))
-            run = _configured_run_args(argparse.Namespace(config=str(p), log_level="INFO"), config.RunConfig())
-            self.assertTrue(_use_pg(run))                      # paperlite run config.toml 也走 PG
-            with self.assertRaises(SystemExit):
-                _use_pg(ns(db="tasks.db"))                     # pg 后端不接受 --db
-        self.assertFalse(_use_pg(argparse.Namespace(config=str(Path(d) / "missing.toml"))))
-
-    def test_export_retry_reject_pg_backend(self):
-        from paperlite import cli
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / "config.toml"
-            p.write_text('[queue]\nbackend = "pg"\n')
-            for argv in (["export"], ["retry", "--status", "failed"]):
-                with mock.patch("sys.argv", ["paperlite", "--config", str(p)] + argv), \
-                        mock.patch.object(cli, "_open_db", side_effect=AssertionError("不应打开队列")):
-                    with self.assertRaises(SystemExit) as e:
-                        cli.main()
-                    self.assertIn("PostgreSQL", str(e.exception))
-
-    def test_pg_flag_only_on_supported_commands(self):
-        from paperlite.cli import _build_parser
-        ap, _ = _build_parser()
-        for cmd in (["import", "--urls", "x"], ["run"], ["download"], ["produce"], ["status"], ["inspect"]):
-            self.assertTrue(ap.parse_args(cmd + ["--pg"]).pg, cmd)
-        for cmd in (["export"], ["retry", "--stopped-volumes"]):
-            with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
-                ap.parse_args(cmd + ["--pg"])
 
 
 if __name__ == "__main__":

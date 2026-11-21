@@ -4,21 +4,26 @@
 
 ## [Unreleased]
 
+### 不兼容变更
+
+- **任务队列只用 PostgreSQL**，移除 SQLite 任务库：配置文件必须有 `[pg]`（`dsn`、`batch`）。删除 `[paths] db`、`--db`、`[queue]`、`--pg`、`[run] pg`；旧配置里写了这些会报错并提示怎么改。没有迁移工具：已有的 `tasks.db` 批次需要把原始 CSV 重新导入。
+- **监控面板数据改存 PostgreSQL**：`[monitor] db` 换成 `[monitor] dsn`（留空用 `[pg] dsn`）和 `[monitor] schema`（默认 `paperlite_monitor`）；`paperlite-monitor --db` 换成 `--dsn` / `--schema`。
+- **移除卷期停止**：`[limits] volume_stop_after`、`retry --stopped-volumes` 删除（只适用 ACM 式 DOI，不通用）。
+- `psycopg` 成为默认依赖；`paperlite[pg]` 保留为空的兼容写法。
+
 ### 新增
 
-- PostgreSQL 任务队列后端：`[queue] backend = "pg"` + `[pg]` 段，多台机器共享同一个批次。导入时按 (主机, DOI) 排序切块，机器按块领取、带租约，结果批量写回；正常退出交还未做完的块，异常退出由租约到期回收。需要 `pip install 'paperlite[pg]'`。
-- 所有命令按 `[queue] backend` 选库；`--pg` 可对单条命令临时改用 PostgreSQL。
-- PostgreSQL 后端下巡检只作用于本机领到的块；`status` 显示块统计；`inspect --list` / `--reset` 查看和放回巡检跳过的任务。
-- `tools/bench_pg_chunks.py`：PG 队列调度压测。
-
-### 说明
-
-- PostgreSQL 后端暂不支持 `export` / `retry`（会报错，用 SQL），不做卷期停止。
+- 任务队列按块领取：导入时按 (主机, DOI) 排序切块（默认 1000 条），进程按块领取、带租约，结果批量写回；正常退出交还未做完的块，异常退出由租约到期回收。一台或多台机器用同一份配置即可共享一个批次。
+- `status` 显示块统计（queued / leased / done）和巡检跳过数。
+- `inspect` 对全批次巡检；下载时浏览器模式在本机块内实时巡检；两者的规则都记入 `pl_skip_rules`，`inspect --list` 可查。
+- `export` 流式导出，`retry` 放回后自动切进下一代块；导入保留 `source`、`batch_no`。
+- `deploy/pg/docker-compose.yml`；`tools/bench_pg_chunks.py`（PG 队列调度压测）。
+- CI 发布前起 PostgreSQL 服务跑全量测试。
 
 ### 文档
 
 - README 精简为概览，详细内容拆到 `docs/`：使用指南、配置参考、命令参考、任务库、架构与设计说明。
-- 新增 `CONTRIBUTING.md`、`CHANGELOG.md`、快速上手（中英双语）、故障排查、多机部署、PG 按块领取设计。
+- 新增 `CONTRIBUTING.md`、`CHANGELOG.md`、快速上手（中英双语）、故障排查、部署 PostgreSQL、多机部署、PG 按块领取设计。
 - `docs/MONITOR.md` 移至 `docs/guide/monitoring.md`，`POSTMORTEMS.md` 移至 `docs/development/postmortems.md`。
 
 ## [0.2.5] - 2026-11-17

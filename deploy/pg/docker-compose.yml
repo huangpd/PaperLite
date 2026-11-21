@@ -1,0 +1,19 @@
+# PostgreSQL（任务队列 + 监控面板数据）。用法见 docs/guide/postgres.md：
+#   echo "PG_PASS=$(openssl rand -hex 24)" > .env && chmod 600 .env && docker compose up -d
+# 各机器 config.toml：[pg] dsn = "postgresql://paperlite:<PG_PASS>@<本机 IP>:5432/paperlite"
+services:
+  postgres:
+    image: postgres:16
+    container_name: paperlite-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: paperlite
+      POSTGRES_PASSWORD: ${PG_PASS:?请先在 .env 里设 PG_PASS}
+      POSTGRES_DB: paperlite
+    command: ["postgres", "-c", "max_connections=300", "-c", "shared_buffers=1GB"]
+    ports:
+      - "5432:5432"                   # 只对内网开放：安全组 / 防火墙限制来源网段
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+volumes:
+  pg-data:

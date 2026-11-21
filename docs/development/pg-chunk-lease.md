@@ -1,22 +1,17 @@
 # PG 按块领取设计
 
-目标：多台机器（目标 100 台、每天几千万篇）共享一个批次的任务队列。SQLite 后端（单机，`TaskDB` + flock）保持不变；
-PostgreSQL 后端由 `paperlite.pgqueue` 实现（`pip install 'paperlite[pg]'`），配置 `[queue] backend = "pg"` 时所有命令改用它。
+目标：多台机器（目标 100 台、每天几千万篇）共享一个批次的任务队列。任务队列只有这一种实现：`paperlite.pgqueue`，
+一台机器也是同一套机制。部署与使用见[部署 PostgreSQL](../guide/postgres.md)和[多机部署](../guide/multi-machine.md)。本文讲为什么这样设计、怎么实现。
 
-部署与使用见[多机部署](../guide/multi-machine.md)。本文讲为什么这样设计、怎么实现。
+## 0. 组成
 
-## 0. 后端选择
+| 类 | 职责 |
+|---|---|
+| `PgTaskQueue` | 一个进程一个实例、一条连接。SQL 都在这里：导入、切块、领块、续租、回写、重试（`reset`）、导出（`rows`）、全批次巡检、统计 |
+| `PgTaskSource` | 给下载 worker 的任务来源：按块领取 → 本地队列 → 结果攒批回写；下载时的块内巡检 |
+| `LeaseKeeper` | 后台线程续租一块 |
 
-`cli._use_pg(args)` 决定后端：命令行 `--pg` 优先，否则读 `[queue] backend`（没有配置文件或没写 = `sqlite`）。
-`cli._open_db` 据此返回 `TaskDB` 或 `PgTaskSource`，两者对 worker 暴露同一组接口（见第 5 节），`browser_pool` / `consumer`
-不感知后端。`export` / `retry` 在 PG 后端下直接报错（`cli._reject_pg`）；`inspect` 只支持 `--list` / `--reset`。
-
-| | SQLite | PostgreSQL |
-|---|---|---|
-| 领取 | 逐条，按 `(challenge_count, id)` | 按块，块内本地排序 |
-| 并发控制 | 文件锁：一个库一个进程 | `FOR UPDATE SKIP LOCKED` + 块租约 |
-| 巡检 | 全库标记 | 只在本机领到的块里（第 6 节） |
-| 卷期停止 | 有 | 无 |
+`cli._open_db` 读 `[pg]` 建 `PgTaskQueue` + `PgTaskSource`；`retry` / `export` / `inspect` 直接用 `PgTaskQueue`。
 
 ## 1. 为什么按块，而不是逐条领
 
@@ -24,7 +19,7 @@ PostgreSQL 后端由 `paperlite.pgqueue` 实现（`pip install 'paperlite[pg]'`�
 
 - 领取热点：`SKIP LOCKED` 要跳过一串被别人锁住的行，并发越高越慢；
 - 状态列在索引里，每次更新都是非 HOT 更新，死元组堆积，autovacuum 压力大；
-- 每台机器拿到的是相隔很远的零散任务，卷期停止这类"本机连续看到相邻任务"的判断失效。
+- 每台机器拿到的是相隔很远的零散任务，巡检这类"本机连续看到相邻任务"的判断失效。
 
 按块领取：一块 = 按 `(host, doi)` 排好序后连续的约 1000 条。机器一次领一块，块内在本地按顺序处理，
 结果攒批回写。PG 的交互从"每篇两次"变成"每块一次领取 + 几次批量回写"。
@@ -43,13 +38,13 @@ PostgreSQL 后端由 `paperlite.pgqueue` 实现（`pip install 'paperlite[pg]'`�
 
 ## 3. 表结构
 
-- `pl_tasks`：与 SQLite 的 `paper_pdf_resources` 同名同义列，另加 `batch`、`host`、`chunk_id`、`next_attempt_at`、
-  `worker`、`skip_reason`（`title_dup`：块内巡检跳过，保持 pending、不再领取）；
+- `pl_tasks`：与上游 `paper_pdf_resources` 同名同义列，另加 `batch`、`host`、`chunk_id`、`next_attempt_at`、
+  `worker`、`skip_reason`（`title_dup`：巡检跳过，保持 pending、不再领取）；
   没有 `running` 状态（块内任务领取时不改状态，省掉每篇一次写）。`fillfactor = 80`。
 - `pl_chunks`：`chunk_id, batch, generation, order_key, host, size, first_doi, last_doi, status(queued/leased/done),
   worker, lease_until, attempts`。
 
-导入时 `INSERT ... ORDER BY host, doi`，id 顺序即领取顺序，导入前不需要 DuckDB 排序。
+导入时 `INSERT ... ORDER BY host, doi`，id 顺序即领取顺序。
 
 ## 4. 生命周期
 
@@ -72,14 +67,13 @@ import_urls ─▶ build_chunks（每 host 每 1000 条一块，换 host 必切�
 - **重试** `Result(status=RETRY, retry_delay_s=...)`：任务留在 pending，写 `next_attempt_at`，**不在本块内重试**；
   块里其余任务做完就 complete，难啃的任务不拖住整块。
 - **下一代** `requeue_leftovers`：把 done 块里到点的剩余 pending 任务重新切块，`generation + 1`。
-  第 0 代全部领完才轮到第 1 代，等价于单机版"被挑战 / 失败的排到后面"。advisory lock 保证同一批次只有一处在切。
+  第 0 代全部领完才轮到第 1 代：被挑战 / 要重试的任务排到后面。advisory lock 保证同一批次只有一处在切。
 
 ## 5. 接入方式：`PgTaskSource`
 
-worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB 的一小部分接口：
+worker（`consumer.Downloader`、`browser_pool.BrowserPool`）用到的接口：
 `claim / finish / retry_later / challenged / count_claimable / has_status / host / hosts / counts`。
-`PgTaskSource` 实现同样的接口，worker 代码不用改。巡检器（`WindowInspector`）需要的两个钩子
-`count_pending_matching` / `flag_suspects` 也由它实现，只作用于本地队列：
+巡检器（`WindowInspector`）需要的两个钩子 `count_pending_matching` / `flag_suspects` 也由它实现，只作用于本地队列：
 
 | 接口 | PgTaskSource 的做法 |
 |---|---|
@@ -90,28 +84,32 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB �
 | `close` | 回写剩余结果；没做完的块 `release` 回 queued，别的机器马上能领，不用等租约过期 |
 | 租约丢失 | 本地还没领的任务放弃（别的机器在做），在途的结果照常上报 |
 
-## 6. 现有功能在多机下怎么落
+## 6. 各功能怎么落在块上
 
-| 单机功能 | 多机做法 | 状态 |
-|---|---|---|
-| 卷期停止（`volume_stop_after`） | 不做：卷期号只能从 ACM 式 DOI（`10.xxxx/数字.数字`）里认，针对性太强、不通用 | 移除 |
-| 巡检（`title_dup_trigger`，浏览器模式） | 只在本机领到的块里跳过，见下 | 已实现 |
-| 被挑战排后（`challenge_count`） | `Result(challenged=True)`：块内排序靠后；放回重试时进入下一代 | 已实现 |
-| 重试退避 | `next_attempt_at` | 已实现 |
-| 身份池（curl 模式） | 不变，继续用 Redis | — |
-| 跨机器的按站点限速 / 并发上限 | Redis 计数（每个 host 的在线 worker 数、令牌桶） | 待设计 |
-| 进度和统计 | `stats()`；大表上改为汇总表，不要直接 `GROUP BY` 全表 | 部分 |
+| 功能 | 做法 |
+|---|---|
+| 巡检（`title_dup_trigger`） | 下载时只在本机领到的块里跳过，见下；`paperlite inspect` 对全批次做一次 |
+| 被挑战排后（`challenge_count`） | `Result(challenged=True)`：块内排序靠后；放回重试时进入下一代 |
+| 重试退避 | `next_attempt_at` |
+| 手动重试（`retry`） | `reset`：放回 pending、清零计数，`requeue_leftovers` 切进下一代 |
+| 导出（`export`） | `rows`：服务端游标流式读出 |
+| 身份池（curl 模式） | 不变，继续用 Redis |
+| 跨机器的按站点限速 / 并发上限 | 待设计：Redis 计数（每个 host 的在线 worker 数、令牌桶） |
+| 进度和统计 | `stats()`；大表上改为汇总表，不要直接 `GROUP BY` 全表（待做） |
+| 卷期停止 | 不做：卷期号只能从 ACM 式 DOI（`10.xxxx/数字.数字`）里认，针对性太强、不通用 |
 
-**为什么巡检只在块内做**：单机版的判断依赖全库状态（全库批量标记），多机下要么每篇查一次 PG，
-要么已经发到别的机器本地队列里的任务看不到标记。导入时按 (host, doi) 排过序，同一卷期、同一期刊基本在同一块里，
-信号大部分在本机，块内判断就够了，也不需要跨机器协调。
+**为什么下载时的巡检只在块内做**：全批次标记要么每篇查一次 PG，要么已经发到别的机器本地队列里的任务看不到标记。
+导入时按 (host, doi) 排过序，同一期刊基本在同一块里，信号大部分在本机，块内判断就够了，也不需要跨机器协调。
 
-**巡检**：
+**块内巡检**：
 - 仍是 `WindowInspector`（本机最近 `title_window_size` 条已加载页），规则归纳和精确率护栏不变；
-  只是"有多少待采匹配""标记哪些"换成本地队列：命中的记 `skip_reason = title_dup`。
-- 代价：精确率只在本机窗口上验证（单机版也是窗口）；别的机器手里的同前缀任务不受影响，它们自己的窗口会各自触发。
+  只是"有多少待采匹配""标记哪些"换成本地队列：命中的记 `skip_reason = title_dup`，规则记入 `pl_skip_rules`（`scope = chunk`）。
+- 代价：精确率只在本机窗口上验证；别的机器手里的同前缀任务不受影响，它们自己的窗口会各自触发。
 
-**撤销**：`clear_skips(reason)` 清掉 `skip_reason`、切成下一代块重新下载（CLI 见第 0 节）。
+**全批次巡检**（`paperlite inspect`）：`PgTaskQueue.crawled_titles / count_pending_matching / flag_suspects`，
+用全批次已采数据归纳，跳过全批次命中的 pending（`scope = batch`）。
+
+**撤销**：`clear_skips(reason)` 清掉 `skip_reason` 和规则、切成下一代块重新下载（`paperlite inspect --reset`）。
 
 ## 7. 参数
 
@@ -133,17 +131,16 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB �
 
 ## 9. 测试
 
-`tests/test_pgqueue.py`（需要 `PAPERLITE_TEST_PG`，没有时跳过）：
+`tests/test_pgqueue.py`（需要 `PAPERLITE_TEST_PG`，没有时跳过；`tests/test_paperlite.py` 里的 worker 测试也跑在 PG 上）：
 
 - 队列：导入排序和去重、按主机切块、16 线程并发领取不重复、租约过期回收与原主人续租失败、重复上报不覆盖、
   重试退避与下一代、空块跳过、LeaseKeeper；
 - PgTaskSource：多线程领完且每条一次、重试在同一次运行里排到最后再做、挑战到上限判 failed、
   close 交还未完成的块、租约丢失放弃本地任务；
-- 卷期停止：PG 模式下 `volume_stop_after` 被忽略，同卷期接连没有 PDF 也逐条请求；
-- 块内巡检：钩子只作用于本地队列（别的机器手里的块不受影响）、浏览器模式同标题触发后跳过本块剩余同前缀任务；
+- 块内巡检：钩子只作用于本地队列（别的机器手里的块不受影响）、规则记入 `pl_skip_rules`、浏览器模式同标题触发后跳过本块剩余同前缀任务；
 - 端到端：3 个 curl `Downloader`（各 2 线程）共享一个批次，30 条每条恰好请求一次；
   2 个 `BrowserPool`（各 2 浏览器）共享一个批次，20 页每页恰好渲染一次；
-- `[queue] backend` 与 `[pg]` 配置解析、`--pg` 开关、`export` / `retry` 在 PG 后端下报错（不需要 PG）。
+- `[pg]` 配置解析（不需要 PG）。
 
 ```bash
 docker run -d --name paperlite-pg -e POSTGRES_PASSWORD=pl -e POSTGRES_DB=paperlite -p 5439:5432 postgres:16-alpine

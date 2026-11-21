@@ -1,6 +1,6 @@
 # 日常运维
 
-本文的命令对两种任务队列后端都适用，差别处会注明。PostgreSQL 后端的部署和多机操作见[多机部署](multi-machine.md)。
+任务都在 `[pg]` 指向的 PostgreSQL 里，本文的命令在任一台机器上执行都行。多台机器一起跑见[多机部署](multi-machine.md)。
 
 ## 启动与停止
 
@@ -10,9 +10,9 @@ setsid nohup paperlite run config.toml > run.log 2>&1 < /dev/null &   # 后台
 pkill -f "paperlite run"                                          # 优雅停止（SIGTERM）
 ```
 
-- `Ctrl+C` / `SIGTERM`：在途任务回到 `pending`，再次执行同一命令即从断点继续。
-- 异常退出（`kill -9`、宕机）：下次启动时，上次残留的 `running` 任务会自动放回 `pending`。
-- SQLite 后端：同一个任务库同时只允许一个下载进程（文件锁），第二个进程会直接报错退出。要多进程、多机器并行，换 PostgreSQL 后端。
+- `Ctrl+C` / `SIGTERM`：已有结果写回，没做完的块立刻交还，再次执行同一命令即从断点继续。
+- 异常退出（`kill -9`、宕机）：这个进程领着的块等租约到期（默认 30 分钟，`[pg] lease_s`）后回到队列，由任何一个下载进程接手；已写回的结果保留。
+- 同一个批次可以同时跑多个下载进程（同一台或多台机器），各领各的块。
 - 给 `run` 传入配置文件时以 `[run]` 段为准，命令行上的其他 `run` 参数会被忽略。
 
 > 通过镜像源装的源码环境，请直接调用 `.venv/bin/paperlite`。`uv run` 会按 `uv.lock` 从默认源重新同步，受限网络下可能卡住。
@@ -20,13 +20,13 @@ pkill -f "paperlite run"                                          # 优雅停止
 ## 导入任务
 
 ```bash
-paperlite import --urls batch.csv                 # 导入到 [paths].db
+paperlite import --urls batch.csv                 # 导入到 [pg] 的批次
 paperlite import --urls pages.txt --type html     # 要网页本身而不是 PDF
 ```
 
 - 文本文件一行一个 URL，保持原顺序。
 - CSV 需要 `url` 列，可选 `doi`、`source`、`batch_no`、`url_type`（逐行覆盖 `--type`）。
-- CSV 会先用 DuckDB 按 DOI 排序再入库：同一出版商、同一期刊的 DOI 前缀相同，排序后连在一起，浏览器按 id 领取时少在站点间切换。没有 `doi` 列时从 URL 里认 DOI，认不出的排在最后。
+- 入库时按 (主机, DOI) 排序、切成块（默认 1000 条，`[pg] chunk_size`）：同一出版商、同一期刊的 DOI 前缀相同，排序后连在一起，一块只打一个站点。没有 `doi` 列时从 URL 里认 DOI，认不出的用 URL 哈希。
 - CSV 格式错误（如未加引号的逗号）会报出行号并中止导入。
 - 重复导入不会重置已有任务，日志里的"已存在"就是这些行。
 
@@ -36,24 +36,19 @@ paperlite import --urls pages.txt --type html     # 要网页本身而不是 PDF
 paperlite status
 ```
 
-输出各状态计数、按 `error_kind` 分组的失败数、已停的卷期，curl 模式下还有身份池，PostgreSQL 后端下还有块统计。直接查库见[任务库](../reference/task-database.md)。
+输出各状态计数（`running` 是本进程在途数，别的机器在做的仍计为 `pending`）、块统计（queued 待领 / leased 领取中 / done 已完成）、巡检跳过数、按 `error_kind` 分组的失败数，curl 模式下还有身份池。直接查库见[任务库](../reference/task-database.md)。
 
 ## 重试
-
-仅 SQLite 后端；PostgreSQL 后端用 SQL 放回，见[多机部署](multi-machine.md#6-看进度)。
 
 ```bash
 paperlite retry --status failed                    # 所有失败任务放回 pending
 paperlite retry --status failed --kind network     # 只放回网络错误
 paperlite retry --status non_pdf --kind paywall    # 换了有订阅的出口后重下订阅页
-paperlite retry --stopped-volumes                  # 让被卷期停止的卷期重新抽样核实
 ```
 
-重置后再执行 `paperlite run config.toml` 即可。
+放回的任务会切成新一代块。正在跑的下载机领完手头的块后会自动接着做；都已退出的话，再执行 `paperlite run config.toml`。
 
 ## 导出
-
-仅 SQLite 后端。
 
 ```bash
 paperlite export --file all.csv
@@ -62,21 +57,28 @@ paperlite export --status success --file done.csv
 
 ## 巡检（重复标题跳过）
 
-浏览器模式下，若大量页面标题相同（通常是错误页或封面页），PaperLite 会归纳出一条 DOI/URL 前缀规则，在已采数据上验证精确率 ≥ 0.98 后，把命中的 pending 任务标记为跳过。原理见[架构与设计说明](../development/architecture.md#重复标题巡检)。
+若大量页面标题相同（通常是错误页或封面页），PaperLite 会归纳出一条 DOI/URL 前缀规则，在已采数据上验证精确率 ≥ 0.98 后，把命中的 pending 任务标记为跳过（保持 pending、不再领取）。原理见[架构与设计说明](../development/architecture.md#重复标题巡检)。
+
+巡检有两种：
+
+| | 什么时候 | 范围 |
+|---|---|---|
+| 下载时实时巡检 | 浏览器模式自动进行 | 只看本进程最近加载的页面，只跳本进程领到的块里的任务 |
+| `paperlite inspect` | 手动执行，任一台机器 | 全批次已采数据归纳规则，跳过全批次命中的 pending；已经在别的机器本地队列里的任务这一轮照常下载 |
 
 ```bash
-paperlite inspect --list      # 查看已生效的规则
-paperlite inspect             # 用当前数据重新巡检
-paperlite inspect --reset     # 清除所有规则与标记，被跳过的任务重新可领
+paperlite inspect --list      # 查看已生效的规则（两种巡检的都在）和跳过数
+paperlite inspect             # 用全批次已采数据巡检一次
+paperlite inspect --reset     # 清除所有规则，放回全部被跳过的任务
 ```
 
 相关配置：`title_dup_trigger`（0 关闭）、`title_window_size`、`rule_min_precision`、`rule_min_support`。
 
 ## 新增站点
 
-不需要按站点配置，主机直接取自任务库里的 URL。
+不需要按站点配置，主机直接取自任务队列里的 URL。
 
-- 每个新浏览器先在第一个导入的主机上热身过盾，默认地址 `https://{host}/`。
+- 每个新浏览器先在批次的第一个主机（按块顺序）上热身过盾，默认地址 `https://{host}/`。
 - 首页不适合热身（不触发挑战，或会跳到别处）时，在 `[landing]` 覆盖：
 
   ```toml

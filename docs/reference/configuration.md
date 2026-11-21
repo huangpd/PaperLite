@@ -8,11 +8,26 @@
 2. 环境变量 `PAPERLITE_CONFIG`
 3. 当前目录的 `config.toml`
 
-写了不认识的段或字段会直接报错，防止拼写错误被静默忽略。
+写了不认识的段或字段会直接报错，防止拼写错误被静默忽略。旧版的 `[queue]`、`[paths] db`、`[run] pg`、`[limits] volume_stop_after`、`[monitor] db` 会报错并提示怎么改。
 
-命令行覆盖：`--db` 优先于 `[paths].db`，`--storage`（`run`、`download` 可用）优先于 `[paths].storage`。给 `run` 传入配置文件时以 `[run]` 段为准，命令行上的其他 `run` 参数会被忽略。
+命令行覆盖：`--storage`（`run`、`download` 可用）优先于 `[paths].storage`。给 `run` 传入配置文件时以 `[run]` 段为准，命令行上的其他 `run` 参数会被忽略。
 
-**`config.toml` 含代理密码，不要提交到 git，也不要外传。**
+**`config.toml` 含数据库和代理密码，不要提交到 git，也不要外传。**
+
+## `[pg]` 任务队列（必填）
+
+任务都在 PostgreSQL 里。`dsn` 和 `batch` 相同的机器共享同一个批次，一台还是多台都一样。部署见[部署 PostgreSQL](../guide/postgres.md)。
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `dsn` | （必填） | `postgresql://user:pass@host:5432/db`，含密码。必须指向主库 |
+| `batch` | （必填） | 批次名。同一批次的所有机器填同一个；不同批次可共用一个 PG，互不可见 |
+| `schema` | 空 | 表所在的 schema；空 = 默认 `search_path`（通常是 `public`） |
+| `chunk_size` | 1000 | 每块任务数，进程一次领一块。太小 PG 交互多，太大机器挂了重做多、批次收尾慢 |
+| `lease_s` | 1800 | 块租约秒数，后台每 `lease_s / 6` 续一次。要长于一块的正常耗时；进程异常退出后，它的块过这么久才被别人接手 |
+| `flush_n` | 500 | 结果攒够这么多条写回一次 |
+| `flush_s` | 5.0 | 或者攒了这么久写回一次 |
+| `retry_delay_s` | 0 | 要重试的任务至少等这么久才进入下一代块 |
 
 ## `[proxy]` 代理
 
@@ -36,34 +51,8 @@
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `db` | `tasks.db` | SQLite 任务库（`backend = "pg"` 时不用）。**必须本地盘**（随机写、文件锁、mmap），goofys / s3fs 等 FUSE 挂载不支持 |
-| `storage` | `output` | PDF / HTML 输出目录。只有顺序写，可放对象存储挂载 |
+| `storage` | `output` | PDF / HTML 输出目录。只有顺序写，可放对象存储挂载；多台机器建议挂同一个共享存储、路径一致 |
 | `log_dir` | `log` | 日志目录；非空时同时输出到终端并写 `.jsonl`，留空只输出到终端 |
-
-`db` 与 `storage` 相互独立，不互相推导。
-
-## `[queue]` 任务队列后端
-
-| 字段 | 默认值 | 说明 |
-|---|---|---|
-| `backend` | `sqlite` | `sqlite`：单机，任务库是 `[paths].db`。`pg`：多台机器共享一个 PostgreSQL 队列，连接写在 `[pg]` |
-
-所有命令（`import`、`run`、`status`、`inspect` 等）都按它选库。命令行 `--pg` 可以对单条命令临时改用 PostgreSQL；`backend = "pg"` 时不能再用 `--db`。两种后端的区别见[运行模式](../guide/modes.md#任务队列后端)。
-
-## `[pg]` PostgreSQL
-
-`backend = "pg"` 时必填，需要 `pip install 'paperlite[pg]'`。部署见[多机部署](../guide/multi-machine.md)。
-
-| 字段 | 默认值 | 说明 |
-|---|---|---|
-| `dsn` | （必填） | `postgresql://user:pass@host:5432/db`，含密码。必须指向主库 |
-| `batch` | （必填） | 批次名。同一批次的所有机器填同一个；不同批次可共用一个 PG |
-| `schema` | 空 | 表所在的 schema；空 = 默认 `search_path` |
-| `chunk_size` | 1000 | 每块任务数，机器一次领一块。太小 PG 交互多，太大机器挂了重做多、批次收尾慢 |
-| `lease_s` | 1800 | 块租约秒数，后台每 `lease_s / 6` 续一次。要长于一块的正常耗时 |
-| `flush_n` | 500 | 结果攒够这么多条写回一次 |
-| `flush_s` | 5.0 | 或者攒了这么久写回一次 |
-| `retry_delay_s` | 0 | 要重试的任务至少等这么久才进入下一代块 |
 
 ## `[run]` 启动参数
 
@@ -75,7 +64,7 @@
 | `mode` | `browser` | `browser`（多主机混跑）或 `curl`（单主机 cookie 池） |
 | `proxy` | true | false 等同于 `--no-proxy`，仅浏览器模式 |
 | `workers` | 20 | 浏览器模式为并发浏览器数，curl 模式为下载线程数 |
-| `urls` | 空 | 启动时先导入的 URL 文件 |
+| `urls` | 空 | 启动时先导入的 URL 文件。多台机器时只在一台上填 |
 | `url_type` | `pdf` | `pdf`（期望拿到 PDF）或 `html`（保存网页本身）；CSV 的 `url_type` 列逐行覆盖 |
 | `headed` | false | 仅浏览器模式：显示浏览器窗口（调试） |
 
@@ -110,7 +99,7 @@
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `redis_url` | `redis://127.0.0.1:6379/0` | 身份池所在的 Redis；浏览器模式不用 |
+| `redis_url` | `redis://127.0.0.1:6379/0` | 身份池所在的 Redis；浏览器模式不用。多台机器指向同一个 |
 | `key_prefix` | `paperlite` | Redis key 前缀 |
 | `max_identities` | 20 | 健康身份上限；实际目标 = min(本值, 在线下载线程数, 可领取任务数) |
 | `refill_before_s` | 90 | 身份剩余寿命低于此值即不算健康，提前生产替补 |
@@ -120,17 +109,16 @@
 | `breaker_pause_s` | 600 | 熔断暂停秒数，之后放一个身份试探 |
 | `min_identities` | 0 | **已废弃**，不再生效；非 0 时打警告 |
 
-### 跳过规则
+### 巡检
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `volume_stop_after` | 3 | curl 模式、SQLite 后端的卷期停止：同一卷期还没下到 PDF 时最多放出这么多篇，全部无 PDF 即停掉该卷期其余任务；0 关闭 |
-| `title_dup_trigger` | 10 | 浏览器模式巡检：同一标题重复到该次数时归纳规则；0 关闭 |
-| `title_window_size` | 500 | 巡检只看本次运行最近这么多条已加载页面；不能小于 `title_dup_trigger` |
+| `title_dup_trigger` | 10 | 同一标题重复到该次数时归纳规则；0 关闭下载时的实时巡检 |
+| `title_window_size` | 500 | 实时巡检只看本进程最近这么多条已加载页面；不能小于 `title_dup_trigger` |
 | `rule_min_precision` | 0.98 | 规则在已采数据上的最低精确率 |
 | `rule_min_support` | 10 | 规则在已采数据上的最低命中数 |
 
-两者的原理见[架构与设计说明](../development/architecture.md)。
+原理见[架构与设计说明](../development/architecture.md#重复标题巡检)。
 
 ## `[landing]` 过盾落地页
 
@@ -141,7 +129,7 @@
 "dl.acm.org" = "https://dl.acm.org/doi/10.1145/3779295"
 ```
 
-- 浏览器模式：每个新浏览器在第一个导入的主机的落地页上热身。
+- 浏览器模式：每个新浏览器在批次第一个主机的落地页上热身。
 - curl 模式：生产者用落地页验收身份；遇到挑战时也用它复验身份。建议配成有代表性的真实文章页。
 
 ## `[monitor]` 监控
@@ -165,9 +153,10 @@
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
+| `dsn` | 空（用 `[pg].dsn`） | 面板数据所在的 PostgreSQL |
+| `schema` | `paperlite_monitor` | 面板表所在 schema，与任务表分开 |
 | `queue` | `paperlite.monitor.dashboard` | 面板的持久队列 |
 | `queue_max_length` | 2000000 | 队列上限，超出丢最旧的 |
-| `db` | `monitor.db` | 面板 SQLite（本地盘） |
 | `bind`、`port` | `127.0.0.1`、8700 | 监听地址 |
 | `username`、`password` | `admin`、空 | 网页登录；监听非本机地址时必须设密码或 token |
 | `token` | 空 | 给脚本调 `/api/summary` 用的只读令牌 |

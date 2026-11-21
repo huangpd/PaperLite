@@ -1,5 +1,16 @@
 # PaperLite 配置。paperlite init 生成为 ./config.toml 再填写（在当前目录运行时自动读取；别处运行用 --config 或 PAPERLITE_CONFIG）。
-# 一份 config = 一个批次：各种主机的 URL 混着导进一个库，默认浏览器模式统一跑。config.toml 含代理密码，不要提交、不要公开同步。
+# 一份 config = 一个批次（[pg] batch）：各种主机的 URL 混着导进 PostgreSQL 任务队列，一台或多台机器共享，默认浏览器模式统一跑。
+# config.toml 含代理和数据库密码，不要提交、不要公开同步。
+
+[pg]                          # 任务队列（必填）：PostgreSQL。一台或多台机器填同一个 dsn + batch 就共享同一个批次
+dsn = "postgresql://paperlite:密码@127.0.0.1:5432/paperlite"   # 含密码，别提交；必须指向主库
+batch = "my-batch"            # 批次名：同一批次的所有机器填同一个；不同批次可共用一个 PG
+# schema = ""                 # 可选：表放在单独的 schema
+# chunk_size = 1000           # 每块任务数：机器一次领一块
+# lease_s = 1800              # 块租约秒数，后台每 lease_s/6 续一次；机器挂了租约到期由别的机器接手
+# flush_n = 500               # 结果攒够这么多条回写一次
+# flush_s = 5.0               # 或者攒了这么久回写一次
+# retry_delay_s = 0           # 要重试的任务至少等这么久再进下一代块
 
 [proxy]
 api_url = ""                  # 短效代理提取接口（每次返回一个 IP，青果格式 JSON），必填
@@ -15,23 +26,9 @@ check_timeout_s = 10          # 单次体检 HTTP 请求超时
 check_max_latency_ms = 3000   # 体检往返延迟超过此值即弃（慢代理大概率过盾也慢）；0 关闭
 verify_exit_ip = true         # 核对回显出口 IP 是否等于 proxy_ip（证明真转发、非劫持/透明）
 
-[paths]                       # 位置：db 与 storage 相互独立
-db      = "tasks.db"          # 任务库（SQLite）。必须本地盘：要随机写/文件锁/mmap，goofys/s3fs 等 FUSE 挂载不支持
-storage = "/obs"              # 输出目录（PDF/HTML）。可放对象存储挂载（顺序写）
+[paths]                       # 位置（任务在 [pg]）
+storage = "/obs"              # 输出目录（PDF/HTML）。可放对象存储挂载（顺序写）；多台机器建议挂同一个共享存储、路径一致
 log_dir = "log"               # 日志目录；非空时同时打印到终端并写入 .jsonl；留空则只打终端
-
-[queue]                       # 任务队列后端：所有命令（import / run / status / inspect）都按它选库
-backend = "sqlite"            # sqlite = 单机，任务库就是 [paths].db（默认）；pg = 多台机器共享一个 PostgreSQL 队列，填下面的 [pg]
-
-# [pg]                        # backend = "pg" 时必填；需要 pip install 'paperlite[pg]'
-# dsn = "postgresql://user:密码@pg-host:5432/paperlite"   # 含密码，别提交
-# batch = "10.1016-2026-11"   # 批次名：同一批次的所有机器填同一个；不同批次可共用一个 PG
-# schema = ""                 # 可选：表放在单独的 schema
-# chunk_size = 1000           # 每块任务数：机器一次领一块
-# lease_s = 1800              # 块租约秒数，后台每 lease_s/6 续一次；机器挂了租约到期由别的机器接手
-# flush_n = 500               # 结果攒够这么多条回写一次
-# flush_s = 5.0               # 或者攒了这么久回写一次
-# retry_delay_s = 0           # 要重试的任务至少等这么久再进下一代块
 
 [limits]                      # 并发与行为（不含存储路径）
 # redis_url = "redis://127.0.0.1:6379/0"   # 仅 curl 模式用（浏览器模式不用 Redis）
@@ -47,7 +44,6 @@ download_timeout_s = 120      # 流式下载卡顿超时：连续这么久收不
 max_file_size_mb = 200        # 单个 PDF 上限，超过中止
 max_tries = 3                 # 网络错误重试次数（cookie 被拒不计）
 max_url_challenges = 3        # 单条 URL 带有效 cookie 仍被挑战满这么多次 → failed / challenge_failed
-volume_stop_after = 3         # curl 模式：同卷期接连这么多篇无 PDF 就停该卷期其余任务；0 关闭
 max_fresh_rejects = 5         # 连续这么多个新身份一用就被拒 → 熔断暂停生产
 breaker_pause_s = 600         # 熔断暂停时长（秒），之后放一个身份试探
 debug_dir = ""                # 过盾失败截图目录，空则不截图
@@ -73,7 +69,8 @@ node = ""                     # 终端名，留空用主机名
 vendor = "qingguo"            # 代理厂商标签：面板按「厂商 × 域名」统计成功率
 heartbeat_s = 15              # 心跳间隔（在线浏览器数、待下载数）
 # 以下仅面板端（paperlite-monitor serve）用
-# db = "monitor.db"           # 面板入库 SQLite（本地盘），保留 retention_days 天
+# dsn = ""                    # 面板数据存 PostgreSQL；留空 = 用 [pg] 的 dsn（与任务队列同一个库）
+# schema = "paperlite_monitor" # 面板表所在 schema，与任务表分开
 # bind = "127.0.0.1"
 # port = 8700
 # username = "admin"          # 面板网页登录用户名
