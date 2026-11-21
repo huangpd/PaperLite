@@ -8,7 +8,7 @@
 2. 环境变量 `PAPERLITE_CONFIG`
 3. 当前目录的 `config.toml`
 
-写了不认识的段或字段会直接报错，防止拼写错误被静默忽略。旧版的 `[queue]`、`[landing]`、`[paths] db`、`[run] pg`、`[limits] volume_stop_after`、`[monitor] db` 会报错并提示怎么改。
+写了不认识的段或字段会直接报错，防止拼写错误被静默忽略。旧版已移除的字段（任务库路径、后端切换、热身页、卷期停止、外部中间件的连接地址等）也会报错，并提示删掉哪几行、改成什么。
 
 命令行覆盖：`--storage`（`run`、`download` 可用）优先于 `[paths].storage`。给 `run` 传入配置文件时以 `[run]` 段为准，命令行上的其他 `run` 参数会被忽略。
 
@@ -97,10 +97,10 @@
 
 ### curl 模式身份池
 
+身份池和任务队列在同一个 PostgreSQL（`[pg]`），不需要单独配置。
+
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `redis_url` | `redis://127.0.0.1:6379/0` | 身份池所在的 Redis；浏览器模式不用。多台机器指向同一个 |
-| `key_prefix` | `paperlite` | Redis key 前缀 |
 | `max_identities` | 20 | 健康身份上限；实际目标 = min(本值, 在线下载线程数, 可领取任务数) |
 | `refill_before_s` | 90 | 身份剩余寿命低于此值即不算健康，提前生产替补 |
 | `min_left_s` | 20 | 身份剩余寿命低于此值不再发请求 |
@@ -129,24 +129,27 @@
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `enabled` | false | true 才上报 |
-| `amqp_url` | `amqp://guest:guest@127.0.0.1:5672/%2F` | RabbitMQ 地址（含密码） |
-| `exchange` | `paperlite.monitor` | topic exchange |
 | `node` | 主机名 | 终端名 |
 | `vendor` | 空（记为 unknown） | 代理厂商标签，面板按"厂商 × 域名"统计 |
 | `heartbeat_s` | 15 | 心跳间隔 |
-| `buffer_size` | 10000 | 本地发送缓冲；RabbitMQ 不通时超出就丢最旧的 |
+| `buffer_size` | 10000 | 本地发送缓冲；PG 写不进时超出就丢最旧的 |
+| `flush_s` | 2.0 | 攒这么久按批写一次 |
 | `forward_logs` | true | 把 WARNING 及以上日志也作为实时事件上报 |
+
+**两端共用：**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `dsn` | 空（用 `[pg].dsn`） | 监控用的 PostgreSQL：下载机把事件写进来，面板从这里取 |
+| `schema` | `paperlite_monitor` | 监控表所在 schema，与任务表分开 |
 
 **面板（`paperlite-monitor serve`）用：**
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `dsn` | 空（用 `[pg].dsn`） | 面板数据所在的 PostgreSQL |
-| `schema` | `paperlite_monitor` | 面板表所在 schema，与任务表分开 |
-| `queue` | `paperlite.monitor.dashboard` | 面板的持久队列 |
-| `queue_max_length` | 2000000 | 队列上限，超出丢最旧的 |
+| `backlog_max` | 2000000 | 面板没开时待处理事件的积压上限，超出丢最旧的 |
 | `bind`、`port` | `127.0.0.1`、8700 | 监听地址 |
 | `username`、`password` | `admin`、空 | 网页登录；监听非本机地址时必须设密码或 token |
 | `token` | 空 | 给脚本调 `/api/summary` 用的只读令牌 |
 | `retention_days` | 30 | 小时汇总保留天数 |
-| `raw_retention_hours` | 48 | 原始事件保留小时数 |
+| `raw_retention_hours` | 6 | 原始事件保留小时数（大屏只读小时汇总） |

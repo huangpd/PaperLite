@@ -3,34 +3,35 @@
 """
 paperlite/store.py
 ────────────────────
-Redis 里的身份池：生产者和消费者只通过这里交互，可分属不同进程/机器。
+curl 模式的身份池，存在 PostgreSQL（与任务队列同一个库、同一个 [pg] schema）：生产者和消费者只通过这里交互，
+可分属不同进程 / 机器。
 
 一个身份 = 出口 IP + 该 IP 过盾得到的 cookie + UA。cf_clearance 绑定 IP 与 UA，
 三者必须一起用；过期时间取 cookie 过期与 IP 到期中较早者。
 
-键（prefix 默认 paperlite，host 如 dl.acm.org）：
-  {prefix}:{host}:id:{id}     hash  身份内容，EXPIREAT = 身份过期时间
-  {prefix}:{host}:ready       zset  空闲身份，score = 过期时间
-  {prefix}:{host}:inuse       zset  被下载线程占用的身份，score = 过期时间
-  {prefix}:{host}:lease:{id}  str   占用者，带 TTL；心跳续期，进程崩溃后到期由 reap() 归还
-  {prefix}:{host}:workers     zset  在线下载线程，score = 最近心跳；生产者据此决定生产多少
-  {prefix}:{host}:pending     hash  各下载进程上报的可领取任务数（数到线程数为止），值 "条数:时间戳"；
-                                    生产目标不超过各进程之和，没有消费者就不生产
-  {prefix}:{host}:producer    str   当前生产者，带 TTL；同一主机同时只有一个生产者在干活，其余待命
-  {prefix}:{host}:fresh_rejects  int  连续"一篇没下成就被拒"的新身份数；任一身份下载成功即清零
-  {prefix}:{host}:paused      str   熔断暂停生产，带 TTL
+表都是 UNLOGGED：内容是临时的（身份最多活十几分钟），不写 WAL，频繁更新更快；PG 崩溃后清空，生产者重新生产即可。
+  pl_identities   一行一个身份。holder 为空 = 空闲；holder 非空且 lease_until 未到 = 被下载线程占用；
+                  租约过期（占用者崩溃）的身份领取时当作空闲。领取用 FOR UPDATE SKIP LOCKED，多线程多机不重复。
+  pl_id_hosts     一行一个主机：生产者锁（producer + producer_until，同一主机同时只有一个生产者在干活）、
+                  熔断计数 fresh_rejects、暂停到期 paused_until、最近成功链接 good_url。
+  pl_id_workers   在线下载线程（最近心跳）；生产者据此决定生产多少。
+  pl_id_pending   各下载进程上报的可领取任务数（数到线程数为止）；生产目标不超过各进程之和，没有消费者就不生产。
 
-Redis 里不存代理密码，只存 ip:port；消费者用本地配置补鉴权。
+时间都用 epoch 秒（与 Identity.expires_at 一致），由调用方的时钟给出；各机器要做时钟同步（NTP）。
+库里不存代理密码，只存 ip:port；消费者用本地配置补鉴权。
 """
 
 import json
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field, fields
 from http.cookiejar import CookieJar
 from typing import Optional
 
-import redis
+import psycopg
+from psycopg import sql
+from psycopg.types.json import Jsonb
 
 from paperlite.cookies import jar_from_records, jar_to_records
 
@@ -38,53 +39,33 @@ WORKER_STALE_S = 60   # 下载线程超过此时长无心跳即视为离线
 PENDING_STALE_S = 60  # 下载进程超过此时长未上报可领取任务数即视为离线，其上报作废
 _GOOD_URL_TTL_S = 86400            # 最近成功链接保留一天：批次停了很久再跑时它可能已不代表现状
 
-# 原子地取出一个剩余寿命 ≥ min_left 的空闲身份（优先最早过期的，先用掉快过期的），转入 inuse 并加占用锁。
-_CLAIM_LUA = """
-local ready, inuse = KEYS[1], KEYS[2]
-local now, min_exp, ttl, holder, lease_prefix = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
-redis.call('ZREMRANGEBYSCORE', ready, '-inf', now)
-local ids = redis.call('ZRANGEBYSCORE', ready, min_exp, '+inf', 'WITHSCORES', 'LIMIT', 0, 1)
-if #ids == 0 then return false end
-redis.call('ZREM', ready, ids[1])
-redis.call('ZADD', inuse, ids[2], ids[1])
-redis.call('SET', lease_prefix .. ids[1], holder, 'EX', ttl)
-return ids[1]
-"""
-
-
-# 持有者是自己就续期，没人持有就抢；返回 1 表示持有
-_HOLD_LUA = """
-local cur = redis.call('GET', KEYS[1])
-if cur == ARGV[1] or not cur then
-  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-  return 1
-end
-return 0
-"""
-
-_UNHOLD_LUA = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
-return 0
-"""
-
-_CHECKPOINT_LUA = """
-if redis.call('GET', KEYS[2]) ~= ARGV[1] or redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-redis.call('HSET', KEYS[1], 'cookies', ARGV[2], 'cookies_format', 'cookiejar-v1')
-redis.call('EXPIRE', KEYS[2], ARGV[3])
-return 1
-"""
-
-_RELEASE_LUA = """
-if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
-redis.call('DEL', KEYS[2])
-redis.call('ZREM', KEYS[4], ARGV[2])
-if redis.call('EXISTS', KEYS[1]) == 0 or tonumber(ARGV[4]) <= tonumber(ARGV[5]) then
-  redis.call('ZREM', KEYS[3], ARGV[2])
-  return 0
-end
-redis.call('HSET', KEYS[1], 'cookies', ARGV[3], 'cookies_format', 'cookiejar-v1')
-redis.call('ZADD', KEYS[3], ARGV[4], ARGV[2])
-return 1
+_SCHEMA = """
+CREATE UNLOGGED TABLE IF NOT EXISTS pl_identities (
+    id          text PRIMARY KEY,
+    host        text NOT NULL,
+    data        jsonb NOT NULL,                   -- Identity.to_dict()：ip、UA、cookie jar……
+    expires_at  double precision NOT NULL,
+    holder      text,                             -- 空 = 空闲
+    lease_until double precision                  -- 占用租约到期（epoch 秒）；过期视为空闲
+) WITH (fillfactor = 70);
+CREATE INDEX IF NOT EXISTS pl_identities_host ON pl_identities (host, expires_at);
+CREATE UNLOGGED TABLE IF NOT EXISTS pl_id_hosts (
+    host           text PRIMARY KEY,
+    producer       text,
+    producer_until double precision,
+    fresh_rejects  int NOT NULL DEFAULT 0,
+    paused_until   double precision,
+    good_url       text,
+    good_until     double precision
+);
+CREATE UNLOGGED TABLE IF NOT EXISTS pl_id_workers (
+    host text NOT NULL, worker text NOT NULL, last_seen double precision NOT NULL,
+    PRIMARY KEY (host, worker)
+);
+CREATE UNLOGGED TABLE IF NOT EXISTS pl_id_pending (
+    host text NOT NULL, consumer text NOT NULL, n int NOT NULL, ts double precision NOT NULL,
+    PRIMARY KEY (host, consumer)
+);
 """
 
 
@@ -105,7 +86,7 @@ class Identity:
     def left(self, now: Optional[float] = None) -> float:
         return self.expires_at - (time.time() if now is None else now)
 
-    def to_redis(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, str]:
         data = {item.name: str(getattr(self, item.name)) for item in fields(self)
                 if item.name not in ("cookies", "_holder")}
         data.update(cookies=self.cookies_json(), cookies_format="cookiejar-v1")
@@ -115,9 +96,9 @@ class Identity:
         return json.dumps(jar_to_records(self.cookies), ensure_ascii=False)
 
     @classmethod
-    def from_redis(cls, d: dict[str, str]) -> "Identity":
+    def from_dict(cls, d: dict[str, str]) -> "Identity":
         if d.get("cookies_format") not in (None, "cookiejar-v1"):
-            raise ValueError("不支持的 Redis cookie 格式")
+            raise ValueError("不支持的 cookie 格式")
         return cls(
             host=d["host"], exit_ip=d["exit_ip"], proxy_server=d["proxy_server"],
             user_agent=d["user_agent"], cookies=jar_from_records(json.loads(d["cookies"])),
@@ -136,181 +117,202 @@ class PoolStats:
 
 
 class IdentityStore:
-    def __init__(self, url: str, prefix: str = "paperlite") -> None:
-        self.r = redis.Redis.from_url(url, decode_responses=True)
-        self.prefix = prefix
-        self._claim = self.r.register_script(_CLAIM_LUA)
-        self._hold = self.r.register_script(_HOLD_LUA)
-        self._unhold = self.r.register_script(_UNHOLD_LUA)
-        self._checkpoint = self.r.register_script(_CHECKPOINT_LUA)
-        self._release = self.r.register_script(_RELEASE_LUA)
+    """一个进程一个实例；生产者线程和各下载线程共用一条连接（加锁），每次操作都是一两条短语句。"""
 
-    def _k(self, host: str, *parts: str) -> str:
-        return ":".join((self.prefix, host) + parts)
+    def __init__(self, dsn: str, schema: Optional[str] = None) -> None:
+        self._lock = threading.Lock()
+        self._conn = psycopg.connect(dsn, autocommit=True)
+        with self._lock:
+            if schema:
+                self._conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
+                self._conn.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+            with self._conn.transaction():
+                self._conn.execute("SELECT pg_advisory_xact_lock(hashtext('paperlite.store.schema'))")
+                self._conn.execute(_SCHEMA)
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def _x(self, query: str, params=()):
+        with self._lock:
+            return self._conn.execute(query, params)
+
+    def _one(self, query: str, params=()):
+        with self._lock:
+            return self._conn.execute(query, params).fetchone()
 
     def ping(self) -> None:
-        self.r.ping()
+        self._x("SELECT 1")
+
+    def _host_row(self, host: str) -> None:
+        """调用方持锁：保证 pl_id_hosts 有这一行。"""
+        self._conn.execute("INSERT INTO pl_id_hosts (host) VALUES (%s) ON CONFLICT DO NOTHING", (host,))
 
     # ── 生产者 ────────────────────────────────────────────────
 
     def add(self, ident: Identity) -> None:
-        key = self._k(ident.host, "id", ident.id)
-        with self.r.pipeline() as p:
-            p.hset(key, mapping=ident.to_redis())
-            p.expireat(key, int(ident.expires_at) + 1)
-            p.zadd(self._k(ident.host, "ready"), {ident.id: ident.expires_at})
-            p.execute()
+        self._x("INSERT INTO pl_identities (id, host, data, expires_at) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (id) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at, "
+                "holder = NULL, lease_until = NULL",
+                (ident.id, ident.host, Jsonb(ident.to_dict()), ident.expires_at))
 
     def hold_producer(self, host: str, holder: str, ttl_s: float) -> bool:
-        """抢占/续期该主机的生产者锁；进程崩溃后 ttl_s 内由待命的生产者接手。"""
-        return bool(self._hold(keys=[self._k(host, "producer")], args=[holder, int(ttl_s)]))
+        """抢占 / 续期该主机的生产者锁；进程崩溃后 ttl_s 内由待命的生产者接手。"""
+        now = time.time()
+        with self._lock:
+            self._host_row(host)
+            return self._conn.execute(
+                "UPDATE pl_id_hosts SET producer = %s, producer_until = %s WHERE host = %s "
+                "AND (producer IS NULL OR producer = %s OR producer_until < %s)",
+                (holder, now + ttl_s, host, holder, now)).rowcount == 1
 
     def release_producer(self, host: str, holder: str) -> None:
-        self._unhold(keys=[self._k(host, "producer")], args=[holder])
+        self._x("UPDATE pl_id_hosts SET producer = NULL, producer_until = NULL WHERE host = %s AND producer = %s",
+                (host, holder))
 
     def producer_holder(self, host: str) -> Optional[str]:
-        return self.r.get(self._k(host, "producer"))
+        row = self._one("SELECT producer FROM pl_id_hosts WHERE host = %s AND producer_until >= %s",
+                        (host, time.time()))
+        return row[0] if row else None
 
     def stats(self, host: str, refill_before_s: float = 0) -> PoolStats:
         now = time.time()
-        healthy_from = now + refill_before_s
-        with self.r.pipeline() as p:
-            p.zcount(self._k(host, "ready"), now, "+inf")
-            p.zcount(self._k(host, "inuse"), now, "+inf")
-            p.zcount(self._k(host, "ready"), healthy_from, "+inf")
-            p.zcount(self._k(host, "inuse"), healthy_from, "+inf")
-            p.zcount(self._k(host, "workers"), now - WORKER_STALE_S, "+inf")
-            ready, inuse, h_ready, h_inuse, workers = p.execute()
-        return PoolStats(ready, inuse, h_ready + h_inuse, workers, self.pending(host))
+        ready, inuse, healthy = self._one(
+            "SELECT count(*) FILTER (WHERE holder IS NULL OR lease_until < %(now)s), "
+            "       count(*) FILTER (WHERE holder IS NOT NULL AND lease_until >= %(now)s), "
+            "       count(*) FILTER (WHERE expires_at >= %(h)s) "
+            "FROM pl_identities WHERE host = %(host)s AND expires_at >= %(now)s",
+            {"now": now, "h": now + refill_before_s, "host": host})
+        workers = self._one("SELECT count(*) FROM pl_id_workers WHERE host = %s AND last_seen >= %s",
+                            (host, now - WORKER_STALE_S))[0]
+        return PoolStats(ready, inuse, healthy, workers, self.pending(host))
 
     def list(self, host: str) -> list[Identity]:
-        ids = self.r.zrange(self._k(host, "ready"), 0, -1) + self.r.zrange(self._k(host, "inuse"), 0, -1)
-        out = []
-        for ident_id in ids:
-            raw = self.r.hgetall(self._k(host, "id", ident_id))
-            if raw:
-                out.append(Identity.from_redis(raw))
-        return sorted(out, key=lambda i: i.expires_at)
+        with self._lock:
+            rows = self._conn.execute("SELECT data FROM pl_identities WHERE host = %s AND expires_at >= %s "
+                                      "ORDER BY expires_at", (host, time.time())).fetchall()
+        return [Identity.from_dict(r[0]) for r in rows]
 
     def reap(self, host: str) -> int:
-        """清理过期身份和离线线程；占用锁已过期（占用者崩溃）的身份归还 ready。返回归还数。"""
+        """清理过期身份、离线线程和过期上报；占用租约已过期（占用者崩溃）的身份归还空闲。返回归还数。"""
         now = time.time()
-        ready, inuse = self._k(host, "ready"), self._k(host, "inuse")
-        self.r.zremrangebyscore(ready, "-inf", now)
-        self.r.zremrangebyscore(self._k(host, "workers"), "-inf", now - WORKER_STALE_S)
-        for ident_id in self.r.zrangebyscore(inuse, "-inf", now):
-            self._drop(host, ident_id)
-        returned = 0
-        for ident_id, exp in self.r.zrange(inuse, 0, -1, withscores=True):
-            if not self.r.exists(self._k(host, "lease", ident_id)):
-                with self.r.pipeline() as p:
-                    p.zrem(inuse, ident_id)
-                    p.zadd(ready, {ident_id: exp})
-                    p.execute()
-                returned += 1
-        return returned
+        with self._lock, self._conn.transaction():
+            c = self._conn
+            c.execute("DELETE FROM pl_identities WHERE host = %s AND expires_at < %s", (host, now))
+            c.execute("DELETE FROM pl_id_workers WHERE host = %s AND last_seen < %s", (host, now - WORKER_STALE_S))
+            c.execute("DELETE FROM pl_id_pending WHERE host = %s AND ts < %s", (host, now - PENDING_STALE_S))
+            return c.execute("UPDATE pl_identities SET holder = NULL, lease_until = NULL "
+                             "WHERE host = %s AND holder IS NOT NULL AND lease_until < %s", (host, now)).rowcount
 
     # ── 消费者 ────────────────────────────────────────────────
 
     def claim(self, host: str, holder: str, min_left_s: float, lease_ttl_s: float) -> Optional[Identity]:
+        """取一个剩余寿命 ≥ min_left_s 的空闲身份（优先最早过期的，先用掉快过期的），加占用租约。"""
         now = time.time()
-        while True:
-            ident_id = self._claim(
-                keys=[self._k(host, "ready"), self._k(host, "inuse")],
-                args=[now, now + min_left_s, int(lease_ttl_s), holder, self._k(host, "lease", "")],
-            )
-            if not ident_id:
-                return None
-            raw = self.r.hgetall(self._k(host, "id", ident_id))
-            if raw:
-                ident = Identity.from_redis(raw)
-                ident._holder = holder
-                return ident
-            self._drop(host, ident_id)   # hash 已过期而 zset 残留，丢掉再取
+        with self._lock, self._conn.transaction():
+            c = self._conn
+            c.execute("DELETE FROM pl_identities WHERE host = %s AND expires_at < %s "
+                      "AND (holder IS NULL OR lease_until < %s)", (host, now, now))
+            row = c.execute(
+                "UPDATE pl_identities SET holder = %(holder)s, lease_until = %(lease)s WHERE id = ("
+                "  SELECT id FROM pl_identities WHERE host = %(host)s AND expires_at >= %(min_exp)s "
+                "  AND (holder IS NULL OR lease_until < %(now)s) "
+                "  ORDER BY expires_at LIMIT 1 FOR UPDATE SKIP LOCKED"
+                ") RETURNING data",
+                {"holder": holder, "lease": now + lease_ttl_s, "host": host, "min_exp": now + min_left_s,
+                 "now": now}).fetchone()
+        if row is None:
+            return None
+        ident = Identity.from_dict(row[0])
+        ident._holder = holder
+        return ident
 
     def heartbeat(self, ident: Identity, lease_ttl_s: float) -> None:
-        self._checkpoint(
-            keys=[self._k(ident.host, "id", ident.id), self._k(ident.host, "lease", ident.id)],
-            args=[ident._holder, ident.cookies_json(), int(lease_ttl_s)],
-        )
+        """续占用租约并保存最新 Cookie Jar；租约已不归自己（被回收后别人领走）时什么都不改。"""
+        self._x("UPDATE pl_identities SET data = jsonb_set(data, '{cookies}', to_jsonb(%s::text)), lease_until = %s "
+                "WHERE id = %s AND holder = %s",
+                (ident.cookies_json(), time.time() + lease_ttl_s, ident.id, ident._holder))
 
     def release(self, ident: Identity) -> None:
-        """原子保存最新 Cookie Jar，再将仍可用的身份还回 ready。"""
-        self._release(
-            keys=[self._k(ident.host, "id", ident.id), self._k(ident.host, "lease", ident.id),
-                  self._k(ident.host, "ready"), self._k(ident.host, "inuse")],
-            args=[ident._holder, ident.id, ident.cookies_json(), ident.expires_at, time.time()],
-        )
+        """保存最新 Cookie Jar，再将仍可用的身份还回空闲；已过期的直接删掉。租约不归自己时什么都不改。"""
+        now = time.time()
+        with self._lock, self._conn.transaction():
+            c = self._conn
+            if ident.expires_at <= now:
+                c.execute("DELETE FROM pl_identities WHERE id = %s AND holder = %s", (ident.id, ident._holder))
+                return
+            c.execute("UPDATE pl_identities SET data = jsonb_set(data, '{cookies}', to_jsonb(%s::text)), "
+                      "holder = NULL, lease_until = NULL WHERE id = %s AND holder = %s",
+                      (ident.cookies_json(), ident.id, ident._holder))
 
     # ── 熔断：新身份接连一用就被拒时暂停生产，别把代理配额烧光 ──────────────
 
     def note_success(self, host: str) -> None:
-        self.r.set(self._k(host, "fresh_rejects"), 0)
+        with self._lock:
+            self._host_row(host)
+            self._conn.execute("UPDATE pl_id_hosts SET fresh_rejects = 0 WHERE host = %s", (host,))
 
     def note_good_url(self, host: str, url: str) -> None:
         """记下该主机最近一次下载成功的链接（各下载进程共享）：生产者验收新身份、消费者复验身份时拿它当参照。"""
-        self.r.set(self._k(host, "good_url"), url, ex=_GOOD_URL_TTL_S)
+        with self._lock:
+            self._host_row(host)
+            self._conn.execute("UPDATE pl_id_hosts SET good_url = %s, good_until = %s WHERE host = %s",
+                               (url, time.time() + _GOOD_URL_TTL_S, host))
 
     def good_url(self, host: str) -> Optional[str]:
-        return self.r.get(self._k(host, "good_url"))
+        row = self._one("SELECT good_url FROM pl_id_hosts WHERE host = %s AND good_until >= %s", (host, time.time()))
+        return row[0] if row else None
 
     def note_fresh_reject(self, host: str) -> int:
-        return int(self.r.incr(self._k(host, "fresh_rejects")))
+        with self._lock:
+            self._host_row(host)
+            return self._conn.execute("UPDATE pl_id_hosts SET fresh_rejects = fresh_rejects + 1 WHERE host = %s "
+                                      "RETURNING fresh_rejects", (host,)).fetchone()[0]
 
     def fresh_rejects(self, host: str) -> int:
-        return int(self.r.get(self._k(host, "fresh_rejects")) or 0)
+        row = self._one("SELECT fresh_rejects FROM pl_id_hosts WHERE host = %s", (host,))
+        return row[0] if row else 0
 
     def trip(self, host: str, pause_s: float, threshold: int) -> None:
         """暂停生产 pause_s 秒；计数退到 threshold-1，恢复后只要再有一个新身份被拒就再次暂停。"""
-        with self.r.pipeline() as p:
-            p.set(self._k(host, "paused"), "1", ex=int(pause_s))
-            p.set(self._k(host, "fresh_rejects"), max(0, threshold - 1))
-            p.execute()
+        with self._lock:
+            self._host_row(host)
+            self._conn.execute("UPDATE pl_id_hosts SET paused_until = %s, fresh_rejects = %s WHERE host = %s",
+                               (time.time() + pause_s, max(0, threshold - 1), host))
 
     def paused_for(self, host: str) -> int:
         """熔断剩余秒数，未暂停为 0。"""
-        return max(0, int(self.r.ttl(self._k(host, "paused"))))
+        row = self._one("SELECT paused_until FROM pl_id_hosts WHERE host = %s", (host,))
+        return max(0, int(row[0] - time.time())) if row and row[0] else 0
 
     def discard(self, ident: Identity) -> None:
         """cookie 被拒、IP 掉线或寿命将尽：彻底删除。"""
-        self._drop(ident.host, ident.id)
+        self._x("DELETE FROM pl_identities WHERE id = %s", (ident.id,))
 
     def worker_alive(self, host: str, worker: str) -> None:
-        self.r.zadd(self._k(host, "workers"), {worker: time.time()})
+        self._x("INSERT INTO pl_id_workers (host, worker, last_seen) VALUES (%s, %s, %s) "
+                "ON CONFLICT (host, worker) DO UPDATE SET last_seen = excluded.last_seen", (host, worker, time.time()))
 
     def worker_gone(self, host: str, worker: str) -> None:
-        self.r.zrem(self._k(host, "workers"), worker)
+        self._x("DELETE FROM pl_id_workers WHERE host = %s AND worker = %s", (host, worker))
 
     # ── 可领取任务数：消费者驱动生产，没活就不生产 ──────────────
 
     def report_pending(self, host: str, consumer: str, n: int) -> None:
         """下载进程上报自己还有多少可领取任务（调用方数到线程数为止即可）。"""
-        self.r.hset(self._k(host, "pending"), consumer, f"{max(0, int(n))}:{time.time():.0f}")
+        self._x("INSERT INTO pl_id_pending (host, consumer, n, ts) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (host, consumer) DO UPDATE SET n = excluded.n, ts = excluded.ts",
+                (host, consumer, max(0, int(n)), time.time()))
 
     def clear_pending(self, host: str, consumer: str) -> None:
-        self.r.hdel(self._k(host, "pending"), consumer)
+        self._x("DELETE FROM pl_id_pending WHERE host = %s AND consumer = %s", (host, consumer))
 
     def pending(self, host: str) -> Optional[int]:
         """在线下载进程上报之和；超过 PENDING_STALE_S 未更新的上报视为离线并清掉。没有任何有效上报返回 None。"""
-        key, now, total, stale = self._k(host, "pending"), time.time(), None, []
-        for consumer, value in self.r.hgetall(key).items():
-            try:
-                n, ts = value.split(":", 1)
-                n, ts = int(n), float(ts)
-            except ValueError:
-                stale.append(consumer)
-                continue
-            if now - ts > PENDING_STALE_S:
-                stale.append(consumer)
-                continue
-            total = (total or 0) + n
-        if stale:
-            self.r.hdel(key, *stale)
-        return total
-
-    def _drop(self, host: str, ident_id: str) -> None:
-        with self.r.pipeline() as p:
-            p.zrem(self._k(host, "ready"), ident_id)
-            p.zrem(self._k(host, "inuse"), ident_id)
-            p.delete(self._k(host, "id", ident_id), self._k(host, "lease", ident_id))
-            p.execute()
+        now = time.time()
+        with self._lock:
+            self._conn.execute("DELETE FROM pl_id_pending WHERE host = %s AND ts < %s", (host, now - PENDING_STALE_S))
+            n, total = self._conn.execute("SELECT count(*), sum(n) FROM pl_id_pending WHERE host = %s",
+                                          (host,)).fetchone()
+        return int(total) if n else None

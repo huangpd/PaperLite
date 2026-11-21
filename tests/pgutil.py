@@ -57,3 +57,16 @@ def execute(src, sql: str, params=()):
 def pg_config(schema: str, batch: str = "t", extra: str = "") -> str:
     """config.toml 里的 [pg] 段。"""
     return f'[pg]\ndsn = "{DSN}"\nbatch = "{batch}"\nschema = "{schema}"\n{extra}'
+
+
+def make_store(test: unittest.TestCase, schema: str | None = None):
+    """一个独立 schema 上的身份池（curl 模式）。"""
+    from paperlite.store import IdentityStore
+    store = IdentityStore(DSN, schema=schema or new_schema(test))
+    test.addCleanup(store.close)
+    return store
+
+
+def identity_row(store, ident_id: str):
+    """身份池里一行的 (data, holder, lease_until, expires_at)；没有返回 None。"""
+    return store._one("SELECT data, holder, lease_until, expires_at FROM pl_identities WHERE id = %s", (ident_id,))

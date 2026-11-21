@@ -19,15 +19,13 @@ uv run paperlite --version
 docker run -d --name paperlite-pg -e POSTGRES_PASSWORD=pl -e POSTGRES_DB=paperlite -p 5439:5432 postgres:16-alpine
 export PAPERLITE_TEST_PG=postgresql://postgres:pl@127.0.0.1:5439/paperlite
 
-uv run pytest                                                   # 跳过依赖 Redis / RabbitMQ 的用例
-PAPERLITE_TEST_REDIS=redis://127.0.0.1:6379/0 uv run pytest     # 包含 Redis 用例
-PAPERLITE_TEST_AMQP=amqp://guest:guest@127.0.0.1:5672/%2F uv run pytest tests/test_monitor.py
+uv run pytest                                                   # 全部测试（任务队列、身份池、监控都在 PG）
 uv run pytest tests/test_paperlite.py::ConfigTest::test_from_dict   # 单个用例
 ```
 
 不设 `PAPERLITE_TEST_PG` 时只跑不需要数据库的用例（配置、分类、参数解析等），不能代替完整测试。GitHub Actions 发布前会起一个 PG 服务跑全量。
 
-改动 `store.py`、`producer.py`、`consumer.py` 的 Redis 逻辑后，提交前务必起本机 Redis 全量跑一遍。PG 相关的测试辅助在 `tests/pgutil.py`（`make_source`、`needs_pg`、`pg_config`）。
+身份池（`store.py`）的测试也跑在 PG 上，跟着全量一起跑。PG 相关的测试辅助在 `tests/pgutil.py`（`make_source`、`make_store`、`needs_pg`、`pg_config`）。
 
 ## 改代码之前
 

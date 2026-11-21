@@ -1,6 +1,6 @@
 # 部署 PostgreSQL
 
-PaperLite 的任务队列和监控面板数据都存在 PostgreSQL 里。一个批次不管跑在一台还是一百台机器上，都只需要一台 PG；不同批次（`[pg] batch` 不同）可以共用同一台。
+PaperLite 的任务队列、curl 模式的身份池和监控数据都存在 PostgreSQL 里，不需要其他中间件。一个批次不管跑在一台还是一百台机器上，都只需要一台 PG；不同批次（`[pg] batch` 不同）可以共用同一台。
 
 ## 本机试用
 
@@ -56,7 +56,8 @@ ALTER TABLE pl_tasks SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_anal
 | 表 | 所在 schema | 内容 |
 |---|---|---|
 | `pl_tasks`、`pl_chunks`、`pl_skip_rules` | `[pg] schema`（默认 `public`） | 任务、块、巡检规则，见[任务库](../reference/task-database.md) |
-| `page`、`page_h` 等 | `[monitor] schema`（默认 `paperlite_monitor`） | 监控面板数据，见[监控](monitoring.md#8-数据存储postgresql) |
+| `pl_identities`、`pl_id_hosts`、`pl_id_workers`、`pl_id_pending` | `[pg] schema` | curl 模式的身份池（UNLOGGED，临时数据，PG 重启后清空、重新生产） |
+| `events`、`page`、`page_h` 等 | `[monitor] schema`（默认 `paperlite_monitor`） | 监控：`events` 中转表（UNLOGGED）、原始事件、小时汇总，见[监控](monitoring.md#数据存储) |
 
 ## 备份
 

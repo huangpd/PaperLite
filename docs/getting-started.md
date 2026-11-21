@@ -104,6 +104,6 @@ paperlite retry --status failed --kind network    # put network failures back in
 ## Next steps
 
 - [Operations](guide/operations.md): retries, inspection rules, adding sites, logs.
-- [Execution modes](guide/modes.md): when curl mode is worth the extra Redis.
+- [Execution modes](guide/modes.md): browser mode vs curl mode.
 - [Monitoring](guide/monitoring.md): a dashboard across many machines.
 - [Troubleshooting](guide/troubleshooting.md).

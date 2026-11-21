@@ -659,7 +659,7 @@ td.empty { white-space: normal; }
         <td class="r">${num(i.browsers_online)} / ${num(i.workers)}</td><td class="r">${num(i.pending)} / ${num(i.running)}</td>
         <td class="r">${num(i.success)} / ${num(i.failed)}</td>
         <td class="r" style="color:${i.online ? "inherit" : "var(--muted)"}" title="${new Date(i.last_seen * 1000).toLocaleString("zh-CN", { hour12: false })}">${ago(i.last_seen)}${i.online ? "" : " · 离线"}</td></tr>`).join("") + `</tbody>`
-      : emptyRow(6,"还没有终端上报（检查终端 [monitor] enabled 与 amqp_url，或用 paperlite-monitor test 验证）");
+      : emptyRow(6,"还没有终端上报（检查终端 [monitor] enabled 与 dsn，或用 paperlite-monitor test 验证）");
   }
 
   let rz; addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => last && render(last), 150); });

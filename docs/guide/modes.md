@@ -13,7 +13,7 @@ PaperLite 有两种下载方式，共用同一个 PostgreSQL 任务队列、存�
 | 工作方式 | N 个 worker，各自独占浏览器与 IP，过盾一次后连续下载 | 浏览器过盾后把 IP + cookie + UA 存入身份池，`curl_cffi` 线程领用下载 |
 | 每批次主机数 | 任意混合 | 仅限一个 |
 | PDF / 网页 | 都能下。`url_type=pdf`：拦截浏览器收到的 PDF 响应，流式写盘（校验同 curl 模式）；最后停在网页上（摘要页、订阅页）记 `non_pdf`，网页存到 `non_pdf/`。`url_type=html`：整页存为 `.html`。都会自动跟随跳转 | 跟随 HTTP 跳转与中转页的 meta refresh；`url_type=html` 整页保存；跳到别的主机被挑战时改用浏览器打开 |
-| 外部依赖 | 无 | Redis（身份池） |
+| 外部依赖 | 无 | 无（身份池也在 PostgreSQL） |
 | 巡检（重复标题跳过） | 有 | 无 |
 | 资源占用 | 每个 worker 一个浏览器进程 | 浏览器只用来过盾，下载线程很轻 |
 | 适用场景 | 来源混杂的 URL 列表 | 单站点海量任务、追求单 IP 吞吐 |
@@ -35,15 +35,12 @@ paperlite run --no-proxy --headed      # 本地调试：直连本机 IP、显示
 
 ### curl 模式
 
-curl 模式拆成两个角色，通过 Redis 交换身份：
+curl 模式拆成两个角色，通过身份池（PostgreSQL 里的几张 UNLOGGED 表）交换身份：
 
-- **生产者**：开浏览器过盾，验收后把身份（IP + cookie + UA）放进 Redis 池。
-- **下载线程**：从任务库领任务、从 Redis 领身份，用 `curl_cffi` 下载。
+- **生产者**：开浏览器过盾，验收后把身份（IP + cookie + UA）放进身份池。
+- **下载线程**：从任务队列领任务、从身份池领身份，用 `curl_cffi` 下载。
 
 ```toml
-[limits]
-redis_url = "redis://127.0.0.1:6379/0"
-
 [run]
 mode    = "curl"
 workers = 20                   # 下载线程数 = 同时在用的身份数
@@ -58,11 +55,11 @@ paperlite download --workers 20 # 只下载
 
 **按消费生产**：生产目标 = min(`max_identities`, 在线下载线程数, 可领取任务数)。下载线程全部退出或任务领完，生产者就停止过盾，不再消耗 IP。代价是冷启动：第一个身份过盾约需 20 秒。
 
-**身份验收**：生产者的浏览器在站点首页过盾拿 cookie，再用同一 IP、UA 和 cookie 通过 `curl_cffi` 请求一条真实链接验收，失败的身份不入池。验收链接依次取：最近一次下载成功的链接（各机器经 Redis 共享）→ 队列里一条待下载链接 → 站点首页。不需要任何配置。
+**身份验收**：生产者的浏览器在站点首页过盾拿 cookie，再用同一 IP、UA 和 cookie 通过 `curl_cffi` 请求一条真实链接验收，失败的身份不入池。验收链接依次取：最近一次下载成功的链接（各机器经身份池共享）→ 队列里一条待下载链接 → 站点首页。不需要任何配置。
 
 **新站点注意**：non-PDF 判定规则（`classify.py`）是按 ACM 写的，换站点前先确认是否适用。
 
-**升级**：Redis 里的 cookie 记录带 `cookies_format=cookiejar-v1` 标记，旧格式可直接读取；升级时生产者和下载线程要一起重启。
+**升级**：身份池里的 cookie 记录带 `cookies_format=cookiejar-v1` 标记；升级时生产者和下载线程要一起重启。
 
 设计细节（身份模型、验收、熔断）见[架构与设计说明](../development/architecture.md)。
 

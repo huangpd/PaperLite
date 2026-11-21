@@ -1,67 +1,36 @@
 """
-面板端消费：声明 topic exchange + 面板自己的持久队列（绑定 #），批量入库后一次性 ack。
-面板停机期间消息留在队列里（上限 queue_max_length，超出丢最旧），重启后补齐。
+面板端消费：从 events 中转表按批取走事件、汇总入库（MonitorDB.consume，取、写、删同一个事务）。
+面板停机期间事件留在表里（上限 backlog_max，超出丢最旧的），重启后补齐。
 """
 
 import logging
 import threading
 
-from paperlite.monitor import schema
 from paperlite.monitor.config import MonitorConfig
 from paperlite.monitor.db import MonitorDB
 
 logger = logging.getLogger(__name__)
 
-_BATCH = 500
-
-
-def declare(ch, cfg: MonitorConfig) -> None:
-    ch.exchange_declare(cfg.exchange, exchange_type="topic", durable=True)
-    ch.queue_declare(cfg.queue, durable=True,
-                     arguments={"x-max-length": cfg.queue_max_length, "x-overflow": "drop-head"})
-    ch.queue_bind(cfg.queue, cfg.exchange, routing_key="#")
+_BATCH = 2000
+_IDLE_S = 1.0          # 没有新事件时隔这么久再看
 
 
 def consume_forever(cfg: MonitorConfig, db: MonitorDB, stop: threading.Event) -> None:
-    import pika
-
+    logger.info("开始消费监控事件（PostgreSQL schema %s 的 events 表）", cfg.schema)
     backoff = 1.0
     while not stop.is_set():
-        conn = None
         try:
-            params = cfg.amqp_params()
-            params.heartbeat = 60
-            conn = pika.BlockingConnection(params)
-            ch = conn.channel()
-            declare(ch, cfg)
-            ch.basic_qos(prefetch_count=_BATCH * 2)
-            logger.info("已连接 RabbitMQ，消费队列 %s", cfg.queue)
+            n = db.consume(_BATCH)
             backoff = 1.0
-            pending_tag, batch = None, []
-            for method, _props, body in ch.consume(cfg.queue, inactivity_timeout=1.0):
-                if method is not None:
-                    try:
-                        batch.append(schema.decode(body))
-                    except Exception as e:
-                        logger.debug("丢弃无法解析的监控消息: %s", e)
-                    pending_tag = method.delivery_tag
-                if pending_tag is not None and (len(batch) >= _BATCH or method is None):
-                    db.ingest(batch)                              # 整批聚合入库并提交，之后才 ack：崩溃最多重放，不丢
-                    ch.basic_ack(pending_tag, multiple=True)
-                    pending_tag, batch = None, []
-                if method is None:
-                    db.prune()
-                if stop.is_set():
-                    break
-            ch.cancel()
+            if n < _BATCH:                 # 没积压了：歇一下，顺手做到期清理（每小时一次）
+                db.prune()
+                stop.wait(_IDLE_S)
         except Exception as e:
-            logger.warning("RabbitMQ 消费中断，%.0fs 后重连: %s", backoff,
+            logger.warning("消费监控事件出错，%.0fs 后重试: %s", backoff,
                            str(e).splitlines()[0][:160] if str(e) else type(e).__name__)
             stop.wait(backoff)
             backoff = min(backoff * 2, 30.0)
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            try:
+                db.reconnect_if_broken()
+            except Exception:
+                pass                       # 还连不上，下一轮再试

@@ -1,5 +1,5 @@
 """
-上报消息格式（上报端与面板端共用）。每条消息一个 JSON 信封，发到 topic exchange，routing key = type：
+上报消息格式（上报端与面板端共用）。每条消息一个 JSON 信封，存进监控 schema 的 events 表：
 
   {"v": 1, "type": "page", "ts": 1731111111.2, "node": "gpu-01", "inst": "gpu-01:4242",
    "batch": "sciencedirect", "vendor": "qingguo", "data": {...}}
@@ -51,7 +51,11 @@ def encode(msg: dict[str, Any]) -> bytes:
 
 def decode(body: bytes) -> dict[str, Any]:
     """解析并做最低限度校验；不认识的版本/类型抛 ValueError（面板端丢弃该条）。"""
-    msg = json.loads(body)
+    return validate(json.loads(body))
+
+
+def validate(msg: Any) -> dict[str, Any]:
+    """最低限度校验（events 表里取出来的已是 dict）；不认识的版本/类型抛 ValueError。"""
     if not isinstance(msg, dict) or msg.get("v") != SCHEMA_VERSION or msg.get("type") not in TYPES:
         raise ValueError(f"不支持的监控消息: {str(msg)[:120]}")
     if not isinstance(msg.get("data"), dict):

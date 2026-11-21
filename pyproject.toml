@@ -25,13 +25,11 @@ dependencies = [
     "curl-cffi>=0.15.0",
     "duckdb>=1.0.0",              # 导入时读 CSV（大文件、容错、报出错行）
     "psycopg[binary]>=3.1",       # 任务队列与监控面板都在 PostgreSQL
-    "redis>=5.0",
     "certifi>=2024.2.2",
-    "pika>=1.3",                  # 监控上报 / 面板（paperlite-monitor）；未启用 [monitor] 时不会被导入
 ]
 
 [project.optional-dependencies]
-monitor = []                  # 兼容旧安装命令 paperlite[monitor]；pika 已是默认依赖
+monitor = []                  # 兼容旧安装命令 paperlite[monitor]；监控不再需要额外依赖
 pg = []                       # 兼容旧安装命令 paperlite[pg]；psycopg 已是默认依赖
 
 [project.urls]
