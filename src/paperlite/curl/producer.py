@@ -28,7 +28,7 @@ from typing import Callable, Optional
 from paperlite.browser.session import pass_challenge
 from paperlite.config import Limits
 from paperlite.curl.http import rate_limit_wait, session_for_identity
-from paperlite.page import is_cf_denied, is_challenge
+from paperlite.rules.page import is_cf_denied, is_challenge
 from paperlite.curl.cookies import jar_from_records
 from paperlite.proxy import IpSource, ProxyUnavailable
 from paperlite.curl.identity import Identity, IdentityStore

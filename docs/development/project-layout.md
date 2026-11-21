@@ -2,14 +2,16 @@
 
 ```
 src/paperlite/
-  # 根目录：共享内核，两种模式都用；这里的模块不 import 下面的子包（cli 除外）
+  rules/              纯规则，两种模式共用：只看传进来的数据给结论，不联网、不读写文件和数据库、不依赖本包其他模块
+    tasks.py          任务的公共定义：状态、错误分类、Task、URL 规范化与校验、DOI 推导、文件路径
+    page.py           页面判定：Cloudflare 挑战 / 封禁、WAF 识别、non-PDF 分类（not_found、paywall、landing_page、blocked）
+    pdf.py            PDF 文件头规则
+
+  # 根目录：入口和基础设施（配置、代理、日志、错误类型）；不 import 下面的功能子包（cli 除外）
   cli.py              命令行：参数解析、读配置、打开任务队列，再调下面各模块；只放命令行本身的事
   errors.py           UserError：给人看的错误，库代码抛它，命令行打印后退出（库代码不直接 SystemExit）
   config.py           配置加载与校验：[pg] [proxy] [paths] [limits] [run]（含 ProxySettings）
   config.example.toml paperlite init 生成的配置模板
-  tasks.py            任务的公共定义：状态、错误分类、Task、URL 规范化与校验、DOI 推导、文件路径（不碰数据库）
-  page.py             页面判定：Cloudflare 挑战 / 封禁、WAF 识别、non-PDF 分类（not_found、paywall、landing_page、blocked）
-  pdf.py              PDF 文件头规则（两种模式共用）
   proxy.py            代理提取与分层体检（TCP / TLS / TTFB / 总耗时）
   logutil.py          日志格式（text / json）
 
@@ -45,7 +47,7 @@ docs/                 文档
 
 ## 模块之间的关系
 
-- **依赖方向**：`cli` → `browser` / `curl` / `taskq` → 根目录的共享模块 → `monitor.reporter`。反方向不允许；
+- **依赖方向**：`cli` → `browser` / `curl` / `taskq` → 根目录（配置、代理…）→ `rules`；遥测只走 `monitor.reporter`。`rules` 不依赖任何人。反方向不允许；
   `curl` 对 `browser` 的依赖只有过盾和一次性渲染（`browser.session`、`browser.env`）。`tests/test_layering.py` 扫描全部 import 检查这条规则。
 - **命令行**：`cli` 读配置、`_open_db` 打开任务队列（`taskq.PgTaskSource`），导入交给 `taskq.importer`，跑下载交给 `browser.runner.run_browser` / `curl.runner.run_curl`（db 交给 runner，由它关闭）。库代码出错抛 `errors.UserError`，`cli.main` 统一打印后退出。
 - **任务队列**：worker 都通过 `taskq.PgTaskSource` 领任务、回写结果。

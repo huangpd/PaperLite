@@ -1,9 +1,10 @@
 """包之间的依赖方向（见 docs/development/project-layout.md）。扫描 src/paperlite 下所有 import（包括函数里的延迟 import）。
 
-  根目录（tasks config page pdf proxy logutil）  只依赖根目录，外加遥测出口 monitor.reporter
-  taskq/                                         根目录
-  browser/                                       根目录、taskq、monitor.reporter
-  curl/                                          根目录、taskq、monitor.reporter，以及 browser.session / browser.env（过盾、渲染）
+  rules/（tasks page pdf）                      纯规则：只依赖 rules 自己（不碰网络、数据库、配置）
+  根目录（config proxy logutil errors）          rules、根目录，外加遥测出口 monitor.reporter
+  taskq/                                         rules、根目录
+  browser/                                       rules、根目录、taskq、monitor.reporter
+  curl/                                          rules、根目录、taskq、monitor.reporter，以及 browser.session / browser.env（过盾、渲染）
   monitor/                                       自己，外加 config（读 [pg] / [monitor]）
   cli、__main__、包的 __init__                    不限
 任何模块都不许 import cli。
@@ -49,9 +50,12 @@ def allowed(src: str, dst: str) -> bool:
     parts = src.split(".")
     if src in ("paperlite", "paperlite.__main__", "paperlite.cli") or (len(parts) == 2 and is_package(src)):
         return True                                       # 入口和包的 __init__ 不限
-    root = dst == "paperlite" or (dst.count(".") == 1 and dst.split(".")[1] in ROOT_MODULES)
+    rules = dst == "paperlite.rules" or dst.startswith("paperlite.rules.")
+    root = rules or dst == "paperlite" or (dst.count(".") == 1 and dst.split(".")[1] in ROOT_MODULES)
     group = parts[1] if len(parts) > 2 else "root"
     same = dst.startswith(f"paperlite.{group}.") or dst == f"paperlite.{group}"
+    if group == "rules":
+        return rules
     if group == "root":
         return root or dst == REPORTER
     if group == "taskq":
@@ -85,7 +89,11 @@ class LayeringTest(unittest.TestCase):
     def test_checker_catches_violations(self):
         """规则本身要能拦住反方向依赖（防止规则写成恒真）。"""
         self.assertFalse(allowed("paperlite.config", "paperlite.curl.identity"))
-        self.assertFalse(allowed("paperlite.tasks", "paperlite.taskq.queue"))
+        self.assertFalse(allowed("paperlite.rules.tasks", "paperlite.taskq.queue"))
+        self.assertFalse(allowed("paperlite.rules.page", "paperlite.config"))          # rules 不读配置
+        self.assertFalse(allowed("paperlite.rules.pdf", REPORTER))                     # rules 不上报监控
+        self.assertTrue(allowed("paperlite.rules.page", "paperlite.rules.tasks"))
+        self.assertTrue(allowed("paperlite.taskq.queue", "paperlite.rules.tasks"))
         self.assertFalse(allowed("paperlite.taskq.queue", "paperlite.browser.pool"))
         self.assertFalse(allowed("paperlite.browser.pool", "paperlite.curl.identity"))
         self.assertFalse(allowed("paperlite.curl.producer", "paperlite.browser.pool"))

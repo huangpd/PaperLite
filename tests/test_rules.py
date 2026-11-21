@@ -1,8 +1,8 @@
-"""共享内核：URL 校验（tasks.py）、页面判定（page.py）、PDF 文件头（pdf.py）。"""
+"""rules/：URL 校验（tasks.py）、页面判定（page.py）、PDF 文件头（pdf.py）。"""
 import unittest
 
-from paperlite.page import classify_html
-from paperlite.tasks import url_problem
+from paperlite.rules.page import classify_html
+from paperlite.rules.tasks import url_problem
 
 
 
@@ -56,10 +56,10 @@ class UrlProblemTest(unittest.TestCase):
 
 
 class PdfHeaderTest(unittest.TestCase):
-    """两种模式共用的 PDF 文件头规则（paperlite.pdf）。"""
+    """两种模式共用的 PDF 文件头规则（paperlite.rules.pdf）。"""
 
     def test_offset(self):
-        from paperlite.pdf import HEAD_BYTES, pdf_offset
+        from paperlite.rules.pdf import HEAD_BYTES, pdf_offset
         self.assertEqual(pdf_offset(b"%PDF-1.7\n"), 0)
         self.assertEqual(pdf_offset(b"\r\n\xef\xbb\xbf%PDF-1.7"), 5)          # 前导换行 / BOM 放行
         self.assertIsNone(pdf_offset(b"<p>see %PDF-1.4</p>"))              # 前面有正文：不是 PDF

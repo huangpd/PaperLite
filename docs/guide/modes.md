@@ -57,7 +57,7 @@ paperlite download --workers 20 # 只下载
 
 **身份验收**：生产者的浏览器在站点首页过盾拿 cookie，再用同一 IP、UA 和 cookie 通过 `curl_cffi` 请求一条真实链接验收，失败的身份不入池。验收链接依次取：最近一次下载成功的链接（各机器经身份池共享）→ 队列里一条待下载链接 → 站点首页。不需要任何配置。
 
-**新站点注意**：non-PDF 判定规则（`page.py`）是按 ACM 写的，换站点前先确认是否适用。
+**新站点注意**：non-PDF 判定规则（`rules/page.py`）是按 ACM 写的，换站点前先确认是否适用。
 
 **升级**：身份池里的 cookie 记录带 `cookies_format=cookiejar-v1` 标记；升级时生产者和下载线程要一起重启。
 

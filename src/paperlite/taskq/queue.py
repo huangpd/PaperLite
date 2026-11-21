@@ -18,7 +18,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
-from paperlite.tasks import ERROR_KINDS, Status, Task, UrlType, derive_doi, url_host, url_key, url_problem
+from paperlite.rules.tasks import ERROR_KINDS, Status, Task, UrlType, derive_doi, url_host, url_key, url_problem
 
 import psycopg
 from psycopg import sql

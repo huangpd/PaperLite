@@ -87,7 +87,7 @@ pending ──领块──▶（本进程在途，不落库）──▶ success
 | `challenge_failed` | `failed` | 带有效 cookie 仍被挑战满 `max_url_challenges` 次 |
 | `extract_failed` | `failed` | 拿到的 PDF 过小、超过大小上限或不是有效 PDF |
 
-`not_found` / `paywall` / `landing_page` 的判定规则在 `page.py`，按 ACM 页面编写。
+`not_found` / `paywall` / `landing_page` 的判定规则在 `rules/page.py`，按 ACM 页面编写。
 
 ## 导出列
 
