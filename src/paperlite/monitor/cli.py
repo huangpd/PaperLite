@@ -48,7 +48,7 @@ def _serve(cfg: MonitorConfig, consume: bool) -> None:
 
     if not cfg.loopback_only and not cfg.auth_enabled:
         raise SystemExit(f"面板监听 {cfg.bind}（非本机）却没设密码：任何人都能看。请在 [monitor] 设 password"
-                         f"（或 token），或改回 bind = \"127.0.0.1\"。见 docs/MONITOR.md")
+                         f"（或 token），或改回 bind = \"127.0.0.1\"。见 docs/guide/monitoring.md")
     db = MonitorDB(cfg.db_path, cfg.retention_days, cfg.raw_retention_hours)
     db.prune(force=True)
     stop = threading.Event()

@@ -1,40 +1,22 @@
-# PG 按块领取（研究分支 `research/pg-chunk-lease`）
+# PG 按块领取设计
 
-目标：多台机器（目标 100 台、每天几千万篇）共享一个批次的任务队列。单机的 SQLite + flock 流程保持不变，
-本分支新增可选模块 `paperlite.pgqueue`（`pip install 'paperlite[pg]'`），命令加 `--pg` 时启用。
+目标：多台机器（目标 100 台、每天几千万篇）共享一个批次的任务队列。SQLite 后端（单机，`TaskDB` + flock）保持不变；
+PostgreSQL 后端由 `paperlite.pgqueue` 实现（`pip install 'paperlite[pg]'`），配置 `[queue] backend = "pg"` 时所有命令改用它。
 
-## 0. 用法
+部署与使用见[多机部署](../guide/multi-machine.md)。本文讲为什么这样设计、怎么实现。
 
-> 多机部署的完整步骤（PostgreSQL、安装、配置、启动、看进度）见 [PG_DEPLOY.md](PG_DEPLOY.md)。
+## 0. 后端选择
 
-每台机器的 config.toml 加 `[pg]` 段（`batch` 相同即共享同一批次）：
+`cli._use_pg(args)` 决定后端：命令行 `--pg` 优先，否则读 `[queue] backend`（没有配置文件或没写 = `sqlite`）。
+`cli._open_db` 据此返回 `TaskDB` 或 `PgTaskSource`，两者对 worker 暴露同一组接口（见第 5 节），`browser_pool` / `consumer`
+不感知后端。`export` / `retry` 在 PG 后端下直接报错（`cli._reject_pg`）；`inspect` 只支持 `--list` / `--reset`。
 
-```toml
-[pg]
-dsn = "postgresql://user:pass@pg-host:5432/paperlite"   # 含密码，不要提交
-batch = "10.1016-2026-11"
-# schema = "paperlite"     # 可选
-# chunk_size = 1000        # 每块任务数
-# lease_s = 1800           # 块租约秒数，后台每 lease_s/6 续一次
-# flush_n = 500            # 结果攒够多少条回写
-# flush_s = 5.0            # 或攒了多久回写
-# retry_delay_s = 0        # 要重试的任务至少等多久再进下一代块
-```
-
-```bash
-paperlite import --pg --urls batch.csv     # 任一台机器导一次：COPY 入库、按 (host, doi) 排序、切块
-paperlite run --pg --workers 20            # 每台机器各跑一个；浏览器模式 / --curl 都支持
-paperlite status --pg                      # 任务状态 + 块统计（queued / leased / done）
-```
-
-巡检在 PG 模式下**只在本机领到的块里做**（见第 6 节）。被跳过的任务保持 pending、不再领取，可以放回：
-
-```bash
-paperlite inspect --pg --list              # 看巡检跳过了多少
-paperlite inspect --pg --reset             # 放回巡检跳过的
-```
-
-PG 模式**不做卷期停止**（`volume_stop_after` 被忽略）。`export` / `retry` 暂不支持 `--pg`。
+| | SQLite | PostgreSQL |
+|---|---|---|
+| 领取 | 逐条，按 `(challenge_count, id)` | 按块，块内本地排序 |
+| 并发控制 | 文件锁：一个库一个进程 | `FOR UPDATE SKIP LOCKED` + 块租约 |
+| 巡检 | 全库标记 | 只在本机领到的块里（第 6 节） |
+| 卷期停止 | 有 | 无 |
 
 ## 1. 为什么按块，而不是逐条领
 
@@ -161,7 +143,7 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）只用到 TaskDB �
 - 块内巡检：钩子只作用于本地队列（别的机器手里的块不受影响）、浏览器模式同标题触发后跳过本块剩余同前缀任务；
 - 端到端：3 个 curl `Downloader`（各 2 线程）共享一个批次，30 条每条恰好请求一次；
   2 个 `BrowserPool`（各 2 浏览器）共享一个批次，20 页每页恰好渲染一次；
-- `[pg]` 配置解析和 `--pg` 开关（不需要 PG）。
+- `[queue] backend` 与 `[pg]` 配置解析、`--pg` 开关、`export` / `retry` 在 PG 后端下报错（不需要 PG）。
 
 ```bash
 docker run -d --name paperlite-pg -e POSTGRES_PASSWORD=pl -e POSTGRES_DB=paperlite -p 5439:5432 postgres:16-alpine

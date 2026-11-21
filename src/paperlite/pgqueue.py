@@ -3,7 +3,7 @@
 """
 paperlite/pgqueue.py
 ────────────────────
-【研究原型】PostgreSQL 任务队列：按块领取，供多台机器共享一个批次。设计说明见 docs/PG_CHUNK_LEASE.md。
+PostgreSQL 任务队列后端（[queue] backend = "pg"）：按块领取，供多台机器共享一个批次。设计说明见 docs/development/pg-chunk-lease.md。
 
 与单机 tasks.py（SQLite + flock，逐条按顺序领取）的区别：
   - 块 = 按 (host, doi) 排好序后连续的一段任务（默认 1000 条），导入后由 build_chunks 切好，任务记 chunk_id
@@ -13,7 +13,7 @@ paperlite/pgqueue.py
     重新切成下一代块（generation + 1），相当于单机版"被挑战/失败的排到后面"
   - 租约过期（机器挂了）的块在下一次领取时被放回 queued，由别的机器接手
 
-依赖可选：pip install 'paperlite[pg]'（psycopg 3）。本模块不被 CLI 导入，现有单机流程不受影响。
+依赖可选：pip install 'paperlite[pg]'（psycopg 3）。只在选了 PG 后端时由 cli._open_pg 导入，SQLite 后端不受影响。
 """
 
 import logging
@@ -474,7 +474,7 @@ class PgTaskSource:
     - 本地队列空了就领下一块（上一块还有在途任务也照领，线程不空等）；没块了先 requeue_leftovers 再试
     - 一块的任务全部出结果 → 回写缓冲 → complete；租约丢了 → 丢弃本地还没领的任务，在途的结果照常上报
     - 结果每 flush_n 条或 flush_s 秒回写一次；关闭时回写剩余结果、交还没做完的块
-    - 巡检只在本机领到的块里做，不查、不改全库（见 docs/PG_CHUNK_LEASE.md）：浏览器模式的 WindowInspector
+    - 巡检只在本机领到的块里做，不查、不改全库（见 docs/development/pg-chunk-lease.md）：浏览器模式的 WindowInspector
       调 count_pending_matching / flag_suspects，只看、只跳本地队列，记 skip_reason = title_dup；
       跳过的任务保持 pending，不再领取，clear_skips 可放回
     - 不做卷期停止（依赖 ACM 式 DOI 结构，不通用）：volume_stop_after 被忽略，finish 恒返回 None

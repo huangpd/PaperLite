@@ -12,7 +12,8 @@ paperlite/config.py
   [paths]    位置：db（任务库，本地盘）、storage（输出 PDF/HTML，可挂载）、log_dir
   [run]      paperlite run config.toml 时的启动参数
   [landing]  主机 → 过盾落地页（可选）
-  [pg]       【研究】多机共享任务队列：PostgreSQL 按块领取（命令加 --pg 时才用，见 docs/PG_CHUNK_LEASE.md）
+  [queue]    任务队列后端：sqlite（单机，默认，任务库 = [paths].db）/ pg（多机共享，连接见 [pg]）
+  [pg]       backend = "pg" 时的 PostgreSQL 连接与按块领取参数（见 docs/guide/multi-machine.md）
 """
 
 import os
@@ -137,10 +138,11 @@ class RunConfig:
     urls: str = ""
     url_type: str = "pdf"
     headed: bool = False
-    pg: bool = False                  # 【研究】true = 用 [pg] 段的共享队列（多机），等同命令行 --pg
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "RunConfig":
+        if "pg" in raw:
+            raise ValueError('[run] pg 已改为 [queue] backend = "pg"（对 import / status / inspect 等所有命令生效）')
         _reject_unknown("run", raw, cls)
         cfg = cls(**raw)
         if cfg.command not in ("", "run"):
@@ -153,6 +155,24 @@ class RunConfig:
             raise ValueError("[run] url_type 必须是 pdf 或 html")
         if not cfg.proxy and cfg.mode != "browser":
             raise ValueError("[run] proxy = false 只支持 browser 模式")
+        return cfg
+
+
+BACKENDS = ("sqlite", "pg")
+
+
+@dataclass(frozen=True)
+class QueueConfig:
+    """[queue]：任务队列后端。所有命令（import / run / status / inspect …）都按它选库。"""
+
+    backend: str = "sqlite"           # sqlite = 单机本地任务库 [paths].db；pg = 多机共享的 PostgreSQL（[pg] 段）
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "QueueConfig":
+        _reject_unknown("queue", raw, cls)
+        cfg = cls(**raw)
+        if cfg.backend not in BACKENDS:
+            raise ValueError(f"[queue] backend 必须是 {' 或 '.join(BACKENDS)}")
         return cfg
 
 
@@ -193,7 +213,7 @@ def _read(path: Path) -> dict[str, Any]:
                                 f"或用 --config / 环境变量 {CONFIG_ENV} 指定）")
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "landing", "monitor", "pg"})   # [monitor] 见 monitor/config.py
+    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "landing", "monitor", "queue", "pg"})   # [monitor] 见 monitor/config.py
     return raw
 
 
@@ -222,11 +242,17 @@ def load_run(path: Path | None = None) -> RunConfig:
     return RunConfig.from_dict(raw.get("run", {}))
 
 
+def load_queue(path: Path | None = None) -> QueueConfig:
+    """读 [queue]（没有这一段 = sqlite）。"""
+    raw = _read(path or resolve_path())
+    return QueueConfig.from_dict(raw.get("queue", {}))
+
+
 def load_pg(path: Path | None = None) -> PgConfig:
-    """读 [pg]；没有这一段报错（命令加了 --pg 才会调用）。"""
+    """读 [pg]；没有这一段报错（backend = "pg" 或命令加了 --pg 才会调用）。"""
     raw = _read(path or resolve_path())
     if "pg" not in raw:
-        raise ValueError("用了 --pg，但配置文件里没有 [pg] 段（dsn、batch）")
+        raise ValueError("任务队列用的是 PostgreSQL（[queue] backend = \"pg\" 或 --pg），但配置文件里没有 [pg] 段（dsn、batch）")
     return PgConfig.from_dict(raw["pg"])
 
 

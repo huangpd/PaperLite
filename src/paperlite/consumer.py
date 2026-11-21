@@ -12,7 +12,7 @@ paperlite/consumer.py
   落地页正常 → 站点单独盯上了这条 URL，任务 challenge_count+1 排到后面，满 max_url_challenges 判 failed；
   （站点会成批盯上相邻论文，如 ACM 1005062.* 的 14 篇；只按"下一条也被挑战"判身份会把好身份接连误杀）
 - 连接被断（IP 掉线）/ IP 被站点封禁 / 寿命不足 min_left_s → 丢弃身份换下一个，任务放回且不计重试；
-- 连接被断（curl 56）先用同一身份重试一次（代理偶尔成批断连，见 README）；
+- 连接被断（curl 56）先用同一身份重试一次（代理偶尔成批断连，见 docs/development/architecture.md「IP 中途失效」）；
 - 超时、5xx 计一次重试，满 max_tries 判 failed；
 - 流式下载：先读够 1024 字节判文件头（%PDF- 前允许空白 / BOM，写盘时去掉），是 PDF 就边下边写 .part，
   超过 max_file_size_mb 中止，完成后原子改名；不是 PDF 只读前 256KB 用于判挑战和分类。

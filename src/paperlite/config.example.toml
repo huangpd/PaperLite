@@ -20,6 +20,19 @@ db      = "tasks.db"          # 任务库（SQLite）。必须本地盘：要随
 storage = "/obs"              # 输出目录（PDF/HTML）。可放对象存储挂载（顺序写）
 log_dir = "log"               # 日志目录；非空时同时打印到终端并写入 .jsonl；留空则只打终端
 
+[queue]                       # 任务队列后端：所有命令（import / run / status / inspect）都按它选库
+backend = "sqlite"            # sqlite = 单机，任务库就是 [paths].db（默认）；pg = 多台机器共享一个 PostgreSQL 队列，填下面的 [pg]
+
+# [pg]                        # backend = "pg" 时必填；需要 pip install 'paperlite[pg]'
+# dsn = "postgresql://user:密码@pg-host:5432/paperlite"   # 含密码，别提交
+# batch = "10.1016-2026-11"   # 批次名：同一批次的所有机器填同一个；不同批次可共用一个 PG
+# schema = ""                 # 可选：表放在单独的 schema
+# chunk_size = 1000           # 每块任务数：机器一次领一块
+# lease_s = 1800              # 块租约秒数，后台每 lease_s/6 续一次；机器挂了租约到期由别的机器接手
+# flush_n = 500               # 结果攒够这么多条回写一次
+# flush_s = 5.0               # 或者攒了这么久回写一次
+# retry_delay_s = 0           # 要重试的任务至少等这么久再进下一代块
+
 [limits]                      # 并发与行为（不含存储路径）
 # redis_url = "redis://127.0.0.1:6379/0"   # 仅 curl 模式用（浏览器模式不用 Redis）
 max_browsers = 20             # 同时运行的浏览器上限
@@ -54,7 +67,7 @@ headed = false                # 仅 browser：有界面（调试）
 
 [monitor]                     # 可选：监控上报。各终端发到同一个 RabbitMQ，paperlite-monitor serve 出大屏
 enabled = false               # true 才上报；RabbitMQ 连不上/没装 pika 都不影响下载
-amqp_url = "amqp://pl_terminal:密码@服务器IP:5672/paperlite"    # 公共 RabbitMQ（含密码，别提交）。部署见 docs/MONITOR.md
+amqp_url = "amqp://pl_terminal:密码@服务器IP:5672/paperlite"    # 公共 RabbitMQ（含密码，别提交）。部署见 docs/guide/monitoring.md
 exchange = "paperlite.monitor"
 node = ""                     # 终端名，留空用主机名
 vendor = "qingguo"            # 代理厂商标签：面板按「厂商 × 域名」统计成功率

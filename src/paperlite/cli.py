@@ -59,7 +59,7 @@ def _configured_run_args(args, run: RunConfig, config: str | None = None):
         db=None, storage=None,
         urls=run.urls or None, type=run.url_type, workers=run.workers,
         curl=run.mode == "curl", browser=run.mode == "browser",
-        no_proxy=not run.proxy, headed=run.headed, pg=run.pg,
+        no_proxy=not run.proxy, headed=run.headed, pg=False,
     )
 
 
@@ -100,10 +100,31 @@ def _storage_dir(args, paths: Paths) -> Path:
     return Path(args.storage).expanduser() if getattr(args, "storage", None) else paths.storage_path
 
 
-def _open_db(args, create: bool = False) -> TaskDB:
-    """打开任务库（位置：--db > [paths].db）。create=False 且文件不存在就报错。
-    加了 --pg 时返回 PgTaskSource（[pg] 段的多机共享队列），worker 侧接口与 TaskDB 一致。"""
+def _use_pg(args) -> bool:
+    """任务队列后端：命令行 --pg 优先，否则看 [queue] backend（没有配置文件 / 没写 = sqlite）。"""
     if getattr(args, "pg", False):
+        return True
+    try:
+        backend = config_mod.load_queue(config_mod.resolve_path(args.config)).backend
+    except FileNotFoundError:
+        return False
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"配置错误: {e}")
+    if backend == "pg" and getattr(args, "db", None):
+        raise SystemExit("--db 只用于 sqlite 后端；当前配置 [queue] backend = \"pg\"")
+    return backend == "pg"
+
+
+def _reject_pg(args, what: str) -> None:
+    if _use_pg(args):
+        raise SystemExit(f"{what} 暂不支持 PostgreSQL 后端（[queue] backend = \"pg\"）；"
+                         f"结果可直接用 SQL 查询，见 docs/guide/multi-machine.md")
+
+
+def _open_db(args, create: bool = False) -> TaskDB:
+    """打开任务队列：[queue] backend = "pg"（或 --pg）时返回 PgTaskSource（[pg] 段的多机共享队列，
+    worker 侧接口与 TaskDB 一致）；否则打开 SQLite 任务库（--db > [paths].db），create=False 且文件不存在就报错。"""
+    if _use_pg(args):
         return _open_pg(args)
     db = _db_file(args, _paths(args))
     if not create and not db.exists():
@@ -356,6 +377,7 @@ def _status(args, cfg) -> None:
 
 
 def _export(args) -> None:
+    _reject_pg(args, "export")
     db = _open_db(args)
     rows = db.rows(args.status)
     out = open(args.file, "w", newline="", encoding="utf-8") if args.file != "-" else sys.stdout
@@ -441,7 +463,7 @@ def _inspect(args) -> None:
     """巡检：同标题重复到阈值就归纳 doi/url 规则、标记疑似封面的未采任务。"""
     cfg = _limits(args)
     db = _open_db(args)
-    if getattr(args, "pg", False):                  # PG：巡检只在下载时按块做，这里只能查看 / 撤销
+    if _use_pg(args):                              # PG：巡检只在下载时按块做，这里只能查看 / 撤销
         try:
             if args.reset:
                 print(f"已放回 {db.q.clear_skips('title_dup')} 个巡检跳过的任务")
@@ -566,7 +588,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
         p.add_argument("--db", help="任务库文件（覆盖 [paths].db）；必须本地盘")
         if pg:
             p.add_argument("--pg", action="store_true",
-                           help="【研究】改用 [pg] 段的 PostgreSQL 共享队列（多机按块领取），不用本地 --db")
+                           help="本次改用 PostgreSQL 共享队列（[pg] 段），等同 [queue] backend = \"pg\"")
 
     p = cmd("init")
     p.add_argument("--force", action="store_true", help="已存在也覆盖")
@@ -689,6 +711,7 @@ def main() -> None:
         db.close()
         return
     if args.cmd == "retry":
+        _reject_pg(args, "retry")
         db = _open_db(args)
         if args.stopped_volumes:
             v, n = db.reset_stopped_volumes()
