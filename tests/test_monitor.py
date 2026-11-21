@@ -11,7 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from paperlite.browser.session import RenderResult, classify_waf
+from paperlite.browser.session import RenderResult
+from paperlite.page import classify_waf
 from paperlite.monitor import reporter as mon
 from paperlite.monitor import schema
 from paperlite.monitor.config import MonitorConfig, load_monitor
@@ -422,7 +423,8 @@ class BrowserPoolMonitorWiringTest(unittest.TestCase):
 
 class ProxyCheckMonitorTest(unittest.TestCase):
     def test_one_event_per_ip(self):
-        from paperlite.proxy import IpSource, Lease, ProbeResult, ProxySettings
+        from paperlite.config import ProxySettings
+        from paperlite.proxy import IpSource, Lease, ProbeResult
         src = IpSource(ProxySettings(api_url="https://api/x"))
         lease = Lease(server="1.2.3.4:1", exit_ip="1.2.3.4", area="", expires_at=time.time() + 600)
         with mock.patch.object(src, "_probe", return_value=ProbeResult(ok=True, status=200, total_ms=5000,

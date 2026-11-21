@@ -4,7 +4,7 @@ import time
 
 from paperlite.curl.cookies import jar_from_records
 from paperlite.curl.identity import Identity
-from paperlite.proxy import ProxySettings
+from paperlite.config import ProxySettings
 
 FAKE_PDF = b"%PDF-1.4\n" + b"0" * 2048          # 超过最小文件大小（1024 字节）
 PROXY = ProxySettings(api_url="https://api.example/get?key=k", username="u", password="p@ss")

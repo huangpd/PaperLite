@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from paperlite.config import Limits, RunConfig, proxy_settings
-from paperlite.curl.downloader import impersonate_for
+from paperlite.curl.http import impersonate_for
 from paperlite.logutil import JsonFormatter
 from tests.fakes import PROXY
 from paperlite.proxy import Lease, parse_deadline

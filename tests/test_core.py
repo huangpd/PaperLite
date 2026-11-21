@@ -1,7 +1,7 @@
-"""共享内核：URL 校验（tasks.py）、页面分类（classify.py）。"""
+"""共享内核：URL 校验（tasks.py）、页面判定（page.py）、PDF 文件头（pdf.py）。"""
 import unittest
 
-from paperlite.classify import classify_html
+from paperlite.page import classify_html
 from paperlite.tasks import url_problem
 
 
@@ -53,3 +53,15 @@ class UrlProblemTest(unittest.TestCase):
                     "http://219.238.6.200/x", "http://155.206.11.181:90/content/x",     # 公网 IP 建站：放行
                     "http://10040.indexcopernicus.com/abstracted.php?level=5&ICID=1138423"):   # 合法但打不开：交给下载
             self.assertIsNone(url_problem(url), url)
+
+
+class PdfHeaderTest(unittest.TestCase):
+    """两种模式共用的 PDF 文件头规则（paperlite.pdf）。"""
+
+    def test_offset(self):
+        from paperlite.pdf import HEAD_BYTES, pdf_offset
+        self.assertEqual(pdf_offset(b"%PDF-1.7\n"), 0)
+        self.assertEqual(pdf_offset(b"\r\n\xef\xbb\xbf%PDF-1.7"), 5)          # 前导换行 / BOM 放行
+        self.assertIsNone(pdf_offset(b"<p>see %PDF-1.4</p>"))              # 前面有正文：不是 PDF
+        self.assertIsNone(pdf_offset(b" " * HEAD_BYTES + b"%PDF-1.4"))     # 超出前 1024 字节
+        self.assertIsNone(pdf_offset(b"<html></html>"))

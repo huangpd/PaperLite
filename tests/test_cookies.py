@@ -8,10 +8,10 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 from paperlite.config import Limits
-from paperlite.curl.downloader import session_for_identity
+from paperlite.curl.http import session_for_identity
 from paperlite.curl.cookies import jar_from_records, jar_to_records
 from paperlite.curl.producer import Producer
-from paperlite.proxy import ProxySettings
+from paperlite.config import ProxySettings
 from paperlite.curl.identity import Identity
 from tests.pgutil import identity_row, make_store, needs_pg
 

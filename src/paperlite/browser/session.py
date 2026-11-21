@@ -12,13 +12,15 @@ paperlite/browser/session.py
 
 import asyncio
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from paperlite.proxy import Lease, ProxySettings
+from paperlite.browser.env import browser_env
+from paperlite.config import ProxySettings
+from paperlite.page import classify_waf
+from paperlite.proxy import Lease
 from paperlite.browser.turnstile import TurnstileClicker
 
 if TYPE_CHECKING:
@@ -27,20 +29,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CLEARANCE = "cf_clearance"
-
-
-def classify_waf(headers: dict) -> str:
-    """按主文档响应头识别站点前面的 WAF：cloudflare / aws_waf / datadome / none（仅供监控统计，不参与过盾判断）。"""
-    h = {str(k).lower(): str(v or "").lower() for k, v in (headers or {}).items()}
-    cookie = h.get("set-cookie", "")
-    if "cf-mitigated" in h or "cf-ray" in h or "cloudflare" in h.get("server", ""):
-        return "cloudflare"
-    if "x-amzn-waf-action" in h or "aws-waf-token" in cookie or "awselb" in h.get("server", ""):
-        return "aws_waf"
-    if "x-datadome" in h or "x-datadome-cid" in h or "datadome=" in cookie or "datadome" in h.get("server", ""):
-        return "datadome"
-    return "none"
-
 
 
 class DocTracker:
@@ -74,11 +62,6 @@ class DocTracker:
         """下一次导航前清状态，避免用上一页的 challenged 判断新页（challenged=None 视作"跳转中"）。"""
         self.url, self.status, self.challenged = "", None, None
         self.waf = ""
-
-
-def browser_env() -> dict[str, str]:
-    # macOS 上 DYLD_LIBRARY_PATH=/opt/homebrew/lib 会让 Chromium 启动即 SIGBUS，浏览器进程一律剔除 DYLD_*
-    return {k: v for k, v in os.environ.items() if not k.startswith("DYLD_")}
 
 
 @dataclass

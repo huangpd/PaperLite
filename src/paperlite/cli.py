@@ -43,7 +43,8 @@ from paperlite.curl.downloader import Downloader
 from paperlite import logutil
 from paperlite.logutil import setup_logging
 from paperlite.curl.producer import Producer
-from paperlite.proxy import IpSource, ProxySettings
+from paperlite.config import ProxySettings
+from paperlite.proxy import IpSource
 from paperlite.curl.identity import IdentityStore
 from paperlite.taskq import PgTaskQueue, PgTaskSource
 from paperlite.tasks import ERROR_KINDS, Status, UrlType

@@ -18,7 +18,7 @@ paperlite/curl/downloader.py
 - 流式下载：先读够 1024 字节判文件头（%PDF- 前允许空白 / BOM，写盘时去掉），是 PDF 就边下边写 .part，
   超过 max_file_size_mb 中止，完成后原子改名；不是 PDF 只读前 256KB 用于判挑战和分类。
   超时是卡顿超时（连续 download_timeout_s 秒收不到数据），慢代理上的大文件不会被总时长掐断；
-- 返回 HTML 的判 non_pdf（error_kind 见 classify.py），原始页面存到 <out>/non_pdf/；
+- 返回 HTML 的判 non_pdf（error_kind 见 page.py），原始页面存到 <out>/non_pdf/；
 - url_type = html 的任务要的就是网页：整页（上限 max_file_size_mb）存为 .html、记 success；404/410 判 failed / not_found，
   其他 4xx 判 failed；挑战、封禁、5xx、网络错误的处理与 PDF 任务相同；
   跳转由框架自己跟：curl 跟 HTTP 3xx 和中转页的 meta refresh（≤10s，最多 _MAX_REFRESH_HOPS 跳）；跳到别的主机后被挑战
@@ -27,8 +27,6 @@ paperlite/curl/downloader.py
 """
 
 import asyncio
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 import html as html_lib
 import logging
 import os
@@ -42,12 +40,11 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin
 
-import certifi
-from curl_cffi import requests as curl_requests
 
-from paperlite.classify import classify_html, page_title
-from paperlite.config import Limits
-from paperlite.proxy import ProxySettings
+from paperlite.curl.http import rate_limit_wait, session_for_identity
+from paperlite.page import classify_html, is_cf_denied, is_challenge, page_title
+from paperlite.pdf import HEAD_BYTES, pdf_offset
+from paperlite.config import Limits, ProxySettings
 from paperlite.curl.identity import Identity, IdentityStore
 from paperlite.taskq import PgTaskSource
 from paperlite.tasks import Status, Task, UrlType, pdf_path, url_host
@@ -58,38 +55,12 @@ _IDLE_WAIT_S = 2.0
 _ALIVE_EVERY_S = 20.0                           # 线程在线记录的写入间隔（身份池 60s 没更新算离线）
 _PENDING_REPORT_S = 5.0                        # 向身份池上报可领取任务数的最短间隔（各线程共用）
 _CHUNK = 256 * 1024
-_PDF_HEADER_WINDOW = 1024                      # %PDF- 须在前 1024 字节内（PDF 规范）
-_PDF_LEADING_JUNK = b" \t\r\n\x00\x0c\xef\xbb\xbf"  # 之前只允许这些（有的 PHP 下载脚本会输出前导换行）
 _HTML_LIMIT = 256 * 1024                       # 非 PDF 响应最多读这么多
 _RESET_RETRY_WAIT_S = 2.0      # curl (56) 后同一身份重试前的等待
-_MAX_RATE_LIMIT_WAIT_S = 60.0
 _MAX_REFRESH_HOPS = 5          # 网页任务最多跟这么多次 meta refresh
 _MAX_REFRESH_DELAY_S = 10      # 延迟更长的 meta refresh 当作页面定时刷新，不跟
 _META_RE = re.compile(rb"<meta\b[^>]*>", re.IGNORECASE)
 _REFRESH_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*[;,]\s*url\s*=\s*['\"]?([^'\"]+)", re.IGNORECASE)
-
-
-def impersonate_for(user_agent: str) -> str:
-    """按浏览器 Chrome 主版本选 curl_cffi 指纹（不高于浏览器版本的最新一个）；cf_clearance 与 UA/TLS 指纹绑定。"""
-    from curl_cffi.requests import BrowserType
-
-    m = re.search(r"Chrome/(\d+)", user_agent)
-    if m:
-        major = int(m.group(1))
-        candidates = sorted(
-            (int(v.group(1)), b.value) for b in BrowserType
-            if (v := re.fullmatch(r"chrome(\d+)a?", b.value)) and int(v.group(1)) <= major
-        )
-        if candidates:
-            return candidates[-1][1]
-    return "chrome"
-
-
-def session_for_identity(ident: Identity):
-    session = curl_requests.Session(trust_env=False, verify=certifi.where(),
-                                    impersonate=impersonate_for(ident.user_agent), cookies=ident.cookies)
-    session.headers["user-agent"] = ident.user_agent
-    return session
 
 
 def meta_refresh_target(body: bytes, base_url: str) -> Optional[str]:
@@ -103,43 +74,6 @@ def meta_refresh_target(body: bytes, base_url: str) -> Optional[str]:
         if r and float(r.group(1)) <= _MAX_REFRESH_DELAY_S:
             return urljoin(base_url, r.group(2).strip())
     return None
-
-
-def is_challenge(headers, body: bytes) -> bool:
-    # 挑战页引用 /cdn-cgi/challenge-platform/h/<x>/orchestrate/…；正常页面里的 …/scripts/jsd、…/scripts/precursor 探针不算
-    return bool(headers.get("cf-mitigated")) or b"/challenge-platform/h/" in body[:20000]
-
-
-def is_cf_denied(code: int, headers, body: bytes) -> bool:
-    if code not in (403, 429):
-        return False
-    if "cloudflare" not in headers.get("server", "").lower() and not headers.get("cf-ray"):
-        return False
-    return bool(re.search(
-        rb"<title[^>]*>\s*(?:access denied|attention required)", body[:20000], re.IGNORECASE))
-
-
-def rate_limit_wait(headers, identity_left: float, min_left: float) -> Optional[float]:
-    """返回可安全等待的 Retry-After 秒数；缺失或超出身份寿命时不等待。"""
-    value = headers.get("retry-after", "").strip()
-    try:
-        delay = float(value)
-    except ValueError:
-        try:
-            delay = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
-        except (TypeError, ValueError, OverflowError):
-            return None
-    if not 0 <= delay <= _MAX_RATE_LIMIT_WAIT_S or identity_left - delay < min_left:
-        return None
-    return delay
-
-
-def pdf_offset(head: bytes) -> Optional[int]:
-    """%PDF- 在前 1024 字节内、之前只有空白或 BOM 时返回它的位置；否则不是 PDF（与 paper_downloader 一致）。"""
-    i = head.find(b"%PDF-", 0, _PDF_HEADER_WINDOW)
-    if i < 0 or head[:i].strip(_PDF_LEADING_JUNK):
-        return None
-    return i
 
 
 class BadPdf(Exception):
@@ -325,7 +259,7 @@ class Downloader:
             head = b""
             for chunk in chunks:
                 head += chunk
-                if len(head) >= _PDF_HEADER_WINDOW:
+                if len(head) >= HEAD_BYTES:
                     break
             offset = pdf_offset(head)
             limit = self.cfg.max_file_size_mb * 1024 * 1024

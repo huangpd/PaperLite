@@ -1,4 +1,4 @@
-"""浏览器模式下载 PDF：CDP 拦截响应、流式写盘（paperlite.pdf_capture）。用假的 CDP 会话驱动，不开浏览器。"""
+"""浏览器模式下载 PDF：CDP 拦截响应、流式写盘（paperlite.browser.pdf_capture）。用假的 CDP 会话驱动，不开浏览器。"""
 import asyncio
 import base64
 import tempfile
@@ -61,6 +61,8 @@ class PdfCaptureTest(unittest.TestCase):
     def test_rejects_non_pdf_short_and_incomplete(self):
         for chunks, headers, needle in (
             ([b"<html>login</html>" * 30], {"Content-Type": "application/pdf"}, "不是 PDF"),
+            # %PDF- 前面不只是空白 / BOM（网页正文里提到 %PDF-）：与 curl 模式同一条规则，不当 PDF
+            ([b"<p>see %PDF-1.4</p>" + b"x" * 200], {"Content-Type": "application/pdf"}, "不是 PDF"),
             ([b"%PDF-1.4"], {"Content-Type": "application/pdf"}, "过小"),
             ([b"%PDF-1.4" + b"x" * 50], {"Content-Type": "application/pdf", "Content-Length": "500"}, "不完整"),
             ([b"%PDF-1.4" + b"x" * 1200], {"Content-Type": "application/pdf"}, "超过大小上限"),
