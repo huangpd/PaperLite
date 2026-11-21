@@ -1,6 +1,55 @@
-# 监控面板部署指南（公网 IP + 端口，无需域名）
+# 监控
 
-把 PaperLite 的监控大屏部署到一台有公网 IP 的服务器上：各地终端经公网把指标发进 RabbitMQ，面板消费入库，浏览器用 `http://服务器IP:8700` 访问并输入用户名密码。指标口径见 README「监控大屏」，本文只讲怎么搭。
+每次 `paperlite run` 都可以把运行指标上报到一个共用的 RabbitMQ。`paperlite-monitor serve` 消费这些消息、写入 PostgreSQL（默认和任务队列同一个库，单独的 schema `paperlite_monitor`，保留 30 天），并提供网页面板，可切换最近 24 小时、7 天、30 天视图。
+
+监控完全是旁路：未启用、RabbitMQ 不可达或缺少客户端库时，下载都不受影响。上报消息只包含统计数据与出口 IP，不含代理密码和页面内容。终端把事件放入本地有界缓冲，由后台线程发送；面板先落盘再确认消息。
+
+## 快速试用
+
+```bash
+paperlite-monitor demo          # 用模拟数据启动面板（写入 schema paperlite_monitor_demo），无需 RabbitMQ
+                                # 打开 http://127.0.0.1:8700/；需要配置文件里有 [pg] dsn 或 [monitor] dsn
+```
+
+终端启用上报（RabbitMQ 部署见下文）：
+
+```toml
+[monitor]
+enabled  = true
+amqp_url = "amqp://pl_terminal:PASSWORD@BROKER_IP:5672/paperlite"
+vendor   = "qingguo"            # 代理厂商标签，用于「厂商 × 域名」统计
+```
+
+```bash
+paperlite-monitor test          # 在终端上验证到 RabbitMQ 的连通性
+paperlite-monitor serve         # 在面板服务器上启动，地址 http://HOST:8700/
+```
+
+## 面板内容
+
+| 区块 | 指标 |
+|---|---|
+| IP 质检 | 质检次数、通过率、平均延迟、不通过原因 |
+| 浏览器 | 在线数与目标数、启动成功率、异常数、平均过盾耗时 |
+| 页面采集 | 成功数、失败数、成功率、过盾率、平均耗时与 P95 |
+| 域名 | 各域名的成功率、过盾率、耗时与吞吐；服务端搜索、排序、分页；可按主域名合并 |
+| 代理厂商 | 厂商 × 域名成功率；各厂商 IP 质检通过率 |
+| WAF | Cloudflare、AWS WAF、DataDome 的过盾率与耗时，按响应头识别 |
+| 实时 | 待下载与进行中任务数、各域名访问频率、实时事件流、终端列表 |
+
+## 指标口径
+
+- 页面指标**按尝试计**：过盾超时后重试的任务，每次尝试各计一次。
+- "过盾"指页面实际加载出来；"成功"指过盾且 HTTP 状态码小于 400。
+- 耗时只统计已加载的页面。
+- 样本少于 20 次的域名灰显。
+- 成功率或过盾率低于 70% 的域名标记为异常。
+
+---
+
+# 部署指南（公网 IP + 端口，无需域名）
+
+把监控面板部署到一台有公网 IP 的服务器上：各地终端经公网把指标发进 RabbitMQ，面板消费入库，浏览器用 `http://服务器IP:8700` 访问并输入用户名密码。
 
 > 本文用到的 `deploy/monitor/` 下的文件（`docker-compose.yml`、`rabbitmq.conf`）、账号权限命令、面板登录均已实测（RabbitMQ 3.13）。示例 IP `203.0.113.10` 和各密码请换成自己的。
 
@@ -13,7 +62,7 @@
 5. [浏览器访问](#5-浏览器访问)
 6. [终端接入](#6-终端接入)
 7. [防火墙与安全组](#7-防火墙与安全组)
-8. [数据库（面板 SQLite）](#8-数据库面板-sqlite)
+8. [数据存储（PostgreSQL）](#8-数据存储postgresql)
 9. [配置项一览](#9-配置项一览monitor)
 10. [日常运维](#10-日常运维)
 11. [故障排查](#11-故障排查)
@@ -25,7 +74,7 @@
 
 ```
  终端 A（paperlite run）─┐
- 终端 B（paperlite run）─┼── amqp://203.0.113.10:5672 ──► RabbitMQ ──► 面板队列 ──► paperlite-monitor serve ──► monitor.db
+ 终端 B（paperlite run）─┼── amqp://203.0.113.10:5672 ──► RabbitMQ ──► 面板队列 ──► paperlite-monitor serve ──► PostgreSQL
  终端 C（paperlite run）─┘                                  （同一台服务器；面板连本机 127.0.0.1:5672）  │
                                                                                                       │ HTTP + 登录
  运维浏览器 ──────────────────── http://203.0.113.10:8700 ◄────────────────────────────────────────────┘
@@ -115,7 +164,7 @@ sudo -u paperlite python3 -m venv /opt/paperlite-monitor/.venv
 sudo -u paperlite /opt/paperlite-monitor/.venv/bin/pip install paperlite      # 或源码：pip install /tmp/PaperLite
 ```
 
-面板只用到 `paperlite-monitor` 命令和 pika，不需要浏览器、代理配置。
+面板只用到 `paperlite-monitor` 命令、pika 和 PostgreSQL，不需要浏览器、代理配置。PostgreSQL 可以和任务队列共用一个（见 [部署 PostgreSQL](postgres.md)），面板表放在单独的 schema 里。
 
 ### 4.2 配置
 
@@ -124,7 +173,8 @@ sudo -u paperlite /opt/paperlite-monitor/.venv/bin/pip install paperlite      # 
 ```toml
 [monitor]
 amqp_url = "amqp://pl_panel:<面板消费密码>@127.0.0.1:5672/paperlite"   # 同机：连本机 5672
-db = "/opt/paperlite-monitor/monitor.db"                              # 绝对路径，必须本地盘
+dsn = "postgresql://paperlite:<PG 密码>@<PG 地址>:5432/paperlite"      # 可与任务队列共用一个 PG
+# schema = "paperlite_monitor"   # 面板表所在 schema，与任务表分开
 bind = "0.0.0.0"                                                       # 对外监听
 port = 8700
 username = "admin"                                                     # 网页登录用户名
@@ -138,7 +188,7 @@ password = "<面板网页登录密码>"                                        #
 sudo chown paperlite: /opt/paperlite-monitor/config.toml && sudo chmod 600 /opt/paperlite-monitor/config.toml
 ```
 
-保险：`bind` 不是本机地址却没设 `password`/`token` → **拒绝启动**。
+保险：`bind` 不是本机地址却没设 `password`/`token` → **拒绝启动**。`dsn` 没填时用同一配置文件里 `[pg]` 的 `dsn`；两个都没有 → 拒绝启动。
 
 ### 4.3 systemd 常驻
 
@@ -230,9 +280,9 @@ sudo ufw allow 22/tcp && sudo ufw allow 5672/tcp && sudo ufw allow 8700/tcp && s
 ssh -L 15672:127.0.0.1:15672 user@203.0.113.10    # 然后本地打开 http://127.0.0.1:15672，用 admin 登录
 ```
 
-## 8. 数据库（面板 SQLite）
+## 8. 数据存储（PostgreSQL）
 
-面板把消息写进 `[monitor].db` 指定的 SQLite 文件（默认 `monitor.db`，相对路径以启动目录为准，**建议写绝对路径**）。必须放本地盘（WAL 模式要文件锁，NFS/FUSE 挂载不行）。
+面板把消息写进 `[monitor].dsn` 指向的 PostgreSQL（留空则用 `[pg].dsn`），表放在 `[monitor].schema`（默认 `paperlite_monitor`）里，第一次启动时自动建好。和任务队列共用一个 PG 时，两边的表互不干扰。
 
 ### 8.1 两层存储
 
@@ -242,47 +292,41 @@ ssh -L 15672:127.0.0.1:15672 user@203.0.113.10    # 然后本地打开 http://12
 | 小时汇总 | `page_h` `browser_h` `proxy_h` `proxy_reason_h` `fleet_h` | `retention_days`（默认 30 天） | 大屏 24 小时 / 7 天 / 30 天的全部数字和趋势 |
 | 终端 | `instance` | 30 天未上报即删 | 每个终端最新心跳（在线数、待下载） |
 
-入库时先按小时聚合，所以大屏查询代价与事件量无关。P95 用每小时的耗时直方图合并得出，误差约 ±6%。过期数据每小时清理一次。
+入库时先按小时聚合，所以大屏查询代价与事件量无关。P95 用每小时的耗时直方图合并得出，误差约 ±6%。过期数据每小时清理一次。每批消息在一个事务里写完才向 RabbitMQ 确认，面板崩溃最多重放一批，不会丢。
 
 ### 8.2 容量估算
 
-一个 20 浏览器的终端每天约 5 万次页面尝试 + 几千次 IP 质检 + 5760 次心跳（15s 一次）。
+一个 20 浏览器的终端每天约 5 万次页面尝试 + 几千次 IP 质检 + 5760 次心跳（15s 一次）。10 个终端合计约 10 条/秒。
 
-实测（30 天、3 个终端的量级，300 万条消息，30 个域名、4 种 WAF、2 个厂商——偏悲观的组合）：
+实测（本机 Docker postgres:16，`paperlite-monitor demo` 的模拟数据放大 3 倍：30 天、3 个终端、6 个域名、2 个厂商，约 2.8 万条消息）：
 
 | 指标 | 实测 |
 |---|---|
-| 入库速度 | 约 2.2 万条/秒（远超需要：10 个终端合计约 10 条/秒） |
-| 小时汇总行数 | 约 17 万行 |
-| 库文件大小 | 约 250 MB（其中原始事件 48 小时） |
-| 大屏查询（24h / 7 天 / 30 天） | 0.07s / 0.5s / 1.4s（多人同时看有 5 秒缓存） |
+| 入库速度 | 约 6900 条/秒（回灌 30 天数据，每批 5000 条；实时入库每批只涉及当前小时，更快） |
+| 大屏查询（24h / 7 天 / 30 天） | 0.008s / 0.014s / 0.026s（多人同时看另有 5 秒缓存） |
+| 域名表（30 天） | 0.010s |
 
-粗算：小时汇总每天约 `24 × 域名数 × 厂商数` 行；原始事件约 200 字节/条 × 48 小时的量。终端很多导致库太大时，先调小 `raw_retention_hours`（如 12）。
+粗算：小时汇总每天约 `24 × 域名数 × 厂商数` 行；原始事件约 200 字节/条 × 48 小时的量。终端很多导致表太大时，先调小 `raw_retention_hours`（如 12）。
 
 ### 8.3 备份
 
-WAL 模式下可在线热备，不用停服务：
+监控数据丢了不影响下载，备份不是必须的；想保留历史趋势再做：
 
 ```bash
-sqlite3 /opt/paperlite-monitor/monitor.db ".backup '/backup/monitor-$(date +%F).db'"
-# 没装 sqlite3 命令行时：
-/opt/paperlite-monitor/.venv/bin/python -c "import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d)" \
-    /opt/paperlite-monitor/monitor.db /backup/monitor-$(date +%F).db
+pg_dump -n paperlite_monitor -Fc "postgresql://paperlite:<密码>@<PG 地址>:5432/paperlite" > monitor-$(date +%F).dump
 ```
-
-监控数据丢了不影响下载，备份不是必须的；想保留历史趋势再做。
 
 ### 8.4 清空 / 迁移
 
-- **清空重来**：`systemctl stop paperlite-monitor`，删 `monitor.db*`（三个文件），再 start。RabbitMQ 队列里还没消费的消息会补进新库。
-- **换服务器**：停面板 → 拷走 `monitor.db` → 新机器按本文部署 → 各终端把 `amqp_url` 里的 IP 改成新的。
+- **清空重来**：`systemctl stop paperlite-monitor`，`DROP SCHEMA paperlite_monitor CASCADE`，再 start（自动重建）。RabbitMQ 队列里还没消费的消息会补进新表。
+- **换服务器**：面板进程是无状态的，新机器按本文部署、`dsn` 指向同一个 PG 即可；各终端把 `amqp_url` 里的 IP 改成新的。
 
 ### 8.5 直接查库
 
-```bash
-sqlite3 -readonly /opt/paperlite-monitor/monitor.db \
-  "SELECT host, SUM(n) 尝试, ROUND(1.0*SUM(ok)/SUM(n),3) 成功率 FROM page_h
-   WHERE hour >= CAST(strftime('%s','now') AS INT)/3600 - 24 GROUP BY host ORDER BY 2 DESC;"
+```sql
+SET search_path TO paperlite_monitor;
+SELECT host, SUM(n) AS 尝试, ROUND(SUM(ok)::numeric / SUM(n), 3) AS 成功率 FROM page_h
+WHERE hour >= extract(epoch FROM now())::int / 3600 - 24 GROUP BY host ORDER BY 2 DESC;
 ```
 
 也可以带 token 调接口拿 JSON：`curl -s 'http://203.0.113.10:8700/api/summary?window=7d&token=<token>'`（`window` = `1d` / `7d` / `30d`）。
@@ -301,7 +345,8 @@ sqlite3 -readonly /opt/paperlite-monitor/monitor.db \
 | `forward_logs` | `true` | 终端 | WARNING 以上日志也作为实时事件上报 |
 | `queue` | `paperlite.monitor.dashboard` | 面板 | 面板的持久队列 |
 | `queue_max_length` | `2000000` | 面板 | 队列上限，满了丢最旧的 |
-| `db` | `monitor.db` | 面板 | SQLite 路径（本地盘） |
+| `dsn` | 空（用 `[pg].dsn`） | 面板 | 面板数据所在的 PostgreSQL |
+| `schema` | `paperlite_monitor` | 面板 | 面板表所在 schema，与任务表分开 |
 | `bind` / `port` | `127.0.0.1` / `8700` | 面板 | 监听地址；对外用 `0.0.0.0` |
 | `username` / `password` | `admin` / 空 | 面板 | 网页登录（HTTP Basic）；`password` 非空即开启 |
 | `token` | 空 | 面板 | 可选的接口令牌（`?token=` 或请求头 `X-Token`） |
@@ -331,6 +376,7 @@ sqlite3 -readonly /opt/paperlite-monitor/monitor.db \
 | 连接超时 / 被拒 | 安全组/ufw 没放 5672 或 8700；在终端上 `nc -vz 203.0.113.10 5672` 自查 |
 | 浏览器反复弹登录框 | 用户名或密码错 |
 | 面板拒绝启动：`面板监听 0.0.0.0（非本机）却没设密码` | 设 `password` |
+| 面板报 `连接 PostgreSQL 失败` / 没有 dsn | 检查 `[monitor].dsn`（或 `[pg].dsn`）和 PG 的访问控制；面板机要能连到 PG 的 5432 |
 | 面板里终端一直「离线」 | 终端没开 `enabled = true`、没装 pika（终端日志会提示）、或连不上 MQ（终端日志每 5 分钟提示一次） |
 | 自测 `curl` 访问结果奇怪（502、连不上） | 本机设了 `http_proxy`/`https_proxy`（代理软件），curl 走了代理。加 `--noproxy '*'` 再试 |
 | 面板数据比预期少 | `queue_max_length` 太小导致积压时丢了最旧的；或终端本地缓冲在长时间断网时溢出 |

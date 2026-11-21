@@ -5,13 +5,16 @@ paperlite/config.py
 ─────────────────────
 读 config.toml（模板见包内 config.example.toml，paperlite init 生成）。查找顺序：--config 参数 > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml。
 
-一份 config = 一个批次。各种主机的 URL 混着导进同一个任务库，默认用浏览器模式统一跑。
+一份 config = 一个批次（[pg] batch）。各种主机的 URL 混着导进同一个 PostgreSQL 任务队列，一台或多台机器共享，
+默认用浏览器模式统一跑。
 
+  [pg]       任务队列：PostgreSQL 连接、批次名、按块领取参数（必填）
   [proxy]    代理提取接口与鉴权
   [limits]   并发与行为（浏览器数、过盾超时、请求间隔、熔断、巡检阈值……）
-  [paths]    位置：db（任务库，本地盘）、storage（输出 PDF/HTML，可挂载）、log_dir
+  [paths]    位置：storage（输出 PDF/HTML，可挂载）、log_dir
   [run]      paperlite run config.toml 时的启动参数
   [landing]  主机 → 过盾落地页（可选）
+  [monitor]  监控上报与面板（可选，见 monitor/config.py）
 """
 
 import os
@@ -44,20 +47,17 @@ def write_example(path: Path, force: bool = False) -> None:
 
 @dataclass(frozen=True)
 class Paths:
-    """位置。db 与 storage 相互独立：storage 可放对象存储挂载，db 必须本地盘。"""
+    """位置。任务在 PostgreSQL（[pg]），这里只有输出与日志。"""
 
-    db: str = "tasks.db"              # 任务库文件（SQLite，必须本地盘：要随机写/文件锁/mmap）
     storage: str = "output"           # 输出目录（PDF/HTML），可在 goofys/s3fs 等挂载上
     log_dir: str = "log"              # 日志目录；非空时同时写终端和按启动时间命名的 .jsonl；空则只打终端
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Paths":
+        if "db" in raw:
+            raise ValueError("[paths] db 已移除：任务队列改用 PostgreSQL，请删掉 db 并配置 [pg] 段（dsn、batch）")
         _reject_unknown("paths", raw, cls)
         return cls(**raw)
-
-    @property
-    def db_path(self) -> Path:
-        return Path(self.db).expanduser()
 
     @property
     def storage_path(self) -> Path:
@@ -95,7 +95,6 @@ class Limits:
     max_file_size_mb: int = 200       # 超过就中止，判 failed / extract_failed
     max_tries: int = 3                # 单条 URL 的网络错误重试次数（cookie 被拒不计）
     max_url_challenges: int = 3       # 单条 URL 带有效 cookie 仍被挑战满这么多次 → failed / challenge_failed
-    volume_stop_after: int = 3        # 同一卷期还没下到 PDF、已有这么多篇 404/订阅/摘要页 → 停掉该卷期其余任务；0 关闭
     # 巡检：同标题重复到阈值就归纳 doi/url 规则，把疑似失效/封面的 pending 标记跳过（见 inspect.py）
     title_dup_trigger: int = 10       # 同一标题重复这么多篇就触发巡检；0 关闭巡检
     title_window_size: int = 500      # 实时巡检只保留本次运行最近这么多条已加载页面
@@ -107,6 +106,8 @@ class Limits:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any], landing: dict[str, str] | None = None) -> "Limits":
+        if "volume_stop_after" in raw:
+            raise ValueError("[limits] volume_stop_after 已移除（卷期停止只适用 ACM 式 DOI，不通用），删掉这一行即可")
         _reject_unknown("limits", raw, cls)
         kwargs = dict(raw)
         for key in ("request_gap_s", "page_interval_s"):
@@ -139,6 +140,8 @@ class RunConfig:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "RunConfig":
+        if "pg" in raw:
+            raise ValueError("[run] pg 已移除：任务队列只用 PostgreSQL（[pg] 段），删掉这一行即可")
         _reject_unknown("run", raw, cls)
         cfg = cls(**raw)
         if cfg.command not in ("", "run"):
@@ -151,6 +154,30 @@ class RunConfig:
             raise ValueError("[run] url_type 必须是 pdf 或 html")
         if not cfg.proxy and cfg.mode != "browser":
             raise ValueError("[run] proxy = false 只支持 browser 模式")
+        return cfg
+
+
+@dataclass(frozen=True)
+class PgConfig:
+    """[pg]：任务队列（paperlite.pgqueue）。同一 batch 的机器共享一个批次。"""
+
+    dsn: str = ""                     # postgresql://user:pass@host:5432/db（含密码，config.toml 不要提交）
+    batch: str = ""                   # 批次名：同一批次的机器填同一个
+    schema: str = ""                  # 可选：表所在 schema，空 = 默认 search_path
+    chunk_size: int = 1000            # 每块任务数
+    lease_s: float = 1800             # 块租约秒数，后台每 lease_s/6 续一次
+    flush_n: int = 500                # 结果攒够这么多条回写一次
+    flush_s: float = 5.0              # 或者攒了这么久回写一次
+    retry_delay_s: float = 0.0        # 要重试的任务至少等这么久再进下一代块
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "PgConfig":
+        _reject_unknown("pg", raw, cls)
+        cfg = cls(**raw)
+        if not cfg.dsn or not cfg.batch:
+            raise ValueError("[pg] dsn 和 batch 必填")
+        if cfg.chunk_size < 1 or cfg.lease_s <= 0 or cfg.flush_n < 1 or cfg.flush_s <= 0:
+            raise ValueError("[pg] chunk_size / lease_s / flush_n / flush_s 必须大于 0")
         return cfg
 
 
@@ -167,7 +194,9 @@ def _read(path: Path) -> dict[str, Any]:
                                 f"或用 --config / 环境变量 {CONFIG_ENV} 指定）")
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "landing", "monitor"})   # [monitor] 见 monitor/config.py
+    if "queue" in raw:
+        raise ValueError("[queue] 已移除：任务队列只用 PostgreSQL（[pg] 段），删掉 [queue] 即可")
+    _reject_unknown("顶层", raw, None, allowed={"proxy", "limits", "paths", "run", "landing", "monitor", "pg"})   # [monitor] 见 monitor/config.py
     return raw
 
 
@@ -194,6 +223,14 @@ def load_run(path: Path | None = None) -> RunConfig:
     """读 [run]。"""
     raw = _read(path or resolve_path())
     return RunConfig.from_dict(raw.get("run", {}))
+
+
+def load_pg(path: Path | None = None) -> PgConfig:
+    """读 [pg]（任务队列）；没有这一段报错。"""
+    raw = _read(path or resolve_path())
+    if "pg" not in raw:
+        raise ValueError("配置文件里没有 [pg] 段：任务队列在 PostgreSQL，至少要填 dsn 和 batch（见 paperlite init 生成的模板）")
+    return PgConfig.from_dict(raw["pg"])
 
 
 def _reject_unknown(section: str, raw: dict, cls, allowed: set[str] | None = None) -> None:

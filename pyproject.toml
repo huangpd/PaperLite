@@ -1,7 +1,7 @@
 [project]
 name = "paperlite"
-version = "0.2.5"
-description = "High-volume PDF and web page downloader for bot-protected sites: real browsers, rotating proxies, resumable SQLite task queue."
+version = "0.3.0"
+description = "High-volume PDF and web page downloader for bot-protected sites: real browsers, rotating proxies, resumable PostgreSQL task queue shared by one or many machines."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -22,7 +22,8 @@ classifiers = [
 dependencies = [
     "cloakbrowser[geoip]==0.6.4",
     "curl-cffi>=0.15.0",
-    "duckdb>=1.0.0",              # 导入 CSV 时按 DOI 排序
+    "duckdb>=1.0.0",              # 导入时读 CSV（大文件、容错、报出错行）
+    "psycopg[binary]>=3.1",       # 任务队列与监控面板都在 PostgreSQL
     "redis>=5.0",
     "certifi>=2024.2.2",
     "pika>=1.3",                  # 监控上报 / 面板（paperlite-monitor）；未启用 [monitor] 时不会被导入
@@ -30,6 +31,7 @@ dependencies = [
 
 [project.optional-dependencies]
 monitor = []                  # 兼容旧安装命令 paperlite[monitor]；pika 已是默认依赖
+pg = []                       # 兼容旧安装命令 paperlite[pg]；psycopg 已是默认依赖
 
 [project.urls]
 Homepage = "https://github.com/huangpd/PaperLite"
@@ -52,7 +54,7 @@ packages = ["src/paperlite"]
 
 # sdist 只放这些：项目目录里的 config.toml（含代理密码）、data/、db/、pdfs/ 绝不能进包
 [tool.hatch.build.targets.sdist]
-only-include = ["src/paperlite", "tests", "deploy", "docs", "README.md", "README.zh-CN.md", "LICENSE", "pyproject.toml"]
+only-include = ["src/paperlite", "tests", "deploy", "docs", "README.md", "README.zh-CN.md", "CHANGELOG.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

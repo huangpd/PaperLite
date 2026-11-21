@@ -19,6 +19,7 @@ from paperlite.monitor import reporter as mon
 from paperlite.monitor import schema
 from paperlite.monitor.config import MonitorConfig, load_monitor
 from paperlite.monitor.db import MonitorDB
+from tests.pgutil import DSN, make_source, needs_pg, new_schema
 
 
 def msg(type_, ts, data, inst="n1:1", vendor="qg", batch="b"):
@@ -46,6 +47,17 @@ class MonitorConfigTest(unittest.TestCase):
             self.assertTrue(cfg.enabled)
             self.assertEqual(cfg.vendor_name, "qg")
             self.assertFalse(load_monitor(Path(tmp) / "none.toml").enabled)
+
+    def test_dsn_falls_back_to_pg_section_and_db_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "c.toml"
+            p.write_text('[pg]\ndsn = "postgresql://h/db"\nbatch = "b"\n[monitor]\nenabled = false\n')
+            cfg = load_monitor(p)
+            self.assertEqual((cfg.dsn, cfg.schema), ("postgresql://h/db", "paperlite_monitor"))
+            p.write_text('[pg]\ndsn = "postgresql://h/db"\nbatch = "b"\n[monitor]\ndsn = "postgresql://m/db"\n')
+            self.assertEqual(load_monitor(p).dsn, "postgresql://m/db")
+        with self.assertRaisesRegex(ValueError, "db 已移除"):
+            MonitorConfig.from_dict({"db": "monitor.db"})
 
     def test_paperlite_config_accepts_monitor_section(self):
         from paperlite import config as config_mod
@@ -116,15 +128,17 @@ class ReporterTest(unittest.TestCase):
             schema.decode(b'{"v": 1, "type": "evil", "data": {}}')
 
 
+def _monitor_db(test) -> MonitorDB:
+    db = MonitorDB(DSN, new_schema(test))
+    test.addCleanup(db.close)
+    return db
+
+
+@needs_pg
 class MonitorDBTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.db = MonitorDB(Path(self.tmp.name) / "m.db")
+        self.db = _monitor_db(self)
         self.now = time.time()
-
-    def tearDown(self):
-        self.db.close()
-        self.tmp.cleanup()
 
     def test_windows_and_rates(self):
         now = self.now
@@ -191,8 +205,8 @@ class MonitorDBTest(unittest.TestCase):
         now = self.now
         self.db.ingest([page(now - 40 * 86400), page(now - 100)])
         self.db.prune(now=now, force=True)
-        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM page_h").fetchone()[0], 1)   # 过期汇总已删
-        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM page").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM page_h").fetchone()["n"], 1)   # 过期汇总已删
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM page").fetchone()["n"], 1)
         tl = self.db.summary("1d", now=now)["trend"]
         self.assertEqual(sum(b["attempts"] for b in tl), 1)
         self.assertGreaterEqual(len(tl), 24)
@@ -251,11 +265,12 @@ class MonitorDBTest(unittest.TestCase):
         json.dumps(d)                                                   # 可直接序列化给前端
 
 
+@needs_pg
 class DashboardHttpTest(unittest.TestCase):
     def test_pages_and_token(self):
         from paperlite.monitor.dashboard import make_server
-        with tempfile.TemporaryDirectory() as tmp:
-            db = MonitorDB(Path(tmp) / "m.db")
+        if True:
+            db = _monitor_db(self)
             db.ingest([page(time.time())])
             srv = make_server(MonitorConfig(port=0, token="s3"), db)
             threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -283,14 +298,13 @@ class DashboardHttpTest(unittest.TestCase):
             finally:
                 srv.shutdown()
                 srv.server_close()
-                db.close()
 
 
+@needs_pg
 class DashboardAuthTest(unittest.TestCase):
     def _serve(self, cfg):
         from paperlite.monitor.dashboard import make_server
-        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
-        db = MonitorDB(Path(tmp.name) / "m.db"); self.addCleanup(db.close)
+        db = _monitor_db(self)
         srv = make_server(cfg, db)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(srv.server_close); self.addCleanup(srv.shutdown)
@@ -331,17 +345,14 @@ class DashboardAuthTest(unittest.TestCase):
         self.assertIn("password", str(e.exception))
 
 
+@needs_pg
 class BrowserPoolMonitorWiringTest(unittest.TestCase):
     """浏览器模式埋点：每次页面尝试发一条 page（带 host / waf / 过盾与成功区分），在线数跟着浏览器开关。"""
 
     def setUp(self):
-        from paperlite.tasks import TaskDB
         self.tmp = tempfile.TemporaryDirectory()
-        self.db = TaskDB(Path(self.tmp.name) / "tasks.db")
-
-    def tearDown(self):
-        self.db.close()
-        self.tmp.cleanup()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = make_source(self)
 
     def _pool(self, url):
         from paperlite.browser_pool import BrowserPool

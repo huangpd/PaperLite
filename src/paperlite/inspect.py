@@ -155,7 +155,7 @@ class WindowInspector:
 def inspect(db, trigger: int = 10, min_precision: float = 0.98, min_support: int = 10) -> tuple[int, int]:
     """
     跑一轮巡检，返回 (本次生效规则数, 本次新标记的 pending 数)。
-    db 需提供 crawled_titles() / count_pending_matching() / flag_suspects()（见 tasks.TaskDB）。
+    db 需提供 crawled_titles() / count_pending_matching() / flag_suspects()（见 pgqueue.PgTaskQueue）。
     """
     crawled = db.crawled_titles()
     if len(crawled) < trigger:

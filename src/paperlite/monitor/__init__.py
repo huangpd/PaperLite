@@ -2,7 +2,7 @@
 paperlite/monitor
 ───────────────────
 独立观测模块：每个 PaperLite 终端把运行指标发到一个公共 RabbitMQ，监控面板（paperlite-monitor serve）
-消费入库（SQLite，保留 30 天）并出大屏（最近 1 / 7 / 30 天）。
+消费入库（PostgreSQL，保留 30 天）并出大屏（最近 1 / 7 / 30 天）。
 
   上报端（下载进程里）
     config.py    [monitor] 段配置

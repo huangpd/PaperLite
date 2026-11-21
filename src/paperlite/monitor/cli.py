@@ -3,9 +3,10 @@ paperlite-monitor：监控面板端命令。
 
   paperlite-monitor serve  [--config config.toml]   # 消费 RabbitMQ → 入库 → 起大屏 http://127.0.0.1:8700/
   paperlite-monitor test   [--config config.toml]   # 在终端机器上发一条测试心跳，验证到 RabbitMQ 的连通性
-  paperlite-monitor demo   --db demo.db             # 灌一份模拟数据并起大屏（不需要 RabbitMQ），看效果用
+  paperlite-monitor demo   [--config config.toml]   # 灌一份模拟数据（schema paperlite_monitor_demo）并起大屏，不需要 RabbitMQ
 
 配置读 config.toml 的 [monitor] 段（查找顺序同 paperlite：--config > PAPERLITE_CONFIG > ./config.toml）。
+面板数据存 PostgreSQL：[monitor] dsn，留空则用 [pg] 的 dsn。
 """
 
 import argparse
@@ -29,7 +30,8 @@ def _cfg(args) -> MonitorConfig:
         cfg = load_monitor(config_mod.resolve_path(args.config))
     except (TypeError, ValueError) as e:
         raise SystemExit(f"配置错误: {e}")
-    over = {k: v for k, v in (("db", getattr(args, "db", None)), ("bind", getattr(args, "bind", None)),
+    over = {k: v for k, v in (("dsn", getattr(args, "dsn", None)), ("schema", getattr(args, "schema", None)),
+                               ("bind", getattr(args, "bind", None)),
                                ("port", getattr(args, "port", None)), ("amqp_url", getattr(args, "amqp", None)))
             if v is not None}
     return dataclasses.replace(cfg, **over) if over else cfg
@@ -42,14 +44,23 @@ def _need_pika() -> None:
         raise SystemExit("需要 pika：pip install pika（或升级 paperlite）")
 
 
+def _open(cfg: MonitorConfig):
+    from paperlite.monitor.db import MonitorDB
+    if not cfg.dsn:
+        raise SystemExit("面板数据存 PostgreSQL：请在 [monitor] 填 dsn，或在 [pg] 填 dsn（两者共用一个库）")
+    try:
+        return MonitorDB(cfg.dsn, cfg.schema, cfg.retention_days, cfg.raw_retention_hours)
+    except Exception as e:
+        raise SystemExit(f"连接 PostgreSQL 失败: {e}")
+
+
 def _serve(cfg: MonitorConfig, consume: bool) -> None:
     from paperlite.monitor.dashboard import make_server
-    from paperlite.monitor.db import MonitorDB
 
     if not cfg.loopback_only and not cfg.auth_enabled:
         raise SystemExit(f"面板监听 {cfg.bind}（非本机）却没设密码：任何人都能看。请在 [monitor] 设 password"
-                         f"（或 token），或改回 bind = \"127.0.0.1\"。见 docs/MONITOR.md")
-    db = MonitorDB(cfg.db_path, cfg.retention_days, cfg.raw_retention_hours)
+                         f"（或 token），或改回 bind = \"127.0.0.1\"。见 docs/guide/monitoring.md")
+    db = _open(cfg)
     db.prune(force=True)
     stop = threading.Event()
     if consume:
@@ -64,8 +75,8 @@ def _serve(cfg: MonitorConfig, consume: bool) -> None:
     host = "127.0.0.1" if cfg.bind in ("0.0.0.0", "") else cfg.bind
     auth = (f"登录用户 {cfg.username}" if cfg.password else "") + \
            ("，另可用 token" if cfg.token else "") or "未设密码（仅本机可访问）"
-    logger.info("监控大屏 http://%s:%d/  %s  数据库 %s（保留 %d 天）", host, cfg.port, auth,
-                cfg.db_path.resolve(), cfg.retention_days)
+    logger.info("监控大屏 http://%s:%d/  %s  数据存 PostgreSQL schema %s（保留 %d 天）", host, cfg.port, auth,
+                cfg.schema, cfg.retention_days)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -155,12 +166,10 @@ def demo_messages(now: float, days: int = 30, scale: int = 1) -> list[dict]:
 
 
 def _demo(cfg: MonitorConfig, scale: int) -> None:
-    from paperlite.monitor.db import MonitorDB
-
-    db = MonitorDB(cfg.db_path, cfg.retention_days, cfg.raw_retention_hours)
+    db = _open(cfg)
     n = db.ingest(demo_messages(time.time(), scale=scale))
     db.close()
-    logger.info("已写入 %d 条模拟数据到 %s", n, cfg.db_path)
+    logger.info("已写入 %d 条模拟数据到 schema %s", n, cfg.schema)
     _serve(cfg, consume=False)
 
 
@@ -172,7 +181,8 @@ def main(argv=None) -> None:
     sub = ap.add_subparsers(dest="cmd", required=True, metavar="<命令>")
     for name, help_ in (("serve", "消费 RabbitMQ、入库并起大屏"), ("demo", "灌模拟数据并起大屏（不连 RabbitMQ）")):
         p = sub.add_parser(name, help=help_)
-        p.add_argument("--db", help="面板 SQLite（覆盖 [monitor].db）")
+        p.add_argument("--dsn", help="面板 PostgreSQL（覆盖 [monitor].dsn）")
+        p.add_argument("--schema", help="面板表所在 schema（覆盖 [monitor].schema）")
         p.add_argument("--bind", help="监听地址（覆盖 [monitor].bind）")
         p.add_argument("--port", type=int, help="端口（覆盖 [monitor].port）")
         if name == "serve":
@@ -191,8 +201,8 @@ def main(argv=None) -> None:
     if args.cmd == "serve":
         _serve(cfg, consume=not args.no_consume)
     elif args.cmd == "demo":
-        if args.db is None:
-            cfg = dataclasses.replace(cfg, db="monitor-demo.db")
+        if args.schema is None:
+            cfg = dataclasses.replace(cfg, schema="paperlite_monitor_demo")
         _demo(cfg, args.scale)
     else:
         _test(cfg)

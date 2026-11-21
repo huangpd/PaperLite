@@ -1,0 +1,31 @@
+# 每次推送 / PR：起 PostgreSQL 服务跑全量测试，再试打包（不发布；发布见 publish.yml，推 v* 标签触发）
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:                      # 任务队列与监控面板都在 PostgreSQL，测试要连真实库
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: pl
+          POSTGRES_DB: paperlite
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --python 3.12 pytest -q -rs
+        env:
+          PAPERLITE_TEST_PG: postgresql://postgres:pl@127.0.0.1:5432/paperlite
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

@@ -3,7 +3,7 @@
 """
 paperlite/consumer.py
 ───────────────────────
-消费者：从 SQLite 任务库领任务、从 Redis 领身份，用 curl_cffi 带 cookie、经同一出口 IP 下载 PDF 或网页（url_type=html 存 .html）。
+消费者：从 PostgreSQL 任务队列领任务、从 Redis 领身份，用 curl_cffi 带 cookie、经同一出口 IP 下载 PDF 或网页（url_type=html 存 .html）。
 
 - 每个下载线程独占一个身份（IP+cookie），同一 IP 两次请求随机间隔 request_gap_s；
 - 线程只在有活可干（有 pending 任务）时登记心跳，生产者据此决定要多少身份；只剩别的线程的在途任务时
@@ -12,7 +12,7 @@ paperlite/consumer.py
   落地页正常 → 站点单独盯上了这条 URL，任务 challenge_count+1 排到后面，满 max_url_challenges 判 failed；
   （站点会成批盯上相邻论文，如 ACM 1005062.* 的 14 篇；只按"下一条也被挑战"判身份会把好身份接连误杀）
 - 连接被断（IP 掉线）/ IP 被站点封禁 / 寿命不足 min_left_s → 丢弃身份换下一个，任务放回且不计重试；
-- 连接被断（curl 56）先用同一身份重试一次（代理偶尔成批断连，见 README）；
+- 连接被断（curl 56）先用同一身份重试一次（代理偶尔成批断连，见 docs/development/architecture.md「IP 中途失效」）；
 - 超时、5xx 计一次重试，满 max_tries 判 failed；
 - 流式下载：先读够 1024 字节判文件头（%PDF- 前允许空白 / BOM，写盘时去掉），是 PDF 就边下边写 .part，
   超过 max_file_size_mb 中止，完成后原子改名；不是 PDF 只读前 256KB 用于判挑战和分类。
@@ -22,8 +22,7 @@ paperlite/consumer.py
   其他 4xx 判 failed；挑战、封禁、5xx、网络错误的处理与 PDF 任务相同；
   跳转由框架自己跟：curl 跟 HTTP 3xx 和中转页的 meta refresh（≤10s，最多 _MAX_REFRESH_HOPS 跳）；跳到别的主机后被挑战
   （身份的 cookie 只对本主机有效）就改用浏览器经同一出口打开该地址，让它自己跳转、过挑战，保存最终页面；
-  最终地址记入 final_url；
-  同一卷期接连 volume_stop_after 篇没有 PDF 就停掉该卷期其余任务（逻辑在 tasks.py）。
+  最终地址记入 final_url。
 """
 
 import asyncio
@@ -49,7 +48,8 @@ from paperlite.classify import classify_html, page_title
 from paperlite.config import Limits
 from paperlite.proxy import ProxySettings
 from paperlite.store import Identity, IdentityStore
-from paperlite.tasks import Status, Task, TaskDB, UrlType, pdf_path, url_host
+from paperlite.pgqueue import PgTaskSource
+from paperlite.tasks import Status, Task, UrlType, pdf_path, url_host
 
 logger = logging.getLogger(__name__)
 
@@ -164,8 +164,6 @@ class DownloadStats:
     non_pdf: int = 0
     failed: int = 0
     rejected: int = 0        # 身份被丢弃次数（cookie 被拒、IP 封禁）
-    volumes_stopped: int = 0 # 被停掉的卷期数
-    inferred: int = 0        # 因卷期停掉而没请求的任务数
     challenged: int = 0      # URL 带有效 cookie 仍被挑战的次数
     identities: int = 0      # 领用过的身份数
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -176,13 +174,12 @@ class DownloadStats:
 
 
 class Downloader:
-    def __init__(self, cfg: Limits, store: IdentityStore, proxy: ProxySettings, db: TaskDB,
+    def __init__(self, cfg: Limits, store: IdentityStore, proxy: ProxySettings, db: PgTaskSource,
                  out_dir: Path, workers: int) -> None:
         self.cfg, self.store, self.proxy, self.db = cfg, store, proxy, db
         self.host = db.host()
         if not self.host:
-            raise ValueError("任务库是空的，先 import")
-        db.volume_stop_after = cfg.volume_stop_after
+            raise ValueError("任务队列是空的，先 import")
         self.out = Path(out_dir)
         self.non_pdf_dir = self.out / "non_pdf"
         self.workers = workers
@@ -431,18 +428,11 @@ class Downloader:
                                    pdf_path(self.out, task.doi, ".html"), title, elapsed_ms())
         self.non_pdf_dir.mkdir(parents=True, exist_ok=True)
         (self.non_pdf_dir / (dest.stem + ".html")).write_bytes(got.body)
-        stopped = self.db.finish(task, Status.NON_PDF, http_status=code, file_size=got.size,
-                                 elapsed_ms=elapsed_ms(), exit_ip=ident.exit_ip, error_kind=kind,
-                                 title=title or None)
+        self.db.finish(task, Status.NON_PDF, http_status=code, file_size=got.size,
+                       elapsed_ms=elapsed_ms(), exit_ip=ident.exit_ip, error_kind=kind,
+                       title=title or None)
         self.stats.add("non_pdf")
         logger.info("non_pdf %s %s %s", kind, task.url, title)
-        if stopped:
-            volume, skipped = stopped
-            self.stats.add("volumes_stopped")
-            with self.stats.lock:
-                self.stats.inferred += skipped
-            logger.info("卷期 %s 已有 %d 篇没有 PDF，停掉其余 %d 篇（记 non_pdf / inferred，不再请求）",
-                        volume, self.cfg.volume_stop_after, skipped)
         return True, "other"
 
     def _fetch_page(self, url: str, ident: Identity, session, dest: Path) -> Fetched:

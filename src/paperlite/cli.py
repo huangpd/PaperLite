@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PaperLite 命令行。一份 config = 一个批次：各种主机的 URL 混着导进**一个任务库**，默认用**浏览器模式**统一跑。
-位置在 [paths] 里定义：db（任务库，本地盘）、storage（输出 PDF/HTML，可挂载），两者相互独立。
+PaperLite 命令行。一份 config = 一个批次：各种主机的 URL 混着导进 PostgreSQL 任务队列（[pg]），
+一台或多台机器共享，默认用**浏览器模式**统一跑。输出目录在 [paths].storage（可挂载）。
 
   paperlite init                                    # 在当前目录生成 config.toml 模板
   paperlite import   --urls mixed.csv               # 导入任务（txt 一行一个，或带 url 列的 CSV），多主机随便混
@@ -14,8 +14,7 @@ PaperLite 命令行。一份 config = 一个批次：各种主机的 URL 混着�
   paperlite export   --status non_pdf > non_pdf.csv
   paperlite turnstile --url <页面> --sitekey <key>  # 取 Turnstile token；--serve 8191 起 HTTP 服务
 
-位置：任务库 = --db > [paths].db；输出目录 = --storage > [paths].storage。
-db 必须本地盘（SQLite 要随机写/文件锁/mmap，FUSE 挂载不支持）；storage 可放 goofys/s3fs 等对象存储挂载。
+任务队列 = [pg]（dsn + batch）；输出目录 = --storage > [paths].storage，可放 goofys/s3fs 等对象存储挂载。
 
 配置查找顺序：--config > 环境变量 PAPERLITE_CONFIG > 当前目录的 config.toml（paperlite init 生成）。
 也可以 python -m paperlite ...。
@@ -27,7 +26,9 @@ import csv
 import dataclasses
 import json
 import logging
+import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -44,17 +45,18 @@ from paperlite.logutil import setup_logging
 from paperlite.producer import Producer
 from paperlite.proxy import IpSource, ProxySettings
 from paperlite.store import IdentityStore
-from paperlite.tasks import ERROR_KINDS, Status, TaskDB, UrlType
+from paperlite.pgqueue import PgTaskQueue, PgTaskSource
+from paperlite.tasks import ERROR_KINDS, Status, UrlType
 
 logger = logging.getLogger("paperlite")
 
 
 def _configured_run_args(args, run: RunConfig, config: str | None = None):
-    """把 [run] 转成与 ``paperlite run ...`` 相同的 argparse 参数（db/storage 仍从 [paths] 取）。"""
+    """把 [run] 转成与 ``paperlite run ...`` 相同的 argparse 参数（storage 仍从 [paths] 取）。"""
     return argparse.Namespace(
         cmd="run", config=config if config is not None else args.config,
         log_level=args.log_level, log_format=getattr(args, "log_format", "auto"),
-        db=None, storage=None,
+        storage=None,
         urls=run.urls or None, type=run.url_type, workers=run.workers,
         curl=run.mode == "curl", browser=run.mode == "browser",
         no_proxy=not run.proxy, headed=run.headed,
@@ -71,7 +73,7 @@ def _load(path: str | None) -> tuple[Limits, ProxySettings]:
 
 
 def _limits(args) -> Limits:
-    """只读 [limits]；没有配置文件时用默认值（import / status / retry / export 不必有代理配置）。"""
+    """只读 [limits]；没有 [limits] 段时用默认值（import / status / retry / export 不必有代理配置）。"""
     try:
         return config_mod.load_limits(config_mod.resolve_path(args.config))
     except FileNotFoundError:
@@ -81,7 +83,7 @@ def _limits(args) -> Limits:
 
 
 def _paths(args) -> Paths:
-    """[paths]：db / storage / log_dir；没有配置文件时用默认值。"""
+    """[paths]：storage / log_dir；没有配置文件时用默认值。"""
     try:
         return config_mod.load_paths(config_mod.resolve_path(args.config))
     except FileNotFoundError:
@@ -90,20 +92,25 @@ def _paths(args) -> Paths:
         raise SystemExit(f"配置错误: {e}")
 
 
-def _db_file(args, paths: Paths) -> Path:
-    return Path(args.db).expanduser() if getattr(args, "db", None) else paths.db_path
-
-
 def _storage_dir(args, paths: Paths) -> Path:
     return Path(args.storage).expanduser() if getattr(args, "storage", None) else paths.storage_path
 
 
-def _open_db(args, create: bool = False) -> TaskDB:
-    """打开任务库（位置：--db > [paths].db）。create=False 且文件不存在就报错。"""
-    db = _db_file(args, _paths(args))
-    if not create and not db.exists():
-        raise SystemExit(f"任务库不存在: {db}（先 import，或用 --db 指定）")
-    return TaskDB(db)
+def _open_db(args) -> PgTaskSource:
+    """打开任务队列：[pg] 段的 PostgreSQL（dsn + batch）。"""
+    try:
+        pc = config_mod.load_pg(config_mod.resolve_path(args.config))
+    except FileNotFoundError as e:
+        raise SystemExit(str(e))
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"配置错误: {e}")
+    try:
+        q = PgTaskQueue(pc.dsn, pc.batch, schema=pc.schema or None,
+                        worker=f"{socket.gethostname()}-{os.getpid()}")
+    except Exception as e:
+        raise SystemExit(f"连接 PostgreSQL 失败: {e}")
+    return PgTaskSource(q, chunk_size=pc.chunk_size, lease_s=pc.lease_s, flush_n=pc.flush_n,
+                        flush_s=pc.flush_s, retry_delay_s=pc.retry_delay_s)
 
 
 def _require_geoip(cfg) -> None:
@@ -176,7 +183,7 @@ def _read_csv_clustered(path: str):
         con.close()
 
 
-def _import(db: TaskDB, path: str, source: str = "", batch: str = "", url_type: str = UrlType.PDF) -> None:
+def _import(db: PgTaskSource, path: str, source: str = "", batch: str = "", url_type: str = UrlType.PDF) -> None:
     """url_type 是整批的默认类型；CSV 里的 url_type 列逐行覆盖。"""
     rows = ({**r, "source": r.get("source") or source, "batch_no": r.get("batch_no") or batch,
              "url_type": (r.get("url_type") or "").strip() or url_type}
@@ -210,7 +217,7 @@ class _ProducerThread:
 
 
 def _download(args, cfg, proxy, store, with_producer: bool) -> None:
-    db = _open_db(args, create=True)
+    db = _open_db(args)
     if args.urls:
         _import(db, args.urls, url_type=args.type)
     hs = db.hosts()
@@ -220,20 +227,16 @@ def _download(args, cfg, proxy, store, with_producer: bool) -> None:
                          f"混多主机请去掉 --curl 用浏览器模式")
     out = _storage_dir(args, _paths(args))
     try:
-        reclaimed = db.lock_for_download()
-    except RuntimeError as e:
-        raise SystemExit(str(e))
-    if reclaimed:
-        logger.info("上次中断残留的 %d 个 running 任务已放回 pending", reclaimed)
-    try:
         dl = Downloader(cfg, store, proxy, db, out, args.workers)
     except ValueError as e:
+        db.close()
         raise SystemExit(str(e))
     c = db.counts()
-    logger.info("输出目录 %s，任务库 %s", out, db.path)
+    logger.info("输出目录 %s，任务队列 %s", out, db.path)
     logger.info("%s：待下载 %d，已成功 %d，non_pdf %d，失败 %d；下载线程 %d", dl.host, c[Status.PENDING],
                 c[Status.SUCCESS], c[Status.NON_PDF], c[Status.FAILED], args.workers)
     if not c[Status.PENDING]:
+        db.close()
         return
     producer = _ProducerThread(cfg, store, proxy, dl.host) if with_producer else None
     stop = threading.Event()
@@ -243,7 +246,7 @@ def _download(args, cfg, proxy, store, with_producer: bool) -> None:
     try:
         dl.run(stop)
     except KeyboardInterrupt:
-        logger.info("中断：在途任务已放回 pending，可重跑继续")
+        logger.info("中断：结果已写回，没做完的块已交还，可重跑继续")
     finally:
         stop.set()
         if producer is not None:
@@ -253,8 +256,8 @@ def _download(args, cfg, proxy, store, with_producer: bool) -> None:
         db.close()
     s = dl.stats
     logger.info("结束: 用时 %.1f 分钟，success %d，non_pdf %d，failed %d，用身份 %d 个，丢弃身份 %d 次，"
-                "URL 被单独挑战 %d 次，停掉卷期 %d 个（%d 篇未请求）", (time.monotonic() - t0) / 60, s.success,
-                s.non_pdf, s.failed, s.identities, s.rejected, s.challenged, s.volumes_stopped, s.inferred)
+                "URL 被单独挑战 %d 次", (time.monotonic() - t0) / 60, s.success,
+                s.non_pdf, s.failed, s.identities, s.rejected, s.challenged)
 
 
 def _attach_monitor(args, snapshot):
@@ -267,8 +270,8 @@ def _attach_monitor(args, snapshot):
         raise SystemExit(f"配置错误: {e}")
 
 
-def _snapshot(mode: str, db: TaskDB, stats, online: int, workers: int) -> dict:
-    """心跳内容：在线浏览器数 + 任务库计数（监控面板「实时任务」）。"""
+def _snapshot(mode: str, db: PgTaskSource, stats, online: int, workers: int) -> dict:
+    """心跳内容：在线浏览器数 + 任务队列计数（监控面板「实时任务」）。"""
     c = db.counts()
     return {"mode": mode, "browsers_online": online, "workers": workers, "pending": c[Status.PENDING],
             "running": c[Status.RUNNING], "success": c[Status.SUCCESS], "failed": c[Status.FAILED]}
@@ -294,19 +297,22 @@ def _report(dl: Downloader, store: IdentityStore, cfg: Limits, stop: threading.E
 
 def _status(args, cfg) -> None:
     db = _open_db(args)
+    q = db.q
     host = db.host()
-    c = db.counts()
-    print(f"任务库 {db.path}（{host or '空'}）: 共 {sum(c.values())}  " +
+    c = db.counts()                                 # pending 不含巡检跳过的
+    sk = q.skip_counts()
+    print(f"任务队列 {db.path}（{host or '空'}）: 共 {sum(c.values()) + sum(sk.values())}  " +
           "  ".join(f"{s} {c[s]}" for s in Status.ALL))
     types = db.type_counts()
     if len(types) > 1 or UrlType.PDF not in types:
         for t, tc in sorted(types.items()):
             print(f"  [{t}] 共 {sum(tc.values())}  " + "  ".join(f"{s} {tc[s]}" for s in Status.ALL if tc[s]))
-    for status, kind, n, inferred in db.kind_counts():
-        print(f"  {status:8s} {kind or '-':16s} {n}" + (f"（其中按卷期推断 {inferred}）" if inferred else ""))
-    v, n = db.volume_summary()
-    if v:
-        print(f"  按卷期停掉 {v} 个卷期，{n} 篇未请求（retry --stopped-volumes 可重新核实）")
+    ch = q.stats().chunks
+    print("  块: " + "  ".join(f"{k} {ch.get(k, 0)}" for k in ("queued", "leased", "done")))
+    if sk:
+        print(f"  巡检跳过（仍 pending、不再领取）: {sk.get('title_dup', 0)}（inspect --reset 可放回）")
+    for status, kind, n in db.kind_counts():
+        print(f"  {status:8s} {kind or '-':16s} {n}")
     db.close()
     if not host:
         return
@@ -326,16 +332,20 @@ def _status(args, cfg) -> None:
 
 def _export(args) -> None:
     db = _open_db(args)
-    rows = db.rows(args.status)
     out = open(args.file, "w", newline="", encoding="utf-8") if args.file != "-" else sys.stdout
-    w = csv.writer(out)
-    if rows:
-        w.writerow(rows[0].keys())
-    w.writerows(tuple(r) for r in rows)
+    n = 0
+    try:
+        w = csv.writer(out)
+        w.writerow(db.q.EXPORT_COLUMNS)
+        for r in db.q.rows(args.status):
+            w.writerow(r)
+            n += 1
+    finally:
+        if out is not sys.stdout:
+            out.close()
+        db.close()
     if out is not sys.stdout:
-        out.close()
-        print(f"导出 {len(rows)} 行到 {args.file}")
-    db.close()
+        print(f"导出 {n} 行到 {args.file}")
 
 
 def _turnstile(args, parser) -> None:
@@ -366,23 +376,17 @@ def _turnstile(args, parser) -> None:
 
 def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
     """浏览器下载模式：每个浏览器+IP 过盾一次后连续下同域名多篇（整页存 .html）。不用 Redis 身份池。"""
-    db = _open_db(args, create=True)
+    db = _open_db(args)
     if args.urls:
         _import(db, args.urls, url_type=args.type)
     out = _storage_dir(args, _paths(args))
-    try:
-        reclaimed = db.lock_for_download()
-    except RuntimeError as e:
-        raise SystemExit(str(e))
-    if reclaimed:
-        logger.info("上次中断残留的 %d 个 running 任务已放回 pending", reclaimed)
     try:
         pool = BrowserPool(cfg, proxy, db, out, args.workers, no_proxy=no_proxy)
     except ValueError as e:
         db.close()
         raise SystemExit(str(e))
     c = db.counts()
-    logger.info("输出目录 %s，任务库 %s", out, db.path)
+    logger.info("输出目录 %s，任务队列 %s", out, db.path)
     logger.info("%s：待下载 %d，已成功 %d，失败 %d；浏览器 %d", pool.host, c[Status.PENDING],
                 c[Status.SUCCESS], c[Status.FAILED], pool.workers)
     if not c[Status.PENDING]:
@@ -395,7 +399,7 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
     try:
         pool.run(stop)
     except KeyboardInterrupt:
-        logger.info("中断：在途任务重跑时会放回 pending，可继续")
+        logger.info("中断：结果已写回，没做完的块已交还，可重跑继续")
     finally:
         stop.set()
         if monitor is not None:
@@ -407,28 +411,32 @@ def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
 
 
 def _inspect(args) -> None:
-    """巡检：同标题重复到阈值就归纳 doi/url 规则、标记疑似封面的未采任务。"""
+    """巡检（全批次）：同标题重复到阈值就归纳 doi/url 规则，命中的未采任务记跳过、不再领取。
+    下载时浏览器模式另有块内实时巡检（PgTaskSource），规则同样记入 pl_skip_rules。"""
     cfg = _limits(args)
     db = _open_db(args)
+    q = db.q
     try:
         if args.reset:
-            print(f"已清除 {db.clear_suspects()} 条 suspect_cover 标记与全部规则，放回可采")
+            print(f"已放回 {q.clear_skips('title_dup')} 个巡检跳过的任务，清除全部规则")
             return
         if args.list:
-            rules = db.skip_rules()
+            rules = q.skip_rules()
             if not rules:
                 print("还没有生效的规则")
             for r in rules:
                 print(f"  doi~{r['doi_prefix']!r} url~{r['url_prefix']!r} | 标题 {(r['title'] or '')[:40]!r} | "
-                      f"precision {r['precision']} 已采命中 {r['support']} 标记 {r['flagged']} | {r['created_at']}")
+                      f"precision {r['precision']} 已采命中 {r['support']} 跳过 {r['flagged']} | "
+                      f"{'全批次' if r['scope'] == 'batch' else '下载时块内'} {r['created_at']:%Y-%m-%d %H:%M}")
+            print(f"巡检跳过（仍 pending、不再领取）: {q.skip_counts().get('title_dup', 0)}")
             return
         trigger = args.trigger if args.trigger is not None else cfg.title_dup_trigger
         mp = args.min_precision if args.min_precision is not None else cfg.rule_min_precision
         ms = args.min_support if args.min_support is not None else cfg.rule_min_support
         from paperlite import inspect as inspect_mod
-        rules, flagged = inspect_mod.inspect(db, trigger, mp, ms)
-        print(f"巡检完成：本次生效规则 {rules} 条，新标记疑似封面 {flagged} 条；"
-              f"累计规则 {len(db.skip_rules())} 条、疑似封面 {db.suspect_count()} 条")
+        rules, flagged = inspect_mod.inspect(q, trigger, mp, ms)
+        print(f"巡检完成：本次生效规则 {rules} 条，新跳过 {flagged} 条；"
+              f"累计规则 {len(q.skip_rules())} 条、跳过 {q.skip_counts().get('title_dup', 0)} 条")
     finally:
         db.close()
 
@@ -457,7 +465,7 @@ _COMMANDS = {
     "run": "下载，下载完退出。默认浏览器模式（各种主机混着跑、跟跳转）；--curl 走单主机 cookie 池",
     "produce": "只生产身份（curl 模式），常驻",
     "download": "只下载（curl 模式），需有生产者在跑",
-    "status": "任务统计、失败分类（curl 模式下含身份池）",
+    "status": "任务统计、失败分类、块统计（curl 模式下含身份池）",
     "inspect": "巡检：同标题重复到阈值就归纳 doi/url 规则，标记疑似失效/封面的未采任务（不再采）",
     "retry": "把 failed / non_pdf 的任务重置为 pending",
     "export": "导出任务为 CSV",
@@ -465,12 +473,12 @@ _COMMANDS = {
     "help": "显示某个命令的帮助",
 }
 
-_DESCRIPTION = "大批量下载 PDF/网页（过 Cloudflare）：各种主机混进一个库，默认浏览器模式统一跑\n\n命令:\n" + \
+_DESCRIPTION = "大批量下载 PDF/网页（过 Cloudflare）：各种主机混进一个 PostgreSQL 任务队列，一台或多台机器共享，默认浏览器模式统一跑\n\n命令:\n" + \
     "\n".join(f"  {k:<10}{v}" for k, v in _COMMANDS.items())
 
 _EPILOG = """示例:
-  paperlite init                         # 生成 config.toml，填好 [proxy] 和 [paths]
-  paperlite import --urls mixed.csv      # 导入（多主机随便混）到 [paths].db
+  paperlite init                         # 生成 config.toml，填好 [pg]、[proxy] 和 [paths]
+  paperlite import --urls mixed.csv      # 导入（多主机随便混）到 [pg] 的批次
   paperlite run config.toml              # 按 [run] 启动（默认浏览器模式），Ctrl+C 随时停，再执行从断点继续
   paperlite run --workers 20             # 命令行临时跑（默认浏览器；--curl 走单主机 cookie 池）
   paperlite status
@@ -520,21 +528,15 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
                                     description=_COMMANDS[name])
         return parsers[name]
 
-    def site_args(p):
-        p.add_argument("--db", help="任务库文件（覆盖 [paths].db）；必须本地盘")
-
     p = cmd("init")
     p.add_argument("--force", action="store_true", help="已存在也覆盖")
     p = cmd("import")
     p.add_argument("--urls", required=True, help="txt 一行一个链接，或带 url 列的 CSV；多主机可混")
-    site_args(p)
     p.add_argument("--source", default="", help="写入 source")
     p.add_argument("--batch", default="", help="写入 batch_no")
     p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="链接类型：pdf = 要 PDF 文件（默认）；html = 要网页本身，整页存为 .html。CSV 的 url_type 列逐行覆盖")
     p = cmd("produce")
-    site_args(p)
     p = cmd("download")
-    site_args(p)
     p.add_argument("--storage", help="输出目录 PDF/HTML（覆盖 [paths].storage）；可挂载")
     p.add_argument("--urls", help="先导入这个文件（可选）")
     p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
@@ -542,7 +544,6 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p = cmd("run")
     p.add_argument("config_file", nargs="?", metavar="[配置文件]",
                    help="给了就按它的 [run] 段启动（paperlite run config.toml），其余 run 参数忽略；省略则用下面的参数临时跑")
-    site_args(p)
     p.add_argument("--storage", help="输出目录 PDF/HTML（覆盖 [paths].storage）；可挂载")
     p.add_argument("--urls", help="先导入这个文件（可选）")
     p.add_argument("--type", choices=UrlType.ALL, default=UrlType.PDF, help="--urls 的链接类型，同 import --type")
@@ -554,24 +555,17 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     p.add_argument("--no-proxy", action="store_true", help="仅浏览器模式：直连本机 IP、不取代理（本地测试，无需代理配置）")
     p.add_argument("--headed", action="store_true", help="仅浏览器模式：有界面运行（调试）")
     p = cmd("status")
-    site_args(p)
     p = cmd("inspect")
-    site_args(p)
     p.add_argument("--trigger", type=int, help="同标题重复多少篇触发（覆盖配置 title_dup_trigger）")
     p.add_argument("--min-precision", type=float, help="规则最低精确率（覆盖配置 rule_min_precision）")
     p.add_argument("--min-support", type=int, help="规则最低命中数（覆盖配置 rule_min_support）")
     p.add_argument("--list", action="store_true", help="只列出已生效的规则，不重新巡检")
-    p.add_argument("--reset", action="store_true", help="清除所有 suspect_cover 标记与规则（放回可采）")
+    p.add_argument("--reset", action="store_true", help="清除全部规则，放回所有巡检跳过的任务")
     p = cmd("retry")
-    site_args(p)
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--status", choices=[Status.FAILED, Status.NON_PDF], help="重置该状态的任务")
-    g.add_argument("--stopped-volumes", action="store_true",
-                   help="重新核实按卷期停掉的：这些卷期的 non_pdf（样本 + 推断）全部放回 pending")
+    p.add_argument("--status", required=True, choices=[Status.FAILED, Status.NON_PDF], help="重置该状态的任务")
     p.add_argument("--kind", choices=ERROR_KINDS, help="配合 --status，只重置该 error_kind")
     p = cmd("export")
-    site_args(p)
-    p.add_argument("--status", choices=Status.ALL, help="只导出该状态")
+    p.add_argument("--status", choices=Status.FINAL + (Status.PENDING,), help="只导出该状态")
     p.add_argument("--file", default="-", help="输出文件，默认标准输出")
     p = cmd("turnstile")
     p.add_argument("--url", help="目标页 URL（token 绑定其 hostname）")
@@ -635,22 +629,24 @@ def main() -> None:
             config_mod.write_example(path, args.force)
         except FileExistsError as e:
             sys.exit(str(e))
-        logger.info("已生成 %s：填好 [proxy] 的接口和代理账号密码、[paths] 的 db/storage 再用", path.resolve())
+        logger.info("已生成 %s：填好 [pg] 的 dsn/batch、[proxy] 的接口和代理账号密码、[paths] 的 storage 再用", path.resolve())
         return
     if args.cmd == "import":
-        db = _open_db(args, create=True)
-        _import(db, args.urls, args.source, args.batch, args.type)
-        logger.info("任务库 %s", db.path)
-        db.close()
+        db = _open_db(args)
+        try:
+            _import(db, args.urls, args.source, args.batch, args.type)
+            logger.info("任务队列 %s", db.path)
+        finally:
+            db.close()
         return
     if args.cmd == "retry":
         db = _open_db(args)
-        if args.stopped_volumes:
-            v, n = db.reset_stopped_volumes()
-            print(f"已重置 {v} 个被停卷期的 {n} 个任务为 pending")
-        else:
-            print(f"已重置 {db.reset(args.status, args.kind)} 个任务为 pending")
-        db.close()
+        try:
+            n = db.q.reset(args.status, args.kind)
+            db.q.requeue_leftovers(db.chunk_size)
+        finally:
+            db.close()
+        print(f"已重置 {n} 个任务为 pending（重新切块，下载机会接着领）")
         return
     if args.cmd == "export":
         _export(args)
@@ -687,7 +683,7 @@ def main() -> None:
         host = db.host()
         db.close()
         if not host:
-            raise SystemExit("任务库是空的，先 import")
+            raise SystemExit("任务队列是空的，先 import")
         producer = _ProducerThread(cfg, store, proxy, host)
         try:
             while not producer.finished.wait(1):

@@ -1,5 +1,5 @@
 """
-面板端存储（SQLite）。两层：
+面板端存储（PostgreSQL，默认 schema paperlite_monitor，与任务表分开）。两层：
 
   原始事件表  page / browser / proxy_check / log      只留 raw_retention_hours（默认 48h），给实时事件流、
                                                        近 5 分钟域名频率、明细排查用
@@ -14,12 +14,14 @@
 import bisect
 import json
 import math
-import sqlite3
 import threading
 import time
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, Iterable, Optional
+
+import psycopg
+from psycopg import sql as pgsql
+from psycopg.rows import dict_row
 
 from paperlite.monitor import schema
 
@@ -35,43 +37,43 @@ _EDGES = [50.0 * 1.12 ** i for i in range(int(math.log(600_000 / 50) / math.log(
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS proxy_check (
-  ts REAL NOT NULL, inst TEXT, node TEXT, batch TEXT, vendor TEXT,
-  ok INTEGER, total_ms REAL, reason TEXT);
+  ts double precision NOT NULL, inst text, node text, batch text, vendor text,
+  ok integer, total_ms double precision, reason text);
 CREATE INDEX IF NOT EXISTS ix_proxy_ts ON proxy_check(ts);
 CREATE TABLE IF NOT EXISTS browser (
-  ts REAL NOT NULL, inst TEXT, node TEXT, batch TEXT, vendor TEXT,
-  ok INTEGER, kind TEXT, host TEXT, waf TEXT, seconds REAL, error TEXT);
+  ts double precision NOT NULL, inst text, node text, batch text, vendor text,
+  ok integer, kind text, host text, waf text, seconds double precision, error text);
 CREATE INDEX IF NOT EXISTS ix_browser_ts ON browser(ts);
 CREATE TABLE IF NOT EXISTS page (
-  ts REAL NOT NULL, inst TEXT, node TEXT, batch TEXT, vendor TEXT,
-  host TEXT, passed INTEGER, ok INTEGER, status INTEGER, waf TEXT, elapsed_ms INTEGER, error TEXT);
+  ts double precision NOT NULL, inst text, node text, batch text, vendor text,
+  host text, passed integer, ok integer, status integer, waf text, elapsed_ms integer, error text);
 CREATE INDEX IF NOT EXISTS ix_page_ts ON page(ts);
 CREATE TABLE IF NOT EXISTS log (
-  ts REAL NOT NULL, inst TEXT, node TEXT, batch TEXT, vendor TEXT,
-  level TEXT, event TEXT, message TEXT);
+  ts double precision NOT NULL, inst text, node text, batch text, vendor text,
+  level text, event text, message text);
 CREATE INDEX IF NOT EXISTS ix_log_ts ON log(ts);
 
 CREATE TABLE IF NOT EXISTS instance (
-  inst TEXT PRIMARY KEY, node TEXT, batch TEXT, vendor TEXT, last_seen REAL,
-  mode TEXT, browsers_online INTEGER, workers INTEGER,
-  pending INTEGER, running INTEGER, success INTEGER, failed INTEGER);
+  inst text PRIMARY KEY, node text, batch text, vendor text, last_seen double precision,
+  mode text, browsers_online integer, workers integer,
+  pending integer, running integer, success integer, failed integer);
 
 CREATE TABLE IF NOT EXISTS page_h (
-  hour INTEGER, vendor TEXT, host TEXT, waf TEXT,
-  n INTEGER, passed INTEGER, ok INTEGER, ms_sum REAL, hist TEXT,      -- 耗时只计 passed
+  hour integer, vendor text, host text, waf text,
+  n integer, passed integer, ok integer, ms_sum double precision, hist text,   -- 耗时只计 passed
   PRIMARY KEY (hour, vendor, host, waf));
 CREATE TABLE IF NOT EXISTS browser_h (
-  hour INTEGER, vendor TEXT, host TEXT, waf TEXT, kind TEXT,
-  n INTEGER, ok INTEGER, s_sum REAL,                                  -- s_sum 只计 ok
+  hour integer, vendor text, host text, waf text, kind text,
+  n integer, ok integer, s_sum double precision,                             -- s_sum 只计 ok
   PRIMARY KEY (hour, vendor, host, waf, kind));
 CREATE TABLE IF NOT EXISTS proxy_h (
-  hour INTEGER, vendor TEXT, n INTEGER, ok INTEGER, ms_sum REAL,      -- ms_sum 只计 ok
+  hour integer, vendor text, n integer, ok integer, ms_sum double precision, -- ms_sum 只计 ok
   PRIMARY KEY (hour, vendor));
 CREATE TABLE IF NOT EXISTS proxy_reason_h (
-  hour INTEGER, vendor TEXT, reason TEXT, n INTEGER,
+  hour integer, vendor text, reason text, n integer,
   PRIMARY KEY (hour, vendor, reason));
 CREATE TABLE IF NOT EXISTS fleet_h (
-  hour INTEGER, inst TEXT, n INTEGER, online_sum REAL,                -- 该终端该小时心跳的在线浏览器数之和
+  hour integer, inst text, n integer, online_sum double precision,           -- 该终端该小时心跳的在线浏览器数之和
   PRIMARY KEY (hour, inst));
 """
 
@@ -84,66 +86,68 @@ _EVENT_COLUMNS = {
 _HB_COLUMNS = ("mode", "browsers_online", "workers", "pending", "running", "success", "failed")
 
 
+def _insert_sql(t: str) -> str:
+    """原始事件 / 心跳的 INSERT（psycopg 占位符）。心跳按终端 upsert：乱序到达的旧心跳不覆盖新的。"""
+    if t == schema.HEARTBEAT:
+        return ("INSERT INTO instance (inst, node, batch, vendor, last_seen, " + ", ".join(_HB_COLUMNS) + ") "
+                "VALUES (" + ", ".join(["%s"] * (5 + len(_HB_COLUMNS))) + ") "
+                "ON CONFLICT(inst) DO UPDATE SET node=excluded.node, batch=excluded.batch, "
+                "vendor=excluded.vendor, last_seen=GREATEST(instance.last_seen, excluded.last_seen), "
+                + ", ".join(f"{c}=CASE WHEN excluded.last_seen >= instance.last_seen THEN excluded.{c} "
+                            f"ELSE instance.{c} END" for c in _HB_COLUMNS))
+    cols = _EVENT_COLUMNS[t]
+    return (f"INSERT INTO {t} (ts, inst, node, batch, vendor, {', '.join(cols)}) "
+            f"VALUES ({', '.join(['%s'] * (5 + len(cols)))})")
+
+
 class MonitorDB:
-    def __init__(self, path: Path, retention_days: int = 30, raw_retention_hours: int = 48) -> None:
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    """一个面板进程一条连接（加锁）：写入只有消费线程，查询来自几个浏览器，量都很小。"""
+
+    def __init__(self, dsn: str, schema: str = "paperlite_monitor", retention_days: int = 30,
+                 raw_retention_hours: int = 48) -> None:
         self.retention_s = retention_days * 86400
         self.raw_retention_s = raw_retention_hours * HOUR
         self._lock = threading.Lock()
-        self.conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        with self._lock:
-            self.conn.executescript(_DDL)
-            self.conn.commit()
+        self.conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
+        with self._lock, self.conn.transaction():
+            self.conn.execute("SELECT pg_advisory_xact_lock(hashtext('paperlite.monitor.schema'))")
+            self.conn.execute(pgsql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(pgsql.Identifier(schema)))
+            self.conn.execute(pgsql.SQL("SET search_path TO {}").format(pgsql.Identifier(schema)))
+            self.conn.execute(_DDL)
         self._pruned_at = 0.0
         self._cache: dict[str, tuple[float, dict]] = {}
 
     def close(self) -> None:
         self.conn.close()
 
+    def execute(self, query: str, params: Iterable = ()):
+        """查询里用 ? 作占位符（与写法统一），这里换成 psycopg 的 %s。调用方持锁。"""
+        return self.conn.execute(query.replace("?", "%s"), tuple(params))
+
     # ── 写入 ────────────────────────────────────────────────────────────
-    def ingest(self, msgs: Iterable[dict[str, Any]], commit: bool = True) -> int:
-        """写原始事件 + 合并进小时汇总。可多次调用后再 commit()（消费端按批提交）。"""
+    def ingest(self, msgs: Iterable[dict[str, Any]]) -> int:
+        """写原始事件 + 合并进小时汇总，整批一个事务（消费端提交成功后才 ack）。
+        原始事件按表攒起来 executemany（psycopg 走 pipeline，几千条一次往返），不逐条 INSERT。"""
         acc = _Acc()
+        raw: dict[str, list[tuple]] = defaultdict(list)
         n = 0
-        with self._lock:
-            for m in msgs:
-                self._raw(m)
-                acc.add(m)
-                n += 1
-            acc.flush(self.conn)
-            if commit:
-                self.conn.commit()
+        for m in msgs:
+            t, d = m["type"], m["data"]
+            if t == schema.HEARTBEAT:
+                raw[t].append((m.get("inst"), m.get("node"), m.get("batch"), m.get("vendor"), float(m["ts"]),
+                               *(d.get(c) for c in _HB_COLUMNS)))
+            else:
+                raw[t].append((float(m["ts"]), m.get("inst"), m.get("node"), m.get("batch"), m.get("vendor"),
+                               *(_sql(d.get(c)) for c in _EVENT_COLUMNS[t])))
+            acc.add(m)
+            n += 1
+        with self._lock, self.conn.transaction(), self.conn.cursor() as cur:
+            for t, rows in raw.items():
+                cur.executemany(_insert_sql(t), rows)
+            acc.flush(self.execute)
         if n:
             self._cache.clear()
         return n
-
-    def commit(self) -> None:
-        with self._lock:
-            self.conn.commit()
-
-    def _raw(self, m: dict[str, Any]) -> None:
-        t, d = m["type"], m["data"]
-        if t == schema.HEARTBEAT:
-            self.conn.execute(
-                "INSERT INTO instance (inst, node, batch, vendor, last_seen, " + ", ".join(_HB_COLUMNS) + ") "
-                "VALUES (?, ?, ?, ?, ?, " + ", ".join("?" * len(_HB_COLUMNS)) + ") "
-                "ON CONFLICT(inst) DO UPDATE SET node=excluded.node, batch=excluded.batch, "
-                "vendor=excluded.vendor, last_seen=MAX(instance.last_seen, excluded.last_seen), "
-                + ", ".join(f"{c}=CASE WHEN excluded.last_seen >= instance.last_seen THEN excluded.{c} "
-                            f"ELSE instance.{c} END" for c in _HB_COLUMNS),
-                (m.get("inst"), m.get("node"), m.get("batch"), m.get("vendor"), float(m["ts"]),
-                 *(d.get(c) for c in _HB_COLUMNS)))
-            return
-        cols = _EVENT_COLUMNS[t]
-        self.conn.execute(
-            f"INSERT INTO {t} (ts, inst, node, batch, vendor, {', '.join(cols)}) "
-            f"VALUES ({', '.join('?' * (5 + len(cols)))})",
-            (float(m["ts"]), m.get("inst"), m.get("node"), m.get("batch"), m.get("vendor"),
-             *(_sql(d.get(c)) for c in cols)))
 
     def prune(self, now: Optional[float] = None, force: bool = False) -> int:
         """原始事件留 raw_retention，汇总与终端留 retention（至多每小时做一次）。"""
@@ -154,13 +158,12 @@ class MonitorDB:
         raw_cut, cut = now - self.raw_retention_s, now - self.retention_s
         hour_cut = int(cut // HOUR)
         n = 0
-        with self._lock:
+        with self._lock, self.conn.transaction():
             for t in _EVENT_COLUMNS:
-                n += self.conn.execute(f"DELETE FROM {t} WHERE ts < ?", (raw_cut,)).rowcount
+                n += self.execute(f"DELETE FROM {t} WHERE ts < ?", (raw_cut,)).rowcount
             for t in ("page_h", "browser_h", "proxy_h", "proxy_reason_h", "fleet_h"):
-                n += self.conn.execute(f"DELETE FROM {t} WHERE hour < ?", (hour_cut,)).rowcount
-            n += self.conn.execute("DELETE FROM instance WHERE last_seen < ?", (cut,)).rowcount
-            self.conn.commit()
+                n += self.execute(f"DELETE FROM {t} WHERE hour < ?", (hour_cut,)).rowcount
+            n += self.execute("DELETE FROM instance WHERE last_seen < ?", (cut,)).rowcount
         self._cache.clear()
         return n
 
@@ -178,7 +181,7 @@ class MonitorDB:
         h0 = h1 - WINDOWS[window] // HOUR               # 含
         p0 = h0 - (h1 - h0)                             # 上一个同长时间窗，用于环比
         with self._lock:
-            q = self.conn.execute
+            q = self.execute
             rows = self._page_rows(q, h0, h1)          # page_h 只读一遍、直方图只解一次，下面几块共用
             out = {
                 "window": window, "now": now, "since": h0 * HOUR,
@@ -288,7 +291,7 @@ class MonitorDB:
         name = site_of if group else (lambda h: h)
 
         with self._lock:
-            ex = self.conn.execute
+            ex = self.execute
             rows = ex("SELECT host, waf, SUM(n) n, SUM(passed) passed, SUM(ok) ok, SUM(ms_sum) ms FROM page_h "
                       "WHERE hour >= ? AND hour < ? GROUP BY host, waf", (h0, h1)).fetchall()
             freq = ex("SELECT host, COUNT(*) n FROM page WHERE ts >= ? GROUP BY host", (now - 300,)).fetchall()
@@ -425,15 +428,15 @@ class MonitorDB:
                  (now - 300,)).fetchall()
         events = q(
             "SELECT * FROM ("
-            " SELECT ts, inst, 'page' type, (CASE WHEN ok THEN 'info' ELSE 'warn' END) level,"
-            "   host || ' ' || COALESCE(status, '-') || ' ' || waf || ' ' || elapsed_ms || 'ms'"
-            "   || CASE WHEN error != '' THEN ' ' || error ELSE '' END msg FROM page WHERE ts >= ?"
-            " UNION ALL SELECT ts, inst, 'browser', (CASE WHEN ok THEN 'info' ELSE 'warn' END),"
-            "   '浏览器' || CASE WHEN ok THEN '就绪 ' ELSE '失败(' || kind || ') ' END || host || ' ' || waf"
-            "   || ' ' || round(seconds, 1) || 's' || CASE WHEN error != '' THEN ' ' || error ELSE '' END"
+            " SELECT ts, inst, 'page' AS type, (CASE WHEN ok <> 0 THEN 'info' ELSE 'warn' END) AS level,"
+            "   host || ' ' || COALESCE(status::text, '-') || ' ' || waf || ' ' || elapsed_ms || 'ms'"
+            "   || CASE WHEN error != '' THEN ' ' || error ELSE '' END AS msg FROM page WHERE ts >= ?"
+            " UNION ALL SELECT ts, inst, 'browser', (CASE WHEN ok <> 0 THEN 'info' ELSE 'warn' END),"
+            "   '浏览器' || CASE WHEN ok <> 0 THEN '就绪 ' ELSE '失败(' || kind || ') ' END || host || ' ' || waf"
+            "   || ' ' || round(seconds::numeric, 1) || 's' || CASE WHEN error != '' THEN ' ' || error ELSE '' END"
             "   FROM browser WHERE ts >= ?"
             " UNION ALL SELECT ts, inst, 'log', lower(level), message FROM log WHERE ts >= ?"
-            ") ORDER BY ts DESC LIMIT 60", (now - HOUR,) * 3).fetchall()
+            ") e ORDER BY ts DESC LIMIT 60", (now - HOUR,) * 3).fetchall()
         return {"pending": sum(i["pending"] or 0 for i in live), "running": sum(i["running"] or 0 for i in live),
                 "online_instances": len(live), "instances": instances,
                 "domain_freq": [{"host": x["host"], "per_min": round(x["n"] / 5, 1)} for x in freq],
@@ -476,29 +479,26 @@ class _Acc:
             a = self.fleet[(h, m.get("inst") or "")]
             a[0] += 1; a[1] += float(d.get("browsers_online") or 0)
 
-    def flush(self, conn: sqlite3.Connection) -> None:
+    def flush(self, ex) -> None:
+        """ex = MonitorDB.execute（? 占位）；调用方持锁、在事务里。"""
         for k, (n, passed, ok, ms, hist) in self.page.items():
-            old = conn.execute("SELECT hist FROM page_h WHERE hour=? AND vendor=? AND host=? AND waf=?", k).fetchone()
-            merged = _merge([old[0] if old else None, hist])
-            conn.execute(
-                "INSERT INTO page_h VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(hour, vendor, host, waf) DO UPDATE SET "
-                "n=n+excluded.n, passed=passed+excluded.passed, ok=ok+excluded.ok, ms_sum=ms_sum+excluded.ms_sum, "
-                "hist=excluded.hist", (*k, n, passed, ok, ms, _dump(merged)))
-        conn.executemany(
-            "INSERT INTO browser_h VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(hour, vendor, host, waf, kind) DO UPDATE SET "
-            "n=n+excluded.n, ok=ok+excluded.ok, s_sum=s_sum+excluded.s_sum",
-            [(*k, *a) for k, a in self.browser.items()])
-        conn.executemany(
-            "INSERT INTO proxy_h VALUES (?,?,?,?,?) ON CONFLICT(hour, vendor) DO UPDATE SET "
-            "n=n+excluded.n, ok=ok+excluded.ok, ms_sum=ms_sum+excluded.ms_sum",
-            [(*k, *a) for k, a in self.proxy.items()])
-        conn.executemany(
-            "INSERT INTO proxy_reason_h VALUES (?,?,?,?) ON CONFLICT(hour, vendor, reason) DO UPDATE SET n=n+excluded.n",
-            [(*k, n) for k, n in self.reason.items()])
-        conn.executemany(
-            "INSERT INTO fleet_h VALUES (?,?,?,?) ON CONFLICT(hour, inst) DO UPDATE SET "
-            "n=n+excluded.n, online_sum=online_sum+excluded.online_sum",
-            [(*k, *a) for k, a in self.fleet.items()])
+            old = ex("SELECT hist FROM page_h WHERE hour=? AND vendor=? AND host=? AND waf=?", k).fetchone()
+            merged = _merge([old["hist"] if old else None, hist])
+            ex("INSERT INTO page_h VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(hour, vendor, host, waf) DO UPDATE SET "
+               "n=page_h.n+excluded.n, passed=page_h.passed+excluded.passed, ok=page_h.ok+excluded.ok, "
+               "ms_sum=page_h.ms_sum+excluded.ms_sum, hist=excluded.hist", (*k, n, passed, ok, ms, _dump(merged)))
+        for k, a in self.browser.items():
+            ex("INSERT INTO browser_h VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(hour, vendor, host, waf, kind) DO UPDATE SET "
+               "n=browser_h.n+excluded.n, ok=browser_h.ok+excluded.ok, s_sum=browser_h.s_sum+excluded.s_sum", (*k, *a))
+        for k, a in self.proxy.items():
+            ex("INSERT INTO proxy_h VALUES (?,?,?,?,?) ON CONFLICT(hour, vendor) DO UPDATE SET "
+               "n=proxy_h.n+excluded.n, ok=proxy_h.ok+excluded.ok, ms_sum=proxy_h.ms_sum+excluded.ms_sum", (*k, *a))
+        for k, n in self.reason.items():
+            ex("INSERT INTO proxy_reason_h VALUES (?,?,?,?) ON CONFLICT(hour, vendor, reason) DO UPDATE SET "
+               "n=proxy_reason_h.n+excluded.n", (*k, n))
+        for k, a in self.fleet.items():
+            ex("INSERT INTO fleet_h VALUES (?,?,?,?) ON CONFLICT(hour, inst) DO UPDATE SET "
+               "n=fleet_h.n+excluded.n, online_sum=fleet_h.online_sum+excluded.online_sum", (*k, *a))
 
 
 def _bucket(ms: float) -> int:

@@ -1,5 +1,6 @@
 """[monitor] 段：上报端（下载进程）与面板端（paperlite-monitor serve）共用一份配置结构。"""
 
+import dataclasses
 import os
 import socket
 from dataclasses import dataclass, fields
@@ -21,7 +22,8 @@ class MonitorConfig:
     # ── 面板端 ──
     queue: str = "paperlite.monitor.dashboard"   # 面板的持久队列：面板停机期间消息在 RabbitMQ 里排队
     queue_max_length: int = 2_000_000     # 队列上限，超出丢最旧的，防面板长期离线撑爆 RabbitMQ
-    db: str = "monitor.db"                # 面板入库的 SQLite（本地盘）
+    dsn: str = ""                         # 面板入库的 PostgreSQL；空 = 用 [pg] 的 dsn（与任务队列同一个库）
+    schema: str = "paperlite_monitor"     # 面板表所在 schema，与任务表分开
     bind: str = "127.0.0.1"
     port: int = 8700
     username: str = "admin"               # 面板登录用户名（HTTP Basic，浏览器弹框输入）
@@ -32,6 +34,8 @@ class MonitorConfig:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "MonitorConfig":
+        if "db" in raw:
+            raise ValueError("[monitor] db 已移除：面板改存 PostgreSQL（[monitor] dsn，留空则用 [pg] 的 dsn），删掉 db 即可")
         known = {f.name for f in fields(cls)}
         unknown = set(raw) - known
         if unknown:
@@ -73,9 +77,6 @@ class MonitorConfig:
     def vendor_name(self) -> str:
         return self.vendor or "unknown"
 
-    @property
-    def db_path(self) -> Path:
-        return Path(self.db).expanduser()
 
 
 def load_monitor(path: Path) -> MonitorConfig:
@@ -85,4 +86,7 @@ def load_monitor(path: Path) -> MonitorConfig:
         raw = config_mod._read(path)
     except FileNotFoundError:
         return MonitorConfig()
-    return MonitorConfig.from_dict(raw.get("monitor", {}))
+    cfg = MonitorConfig.from_dict(raw.get("monitor", {}))
+    if not cfg.dsn and isinstance(raw.get("pg"), dict) and raw["pg"].get("dsn"):
+        cfg = dataclasses.replace(cfg, dsn=raw["pg"]["dsn"])
+    return cfg

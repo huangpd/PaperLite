@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""CSV 导入前用 DuckDB 按 DOI 排序：杂乱的 CSV 入库后同出版商/同期刊任务连号，字段语义与原来一致。"""
+"""用 DuckDB 读 CSV（按 DOI 排序产出）：容错、报出错行；入库后同出版商/同期刊任务连号，字段语义与原来一致。"""
 import csv
 import io
 import tempfile
@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from paperlite.cli import _import, _read_url_file
-from paperlite.tasks import TaskDB
+from tests.pgutil import execute, make_source, needs_pg
 
 
 class ImportClusterTest(unittest.TestCase):
@@ -82,11 +82,14 @@ class ImportClusterTest(unittest.TestCase):
         ])
         rows = list(_read_url_file(path))
         self.assertEqual(rows[1]["title"], 'a, b "c"')
-        db = TaskDB(self.dir / "t.db")
+        self._import_end_to_end(path)
+
+    @needs_pg
+    def _import_end_to_end(self, path):
+        db = make_source(self)
         _import(db, path, source="batch", url_type="html")
-        got = db._conn.execute("SELECT doi, url_type, source FROM paper_pdf_resources ORDER BY id").fetchall()
+        got = execute(db, "SELECT doi, url_type, source FROM pl_tasks ORDER BY id").fetchall()
         self.assertEqual([tuple(r) for r in got], [("10.1016/j.a.1", "html", "batch"), ("10.1016/j.b.1", "html", "batch")])
-        db.close()
 
     def test_txt_unchanged(self):
         p = self.dir / "list.txt"
