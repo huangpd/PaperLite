@@ -18,7 +18,7 @@ uv run paperlite <命令>                   # 运行；子命令见 docs/referen
 
 测试是 `unittest.TestCase` 子类，用 pytest 跑。依赖 PG 的用例用 `tests/pgutil.needs_pg` 门控（`PAPERLITE_TEST_PG`），身份池（`curl/identity.py`）的测试也在其中；没设时它们跳过，不能当全量通过。测试文件按包对应（`test_curl` / `test_browser` / `test_taskq` / `test_title_dup` / `test_cli` …），共用的替身（`FakeStore`、`Resp`、`ident`、`PROXY`）在 `tests/fakes.py`，测试文件之间不互相 import。
 
-**包结构与依赖方向**（见 docs/development/project-layout.md）：根目录是共享内核（`tasks` `config` `page` `pdf` `proxy` `logutil`；PDF 文件头规则只在 `pdf.py`，页面/挑战判定只在 `page.py`，两种模式共用，别再各写一份），`taskq/` 任务队列、`browser/` 浏览器模式、`curl/` curl 模式、`monitor/` 监控。依赖只能 `cli` → `browser`/`curl`/`taskq` → 根目录 → `monitor.reporter`；`curl` 只借用 `browser.session` / `browser.env`（过盾、渲染）。这条由 `tests/test_layering.py` 检查。PG 里的 advisory lock 名沿用旧模块名（`paperlite.pgqueue.*`、`paperlite.store.schema`），别跟着改名。
+**包结构与依赖方向**（见 docs/development/project-layout.md）：根目录是共享内核（`tasks` `config` `page` `pdf` `proxy` `logutil`；PDF 文件头规则只在 `pdf.py`，页面/挑战判定只在 `page.py`，两种模式共用，别再各写一份），`taskq/` 任务队列、`browser/` 浏览器模式、`curl/` curl 模式、`monitor/` 监控。依赖只能 `cli` → `browser`/`curl`/`taskq` → 根目录 → `monitor.reporter`；`curl` 只借用 `browser.session` / `browser.env`（过盾、渲染）。这条由 `tests/test_layering.py` 检查。`cli.py` 只做命令行本身（参数、读配置、打开队列）：导入在 `taskq/importer.py`，跑下载在 `browser/runner.py` / `curl/runner.py`；库代码给人看的错误抛 `errors.UserError`（由 `cli.main` 打印退出），别在库里 `SystemExit`。PG 里的 advisory lock 名沿用旧模块名（`paperlite.pgqueue.*`、`paperlite.store.schema`），别跟着改名。
 
 ## 架构要点（跨文件才看得清的部分）
 

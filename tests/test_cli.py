@@ -1,4 +1,4 @@
-"""命令行（cli.py）：子命令、参数、地理库检查。"""
+"""命令行（cli.py）：子命令、参数；启动前的地理库检查（browser.session.require_geoip）。"""
 import os
 import tempfile
 import tomllib
@@ -72,6 +72,29 @@ class CliTest(unittest.TestCase):
             with self.assertRaises(ValueError) as e:
                 config.load_limits(Path("c.toml")); config.load_paths(Path("c.toml")); config.load_run(Path("c.toml"))
             self.assertIn(needle, str(e.exception))
+
+    @needs_pg
+    def test_user_error_becomes_clean_exit(self):
+        """库代码抛 UserError（这里是 CSV 引号没闭合），命令行打印原因后退出，不打 traceback。"""
+        Path("config.toml").write_text(pg_config(new_schema(self), batch="cli-bad"))
+        Path("bad.csv").write_text('doi,url\n10.1/a,"https://x.example/a\n', encoding="utf-8")
+        with self.assertRaises(SystemExit) as e:
+            self.run_cli("import", "--urls", "bad.csv")
+        self.assertIn("读取 CSV 失败", str(e.exception))
+
+    @needs_pg
+    def test_curl_run_rejects_multi_host_batch(self):
+        """curl 模式须单主机：多主机批次直接报错（UserError），且交还任务队列连接。"""
+        from paperlite.curl.runner import run_curl
+        from paperlite.errors import UserError
+        from paperlite.config import Limits
+        db = make_source(self, batch="multi")
+        db.import_urls([{"url": "https://dl.acm.org/doi/pdf/10.1145/1"}, {"url": "https://example.org/a.pdf"}])
+        closed = mock.patch.object(db, "close", wraps=db.close)
+        with closed as close, self.assertRaises(UserError) as e:
+            run_curl(Limits(), None, None, db, Path("out"), 1, with_producer=False)
+        self.assertIn("curl 模式需单主机", str(e.exception))
+        close.assert_called_once()
 
     @needs_pg
     def test_import_retry_export_status_via_pg(self):
@@ -254,16 +277,17 @@ class CliArgsTest(unittest.TestCase):
 class GeoipGateTest(unittest.TestCase):
     """geoip=true 但 GeoIP 库缺失时，启动前报错而非卡死下载。"""
 
-    def test_require_geoip(self):
-        from paperlite.cli import _require_geoip
+    def testrequire_geoip(self):
+        from paperlite.browser.session import require_geoip
+        from paperlite.errors import UserError
         from paperlite.config import Limits
-        _require_geoip(Limits(geoip=False))                                  # 关：不检查、不报错
+        require_geoip(Limits(geoip=False))                                  # 关：不检查、不报错
         with mock.patch("paperlite.browser.session.ensure_geoip_db", return_value=(True, "/x/db.mmdb", "u")):
-            _require_geoip(Limits(geoip=True))                               # 就位（或下成功）：通过
+            require_geoip(Limits(geoip=True))                               # 就位（或下成功）：通过
         with mock.patch("paperlite.browser.session.ensure_geoip_db",
                         return_value=(False, "/x/GeoLite2-City.mmdb", "https://example/db")):
-            with self.assertRaises(SystemExit) as e:
-                _require_geoip(Limits(geoip=True))                           # 下不动：报错
+            with self.assertRaises(UserError) as e:
+                require_geoip(Limits(geoip=True))                           # 下不动：报错
             msg = str(e.exception)
             self.assertIn("GeoLite2-City.mmdb", msg)        # 指明文件
             self.assertIn("https://example/db", msg)        # 给出下载地址

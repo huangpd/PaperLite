@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 from paperlite.browser.env import browser_env
 from paperlite.config import ProxySettings
+from paperlite.errors import UserError
 from paperlite.page import classify_waf
 from paperlite.proxy import Lease
 from paperlite.browser.turnstile import TurnstileClicker
@@ -122,6 +123,23 @@ def ensure_geoip_db(connect_timeout: float = 15.0, read_timeout: float = 45.0) -
             pass
         logger.warning("GeoIP 库下载失败: %s", str(e).splitlines()[0][:120])
         return False, path, url
+
+
+def require_geoip(cfg) -> None:
+    """geoip=true：启动前确保 GeoIP 库就位——缺失则限时下载一次；下不动就快速报错给手动预置指引
+    （而不是让 cloakbrowser 每次启动都卡 5 分钟重试）。"""
+    if not cfg.geoip:
+        return
+    ok, path, url = ensure_geoip_db()
+    if ok:
+        return
+    raise UserError(
+        f"geoip = true，但 GeoIP 库下载不下来（服务器/受限网络常连不上 GitHub），这里先拦下不让它卡死。\n"
+        f"目标路径：{path}\n"
+        f"请手动装好再跑，二选一：\n"
+        f"  1) 能连 GitHub 的机器上下载后放到该路径（或在别处下好 scp 过去）：\n"
+        f"     curl -L --create-dirs -o '{path}' '{url}'\n"
+        f"  2) 不用 geoip（WebRTC 伪造仍由 webrtc_spoof 保留）：在 config.toml 的 [limits] 设 geoip = false")
 
 
 async def pass_challenge(
