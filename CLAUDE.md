@@ -30,6 +30,8 @@ uv run paperlite <命令>                   # 运行；子命令见 docs/referen
 
 **身份坏不坏的判定是核心陷阱**（见 docs/development/postmortems.md 与 architecture.md）：带有效 cookie 仍被挑战时，**先用参照链接验身份**（最近下载成功的链接，没有时用首页；不再有配置的落地页）——参照正常说明只是这条 URL 被站点单独盯上（`challenge_count+1` 排后面），参照也打不开才算身份坏、丢弃。不要用"下一条也被挑战"来判身份，被盯上的论文成批相邻会误杀好身份。
 
+**浏览器模式下 PDF**：`url_type=pdf` 走 `pdf_capture.PdfCapture`（CDP Fetch 拦截 PDF 响应、流式写盘），别改回 goto 后读页面或点下载按钮；开拦截时必须应答 `Fetch.authRequired`（代理鉴权）。
+
 **浏览器模式不热身**：新浏览器领到的第一篇就是探针（`browser_pool._do_task(probe=True)`），首篇失败任务放回不计次数、换 IP；同一主机连续 `_PROBE_STREAK` 个新浏览器首篇失败就按站点问题正常计次，别改成无限换 IP。
 
 **易改错的行为语义**，动之前先对齐 architecture.md / postmortems.md：
