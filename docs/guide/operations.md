@@ -81,7 +81,7 @@ paperlite inspect --reset     # 清除所有规则，放回全部被跳过的任
 不需要按站点配置，主机直接取自任务队列里的 URL。
 
 - 不需要配置热身页：浏览器直接拿队列里的真实链接过盾，curl 模式用真实链接验收身份。
-- curl 模式还要检查 `core/page.py` 里的 non-PDF 判定规则（按 ACM 编写）是否适用。
+- curl 模式还要检查 `rules/page.py` 里的 non-PDF 判定规则（按 ACM 编写）是否适用。
 
 ## 日志
 

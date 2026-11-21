@@ -2,7 +2,7 @@
 
 ```
 src/paperlite/
-  core/               纯规则，两种模式共用：只看传进来的数据给结论，不联网、不读写文件和数据库、不依赖本包其他模块
+  rules/              纯规则，两种模式共用：只看传进来的数据给结论，不联网、不读写文件和数据库、不依赖本包其他模块
     tasks.py          任务的公共定义：状态、错误分类、Task、URL 规范化与校验、DOI 推导、文件路径
     page.py           页面判定：Cloudflare 挑战 / 封禁、WAF 识别、non-PDF 分类（not_found、paywall、landing_page、blocked）
     pdf.py            PDF 文件头规则
@@ -47,7 +47,7 @@ docs/                 文档
 
 ## 模块之间的关系
 
-- **依赖方向**：`cli` → `browser` / `curl` / `taskq` → 根目录（配置、代理…）→ `core`；遥测只走 `monitor.reporter`。`core` 不依赖任何人。反方向不允许；
+- **依赖方向**：`cli` → `browser` / `curl` / `taskq` → 根目录（配置、代理…）→ `rules`；遥测只走 `monitor.reporter`。`rules` 不依赖任何人。反方向不允许；
   `curl` 对 `browser` 的依赖只有过盾和一次性渲染（`browser.session`、`browser.env`）。`tests/test_layering.py` 扫描全部 import 检查这条规则。
 - **命令行**：`cli` 读配置、`_open_db` 打开任务队列（`taskq.PgTaskSource`），导入交给 `taskq.importer`，跑下载交给 `browser.runner.run_browser` / `curl.runner.run_curl`（db 交给 runner，由它关闭）。库代码出错抛 `errors.UserError`，`cli.main` 统一打印后退出。
 - **任务队列**：worker 都通过 `taskq.PgTaskSource` 领任务、回写结果。

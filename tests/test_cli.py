@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from paperlite.core.tasks import Status
+from paperlite.rules.tasks import Status
 from tests.pgutil import make_source, needs_pg, new_schema, pg_config
 
 
@@ -239,7 +239,7 @@ class CliArgsTest(unittest.TestCase):
 
     # 文档 export：--status 为 pending / success / failed / non_pdf 之一；--file 默认标准输出（-）
     def test_export(self):
-        from paperlite.core.tasks import Status
+        from paperlite.rules.tasks import Status
         self.assertEqual(self.parse("export").file, "-")
         for s in (Status.PENDING, Status.SUCCESS, Status.FAILED, Status.NON_PDF):
             self.assertEqual(self.parse("export", "--status", s).status, s)

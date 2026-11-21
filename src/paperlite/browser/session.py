@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Optional
 from paperlite.browser.env import browser_env
 from paperlite.config import ProxySettings
 from paperlite.errors import UserError
-from paperlite.core.page import classify_waf
+from paperlite.rules.page import classify_waf
 from paperlite.proxy import Lease
 from paperlite.browser.turnstile import TurnstileClicker
 

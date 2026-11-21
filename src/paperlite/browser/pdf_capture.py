@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-from paperlite.core.pdf import HEAD_BYTES, pdf_offset
+from paperlite.rules.pdf import HEAD_BYTES, pdf_offset
 
 logger = logging.getLogger("paperlite.browser.pdf_capture")
 

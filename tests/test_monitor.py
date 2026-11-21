@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from paperlite.browser.session import RenderResult
-from paperlite.core.page import classify_waf
+from paperlite.rules.page import classify_waf
 from paperlite.monitor import reporter as mon
 from paperlite.monitor import schema
 from paperlite.monitor.config import MonitorConfig, load_monitor

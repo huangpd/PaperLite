@@ -16,7 +16,7 @@ from paperlite.config import Limits, ProxySettings
 from paperlite.errors import UserError
 from paperlite.monitor.reporter import task_snapshot
 from paperlite.taskq import PgTaskSource
-from paperlite.core.tasks import Status
+from paperlite.rules.tasks import Status
 
 logger = logging.getLogger("paperlite")
 

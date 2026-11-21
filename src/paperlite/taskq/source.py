@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from paperlite.taskq.queue import DEFAULT_CHUNK_SIZE, DEFAULT_LEASE_S, RETRY, SKIP, PgTaskQueue, Result
-from paperlite.core.tasks import Status, Task
+from paperlite.rules.tasks import Status, Task
 
 logger = logging.getLogger("paperlite")
 

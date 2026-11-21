@@ -2,7 +2,7 @@
 import unittest
 
 from paperlite.taskq.title_dup import WindowInspector
-from paperlite.core.tasks import Status, UrlType
+from paperlite.rules.tasks import Status, UrlType
 from tests.pgutil import execute, make_source, needs_pg, rows as pg_rows
 
 
