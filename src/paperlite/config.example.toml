@@ -54,7 +54,7 @@ headed = false                # 仅 browser：有界面（调试）
 
 [monitor]                     # 可选：监控上报。各终端发到同一个 RabbitMQ，paperlite-monitor serve 出大屏
 enabled = false               # true 才上报；RabbitMQ 连不上/没装 pika 都不影响下载
-amqp_url = "amqp://pl_terminal:密码@服务器IP:5672/paperlite"    # 公共 RabbitMQ（含密码，别提交）。部署见 docs/MONITOR.md
+amqp_url = "amqp://pl_terminal:密码@服务器IP:5672/paperlite"    # 公共 RabbitMQ（含密码，别提交）。部署见 docs/guide/monitoring.md
 exchange = "paperlite.monitor"
 node = ""                     # 终端名，留空用主机名
 vendor = "qingguo"            # 代理厂商标签：面板按「厂商 × 域名」统计成功率

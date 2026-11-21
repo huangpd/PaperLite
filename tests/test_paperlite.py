@@ -1422,9 +1422,9 @@ def test_cf_probe_scripts_are_not_challenge():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 命令行契约：断言 README「命令」「主要配置」两节描述的子命令、参数、默认值、
+# 命令行契约：断言 docs/reference/cli.md 与 configuration.md 描述的子命令、参数、默认值、
 # choices 与真实的 argparse 定义一致。只测参数解析（纯函数），不碰 Redis/网络。
-# 改了 CLI 的命令集或参数默认值而没更新 README 时，这里会红。
+# 改了 CLI 的命令集或参数默认值而没更新文档时，这里会红。
 # ──────────────────────────────────────────────────────────────────────────
 class CliArgsTest(unittest.TestCase):
     def setUp(self):
@@ -1443,7 +1443,7 @@ class CliArgsTest(unittest.TestCase):
         with self.assertRaises(SystemExit), self._contextlib.redirect_stderr(buf):
             self.ap.parse_args(list(argv))
 
-    # README 命令表列出的子命令（help 是帮助本身）
+    # 文档 命令表列出的子命令（help 是帮助本身）
     def test_command_set_matches_readme(self):
         from paperlite.cli import _COMMANDS
         self.assertEqual(
@@ -1454,7 +1454,7 @@ class CliArgsTest(unittest.TestCase):
         # 每个命令都建了子解析器（help 自身也在内）
         self.assertEqual(set(self.parsers), set(_COMMANDS))
 
-    # README 快速开始/脚注：--version、--config、--log-level 默认 INFO
+    # 文档 快速开始/脚注：--version、--config、--log-level 默认 INFO
     def test_global_flags(self):
         self.assertEqual(self.parse("status").log_level, "INFO")
         self.assertIsNone(self.parse("status").config)
@@ -1471,7 +1471,7 @@ class CliArgsTest(unittest.TestCase):
         self.fails("status", "--out", "o")        # --out 已移除
         self.fails("import", "--host", "h")       # --host 已移除
 
-    # README import 行：--urls 必填；--type 为 pdf|html 默认 pdf
+    # 文档 import 行：--urls 必填；--type 为 pdf|html 默认 pdf
     def test_import(self):
         from paperlite.tasks import UrlType
         self.fails("import")                                   # 缺 --urls
@@ -1480,7 +1480,7 @@ class CliArgsTest(unittest.TestCase):
         self.assertEqual(self.parse("import", "--urls", "x", "--type", "html").type, "html")
         self.fails("import", "--urls", "x", "--type", "xml")   # 非法 choice
 
-    # README run 行：--workers 默认 20；--curl/--browser 互斥；--no-proxy；--type
+    # 文档 run 行：--workers 默认 20；--curl/--browser 互斥；--no-proxy；--type
     def test_run(self):
         ns = self.parse("run")
         self.assertEqual(ns.workers, 20)
@@ -1490,7 +1490,7 @@ class CliArgsTest(unittest.TestCase):
         self.assertTrue(self.parse("run", "--browser", "--no-proxy").no_proxy)
         self.fails("run", "--browser", "--curl")               # 互斥
 
-    # README「配置文件启动」：paperlite run config.toml 按 [run] 启动
+    # 文档「配置文件启动」：paperlite run config.toml 按 [run] 启动
     def test_run_config_file_positional(self):
         self.assertEqual(self.parse("run", "config.toml").config_file, "config.toml")
 
@@ -1506,17 +1506,17 @@ class CliArgsTest(unittest.TestCase):
                                       RunConfig(command="run"))
         self.assertTrue(mapped.browser and not mapped.curl)   # [run] 省略 mode → browser
 
-    # README：produce 常驻，按下载线程与可领取任务生产；--keep 已删除
+    # 文档：produce 常驻，按下载线程与可领取任务生产；--keep 已删除
     def test_produce(self):
         self.parse("produce")
         self.fails("produce", "--keep", "20")
 
-    # README：download 需 --workers（默认 20），可选 --urls
+    # 文档：download 需 --workers（默认 20），可选 --urls
     def test_download(self):
         self.assertEqual(self.parse("download").workers, 20)
         self.assertEqual(self.parse("download", "--workers", "8").workers, 8)
 
-    # README retry：必须二选一；--status 只接受 failed/non_pdf；--kind 配合
+    # 文档 retry：必须二选一；--status 只接受 failed/non_pdf；--kind 配合
     def test_retry(self):
         from paperlite.cli import ERROR_KINDS
         self.fails("retry")                                    # 缺 required 互斥组
@@ -1528,7 +1528,7 @@ class CliArgsTest(unittest.TestCase):
         self.assertIn("network", ERROR_KINDS)
         self.assertEqual(self.parse("retry", "--status", "failed", "--kind", "network").kind, "network")
 
-    # README export：--status 为全部状态之一；--file 默认标准输出（-）
+    # 文档 export：--status 为全部状态之一；--file 默认标准输出（-）
     def test_export(self):
         from paperlite.tasks import Status
         self.assertEqual(self.parse("export").file, "-")
@@ -1536,14 +1536,14 @@ class CliArgsTest(unittest.TestCase):
             self.assertEqual(self.parse("export", "--status", s).status, s)
         self.fails("export", "--status", "bogus")
 
-    # README inspect 行：--trigger/--min-precision/--min-support/--list/--reset
+    # 文档 inspect 行：--trigger/--min-precision/--min-support/--list/--reset
     def test_inspect(self):
         ns = self.parse("inspect", "--trigger", "10", "--min-precision", "0.9",
                         "--min-support", "5", "--list", "--reset")
         self.assertEqual((ns.trigger, ns.min_precision, ns.min_support), (10, 0.9, 5))
         self.assertTrue(ns.list and ns.reset)
 
-    # README Turnstile 节：--url/--sitekey、--serve 起服务、--json、默认值
+    # 文档 Turnstile 节：--url/--sitekey、--serve 起服务、--json、默认值
     def test_turnstile(self):
         ns = self.parse("turnstile", "--url", "https://x/", "--sitekey", "0x4A")
         self.assertEqual((ns.timeout, ns.concurrency, ns.bind), (60, 4, "127.0.0.1"))
@@ -1551,7 +1551,7 @@ class CliArgsTest(unittest.TestCase):
         self.assertEqual(self.parse("turnstile", "--serve", "8191").serve, 8191)
         self.assertTrue(self.parse("turnstile", "--url", "x", "--sitekey", "k", "--json").json)
 
-    # README：init --force
+    # 文档：init --force
     def test_init(self):
         self.assertFalse(self.parse("init").force)
         self.assertTrue(self.parse("init", "--force").force)
