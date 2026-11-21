@@ -104,6 +104,6 @@ paperlite retry --status failed --kind network    # 把网络错误的任务放�
 ## 下一步
 
 - [日常运维](guide/operations.md)：重试、巡检规则、新增站点、日志。
-- [运行模式](guide/modes.md)：什么时候值得为 curl 模式多搭一个 Redis。
+- [运行模式](guide/modes.md)：浏览器模式和 curl 模式怎么选。
 - [监控](guide/monitoring.md)：多台机器一个面板。
 - [故障排查](guide/troubleshooting.md)。

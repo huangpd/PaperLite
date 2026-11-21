@@ -67,8 +67,6 @@ class Paths:
 class Limits:
     """并发与行为。不含任何存储路径（那些在 [paths]）。"""
 
-    redis_url: str = "redis://127.0.0.1:6379/0"
-    key_prefix: str = "paperlite"
     # 生产
     max_browsers: int = 20            # 同时运行的浏览器上限
     max_identities: int = 20          # 健康身份（IP+cookie）上限；实际目标 = min(本值, 在线下载线程数)
@@ -101,6 +99,9 @@ class Limits:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Limits":
+        for old in ("redis_url", "key_prefix"):
+            if old in raw:
+                raise ValueError(f"[limits] {old} 已移除：curl 模式的身份池改存 PostgreSQL（与任务队列同一个 [pg]），删掉这一行即可")
         if "volume_stop_after" in raw:
             raise ValueError("[limits] volume_stop_after 已移除（卷期停止只适用 ACM 式 DOI，不通用），删掉这一行即可")
         _reject_unknown("limits", raw, cls)

@@ -13,7 +13,7 @@ paperlite/browser_pool.py
 不走代理时规则相同，"换 IP"就是在本机 IP 上重开浏览器。
 
 适用于 ScienceDirect 这类"每个请求都重新挑战、cf_clearance 无法交给 curl 复用"的站：
-请求必须整篇留在浏览器里。不走 Redis 身份池，也不用 curl —— 浏览器本身就是 worker。
+请求必须整篇留在浏览器里。不走身份池，也不用 curl —— 浏览器本身就是 worker。
 
 url_type=html 的任务整页存成 .html。url_type=pdf 的任务开 CDP 拦截（pdf_capture.py）：途中任一响应是 PDF
 就流式写盘（校验 %PDF-、大小、长度）记 success；最后停在网页上（摘要页、订阅页）记 non_pdf

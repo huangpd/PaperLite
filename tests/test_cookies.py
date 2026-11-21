@@ -14,7 +14,8 @@ from paperlite.consumer import session_for_identity
 from paperlite.cookies import jar_from_records, jar_to_records
 from paperlite.producer import Producer
 from paperlite.proxy import ProxySettings
-from paperlite.store import Identity, IdentityStore
+from paperlite.store import Identity
+from tests.pgutil import identity_row, make_store, needs_pg
 
 
 def identity(records, **changes):
@@ -26,7 +27,7 @@ def identity(records, **changes):
 
 
 class CookieJarTest(unittest.TestCase):
-    def test_redis_roundtrip_preserves_scopes_and_attributes(self):
+    def test_record_roundtrip_preserves_scopes_and_attributes(self):
         expires = int(time.time()) + 120
         original = identity([
             {"name": "cf_clearance", "value": "parent", "domain": ".example.test", "path": "/",
@@ -38,7 +39,7 @@ class CookieJarTest(unittest.TestCase):
             {"name": "__Host-session", "value": "scoped", "domain": "dl.example.test", "path": "/",
              "expires": -1, "secure": True},
         ])
-        restored = Identity.from_redis(original.to_redis())
+        restored = Identity.from_dict(original.to_dict())
         self.assertIsInstance(restored.cookies, CookieJar)
         with session_for_identity(restored) as session:
             self.assertIs(session.cookies.jar, restored.cookies)
@@ -55,21 +56,21 @@ class CookieJarTest(unittest.TestCase):
         self.assertEqual(cookies[("dl.example.test", "/doi", "cf_clearance")].value, "article")
         self.assertFalse(cookies[("dl.example.test", "/", "__Host-session")].domain_specified)
 
-    def test_reads_legacy_redis_browser_cookie_list(self):
-        raw = identity([]).to_redis()
+    def test_reads_legacy_browser_cookie_list(self):
+        raw = identity([]).to_dict()
         del raw["cookies_format"]
         raw["cookies"] = json.dumps([
             {"name": "cf_clearance", "value": "parent", "domain": ".example.test", "path": "/"},
             {"name": "cf_clearance", "value": "host", "domain": "dl.example.test", "path": "/doi",
              "expires": -1, "httpOnly": True, "sameSite": "Lax"},
         ])
-        restored = Identity.from_redis(raw)
+        restored = Identity.from_dict(raw)
         cookies = list(restored.cookies)
         self.assertEqual([cookie.value for cookie in cookies], ["parent", "host"])
         self.assertEqual([cookie.domain_specified for cookie in cookies], [True, False])
         self.assertTrue(cookies[1].has_nonstandard_attr("HttpOnly"))
         self.assertEqual(cookies[1].get_nonstandard_attr("SameSite"), "Lax")
-        self.assertEqual(restored.to_redis()["cookies_format"], "cookiejar-v1")
+        self.assertEqual(restored.to_dict()["cookies_format"], "cookiejar-v1")
 
 
 class CookieEchoProxy(BaseHTTPRequestHandler):
@@ -90,8 +91,9 @@ class CookieEchoProxy(BaseHTTPRequestHandler):
         pass
 
 
-@unittest.skipUnless(os.environ.get("PAPERLITE_TEST_REDIS"), "设置 PAPERLITE_TEST_REDIS 才跑真实 Redis/HTTP 用例")
-class RedisCookieReplayTest(unittest.TestCase):
+@needs_pg
+class StoreCookieReplayTest(unittest.TestCase):
+    """身份池（PostgreSQL）里的 cookie 经真实 HTTP 往返：作用域、续存、删除、寿命。"""
     @classmethod
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), CookieEchoProxy)
@@ -105,17 +107,15 @@ class RedisCookieReplayTest(unittest.TestCase):
         cls.server_thread.join(timeout=5)
 
     def setUp(self):
-        self.store = IdentityStore(os.environ["PAPERLITE_TEST_REDIS"], prefix=f"cookie_test_{uuid.uuid4().hex}")
+        self.store = make_store(self)
         self.proxy_server = f"127.0.0.1:{self.server.server_port}"
         self.proxy = ProxySettings(api_url="http://unused.example.test")
 
-    def tearDown(self):
-        keys = list(self.store.r.scan_iter(f"{self.store.prefix}:*"))
-        if keys:
-            self.store.r.delete(*keys)
-        self.store.r.close()
+    def saved(self, ident_id):
+        row = identity_row(self.store, ident_id)
+        return Identity.from_dict(row[0]) if row else None
 
-    def test_real_redis_replay_scopes_renewal_deletion_and_lifetime(self):
+    def test_real_replay_scopes_renewal_deletion_and_lifetime(self):
         expires = int(time.time()) + 120
         original = identity([
             {"name": "cf_clearance", "value": "parent", "domain": ".example.test", "path": "/"},
@@ -128,8 +128,6 @@ class RedisCookieReplayTest(unittest.TestCase):
         ], proxy_server=self.proxy_server)
         self.store.add(original)
         claimed = self.store.claim(original.host, "worker-1", 20, 60)
-        key = self.store._k(original.host, "id", original.id)
-        ttl_before = self.store.r.pttl(key)
         with session_for_identity(claimed) as session:
             def fetch(url):
                 return session.get(url, proxy=self.proxy.url_for(claimed.proxy_server), timeout=3).json()
@@ -147,7 +145,7 @@ class RedisCookieReplayTest(unittest.TestCase):
             self.assertNotIn("cf_clearance=article", fetch("http://dl.example.test/other")["cookie"])
             fetch("http://dl.example.test/renew")
             self.store.heartbeat(claimed, 60)
-            saved = Identity.from_redis(self.store.r.hgetall(key))
+            saved = self.saved(original.id)
             self.assertEqual(next(cookie.value for cookie in saved.cookies if cookie.name == "session"), "renewed")
             self.assertNotIn("obsolete", [cookie.name for cookie in saved.cookies])
             session.cookies.set("handoff", "saved-on-release", domain="dl.example.test")
@@ -159,9 +157,8 @@ class RedisCookieReplayTest(unittest.TestCase):
             self.assertIn("session=renewed", echoed["cookie"])
             self.assertIn("handoff=saved-on-release", echoed["cookie"])
             self.assertNotIn("obsolete=", echoed["cookie"])
-        self.assertEqual(next_claim.expires_at, original.expires_at)
-        self.assertGreater(self.store.r.pttl(key), 0)
-        self.assertLessEqual(self.store.r.pttl(key), ttl_before)
+        self.assertEqual(next_claim.expires_at, original.expires_at)          # 保存 cookie 不延长身份寿命
+        self.assertEqual(identity_row(self.store, original.id)[3], original.expires_at)
 
     def test_producer_acceptance_saves_response_cookies_before_insertion(self):
         original = identity([
@@ -180,26 +177,24 @@ class RedisCookieReplayTest(unittest.TestCase):
         original = identity([])
         self.store.add(original)
         stale = self.store.claim(original.host, "stale", 20, 60)
-        self.store.r.delete(self.store._k(original.host, "lease", original.id))
+        self.store._x("UPDATE pl_identities SET lease_until = 0 WHERE id = %s", (original.id,))   # stale 崩溃：租约过期
         self.store.reap(original.host)
         current = self.store.claim(original.host, "current", 20, 60)
         current.cookies = jar_from_records([{"name": "session", "value": "current", "domain": "dl.example.test"}])
         self.store.heartbeat(current, 60)
         self.store.heartbeat(stale, 60)
         self.store.release(stale)
-        key = self.store._k(original.host, "id", original.id)
-        saved = Identity.from_redis(self.store.r.hgetall(key))
+        saved = self.saved(original.id)
         self.assertEqual(jar_to_records(saved.cookies), jar_to_records(current.cookies))
-        self.assertEqual(self.store.r.get(self.store._k(original.host, "lease", original.id)), "current")
+        self.assertEqual(identity_row(self.store, original.id)[1], "current")
         self.assertEqual(self.store.stats(original.host).ready, 0)
 
     def test_expired_identity_is_not_recreated_when_saving_cookies(self):
         original = identity([])
         self.store.add(original)
         claimed = self.store.claim(original.host, "worker", 20, 60)
-        key = self.store._k(original.host, "id", original.id)
-        self.store.r.delete(key)
+        self.store._x("DELETE FROM pl_identities WHERE id = %s", (original.id,))      # 期间已过期被清掉
         self.store.heartbeat(claimed, 60)
         self.store.release(claimed)
-        self.assertFalse(self.store.r.exists(key))
+        self.assertIsNone(identity_row(self.store, original.id))
         self.assertEqual((self.store.stats(original.host).ready, self.store.stats(original.host).inuse), (0, 0))

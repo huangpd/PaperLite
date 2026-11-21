@@ -93,8 +93,8 @@ worker（`consumer.Downloader`、`browser_pool.BrowserPool`）用到的接口：
 | 重试退避 | `next_attempt_at` |
 | 手动重试（`retry`） | `reset`：放回 pending、清零计数，`requeue_leftovers` 切进下一代 |
 | 导出（`export`） | `rows`：服务端游标流式读出 |
-| 身份池（curl 模式） | 不变，继续用 Redis |
-| 跨机器的按站点限速 / 并发上限 | 待设计：Redis 计数（每个 host 的在线 worker 数、令牌桶） |
+| 身份池（curl 模式） | 也在 PostgreSQL：`store.py`，UNLOGGED 表，`SKIP LOCKED` 领取 |
+| 跨机器的按站点限速 / 并发上限 | 待设计：PG 里按 host 计数（在线 worker 数、令牌桶） |
 | 进度和统计 | `stats()`；大表上改为汇总表，不要直接 `GROUP BY` 全表（待做） |
 | 卷期停止 | 不做：卷期号只能从 ACM 式 DOI（`10.xxxx/数字.数字`）里认，针对性太强、不通用 |
 

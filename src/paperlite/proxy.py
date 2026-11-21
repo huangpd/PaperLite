@@ -82,7 +82,7 @@ class ProxySettings:
         return proxy
 
     def url_for(self, server: str) -> str:
-        """ip:port → 带鉴权的代理 URL（鉴权只在本地拼，不进 Redis）。"""
+        """ip:port → 带鉴权的代理 URL（鉴权只在本地拼，不进身份池）。"""
         if not self.username:
             return f"{self.scheme}://{server}"
         return f"{self.scheme}://{quote(self.username, safe='')}:{quote(self.password, safe='')}@{server}"

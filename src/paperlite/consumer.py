@@ -3,7 +3,7 @@
 """
 paperlite/consumer.py
 ───────────────────────
-消费者：从 PostgreSQL 任务队列领任务、从 Redis 领身份，用 curl_cffi 带 cookie、经同一出口 IP 下载 PDF 或网页（url_type=html 存 .html）。
+消费者：从 PostgreSQL 任务队列领任务、从身份池（store.py）领身份，用 curl_cffi 带 cookie、经同一出口 IP 下载 PDF 或网页（url_type=html 存 .html）。
 
 - 每个下载线程独占一个身份（IP+cookie），同一 IP 两次请求随机间隔 request_gap_s；
 - 线程只在有活可干（有 pending 任务）时登记心跳，生产者据此决定要多少身份；只剩别的线程的在途任务时
@@ -55,7 +55,8 @@ from paperlite.tasks import Status, Task, UrlType, pdf_path, url_host
 logger = logging.getLogger(__name__)
 
 _IDLE_WAIT_S = 2.0
-_PENDING_REPORT_S = 5.0                        # 向 Redis 上报可领取任务数的最短间隔（各线程共用）
+_ALIVE_EVERY_S = 20.0                           # 线程在线记录的写入间隔（身份池 60s 没更新算离线）
+_PENDING_REPORT_S = 5.0                        # 向身份池上报可领取任务数的最短间隔（各线程共用）
 _CHUNK = 256 * 1024
 _PDF_HEADER_WINDOW = 1024                      # %PDF- 须在前 1024 字节内（PDF 规范）
 _PDF_LEADING_JUNK = b" \t\r\n\x00\x0c\xef\xbb\xbf"  # 之前只允许这些（有的 PHP 下载脚本会输出前导换行）
@@ -194,7 +195,7 @@ class Downloader:
 
     def report_pending(self, force: bool = False) -> None:
         """
-        向 Redis 上报本进程还有多少可领取任务（数到线程数为止），生产者据此不多产身份；
+        向身份池上报本进程还有多少可领取任务（数到线程数为止），生产者据此不多产身份；
         各线程共用 _PENDING_REPORT_S 节流。上报失败只记日志，不影响下载。
         """
         with self._pending_lock:
@@ -240,6 +241,8 @@ class Downloader:
         uses = 0                                      # 当前身份成功下载数
         waited_since = None
         registered = False
+        alive_at = beat_at = float("-inf")            # 上次写在线记录 / 续租的时间：不必每篇都写库
+        beat_every = min(30.0, self.cfg.lease_ttl_s / 4)
         try:
             while not stop.is_set():
                 self.report_pending()
@@ -250,14 +253,16 @@ class Downloader:
                     # 只剩别的线程的在途任务（可能被放回）：不登记需求，身份还回池里，空等
                     if registered:
                         self.store.worker_gone(self.host, worker)
-                        registered = False
+                        registered, alive_at = False, float("-inf")
                     if ident is not None:
                         self.store.release(ident)
                         session.close()
                         ident, session = None, None
                     stop.wait(_IDLE_WAIT_S)
                     continue
-                self.store.worker_alive(self.host, worker)
+                if time.monotonic() - alive_at >= _ALIVE_EVERY_S:
+                    self.store.worker_alive(self.host, worker)
+                    alive_at = time.monotonic()
                 registered = True
                 if ident is None:
                     ident = self.store.claim(self.host, worker, self.cfg.min_left_s, self.cfg.lease_ttl_s)
@@ -273,6 +278,7 @@ class Downloader:
                     self.stats.add("identities")
                     session = self._session(ident)
                     uses = 0
+                    beat_at = time.monotonic()            # 领取时已带租约
                 task = self.db.claim(worker)
                 if task is None:
                     # 被别的线程抢先领走，或本进程的块还在收尾，稍等再看
@@ -286,8 +292,9 @@ class Downloader:
                     uses += 1
                 elif outcome == "rejected" and uses == 0:
                     self.store.note_fresh_reject(self.host)      # 新身份一篇没下成就被拒，计入熔断
-                if keep:
-                    self.store.heartbeat(ident, self.cfg.lease_ttl_s)
+                if keep and time.monotonic() - beat_at >= beat_every:
+                    self.store.heartbeat(ident, self.cfg.lease_ttl_s)   # 续租 + 保存最新 cookie；归还时也会保存
+                    beat_at = time.monotonic()
                 if not keep or ident.left() < self.cfg.min_left_s:
                     self.store.discard(ident)
                     session.close()
@@ -494,7 +501,7 @@ class Downloader:
         return True, "page"
 
     def _remember_good(self, url: str) -> None:
-        """记下最近一次下载成功的链接；每分钟最多同步一次到 Redis，供生产者验收新身份。"""
+        """记下最近一次下载成功的链接；每分钟最多同步一次到身份池，供生产者验收新身份。"""
         self._good_url = url
         now = time.monotonic()
         if now - self._good_shared_at >= 60:

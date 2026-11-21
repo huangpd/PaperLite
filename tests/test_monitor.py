@@ -1,5 +1,5 @@
 """监控模块：配置、WAF 识别、埋点 no-op、入库聚合、HTTP 面板、浏览器模式埋点接线。
-RabbitMQ 端到端用例需 PAPERLITE_TEST_AMQP=amqp://... 才跑（与 Redis 用例同样门控）。"""
+RabbitMQ 端到端用例需 PAPERLITE_TEST_AMQP=amqp://... 才跑。"""
 
 import asyncio
 import json

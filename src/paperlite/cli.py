@@ -113,6 +113,20 @@ def _open_db(args) -> PgTaskSource:
                         flush_s=pc.flush_s, retry_delay_s=pc.retry_delay_s)
 
 
+def _open_store(args) -> IdentityStore:
+    """curl 模式的身份池：和任务队列同一个 PostgreSQL（[pg] 的 dsn、schema）。"""
+    try:
+        pc = config_mod.load_pg(config_mod.resolve_path(args.config))
+    except FileNotFoundError as e:
+        raise SystemExit(str(e))
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"配置错误: {e}")
+    try:
+        return IdentityStore(pc.dsn, schema=pc.schema or None)
+    except Exception as e:
+        raise SystemExit(f"连接 PostgreSQL 失败: {e}")
+
+
 def _require_geoip(cfg) -> None:
     """geoip=true：启动前确保 GeoIP 库就位——缺失则限时下载一次；下不动就快速报错给手动预置指引
     （而不是让 cloakbrowser 每次启动都卡 5 分钟重试）。"""
@@ -352,17 +366,22 @@ def _status(args, cfg) -> None:
     if not host:
         return
     try:
-        store = IdentityStore(cfg.redis_url, cfg.key_prefix)
+        pc = config_mod.load_pg(config_mod.resolve_path(args.config))
+        store = IdentityStore(pc.dsn, schema=pc.schema or None)
         store.reap(host)
         st = store.stats(host, cfg.refill_before_s)
     except Exception as e:
-        print(f"身份池: Redis 不可用（{e}）")
+        print(f"身份池: 读取失败（{e}）")
+        return
+    if not (st.ready or st.inuse or st.workers):          # 浏览器模式没有身份池，不打空行
+        store.close()
         return
     print(f"身份池 {host}: 空闲 {st.ready}  占用 {st.inuse}  健康 {st.healthy}  在线下载线程 {st.workers}  "
           f"生产者 {store.producer_holder(host) or '无'}")
     for ident in store.list(host):
         print(f"  {ident.exit_ip:15s} 剩余 {ident.left():4.0f}s  过盾 {ident.pass_s:.0f}s  "
               f"创建 {datetime.fromtimestamp(ident.created_at):%H:%M:%S}  指纹 {ident.fingerprint}")
+    store.close()
 
 
 def _export(args) -> None:
@@ -410,7 +429,7 @@ def _turnstile(args, parser) -> None:
 
 
 def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
-    """浏览器下载模式：每个浏览器+IP 过盾一次后连续下同域名多篇（整页存 .html）。不用 Redis 身份池。"""
+    """浏览器下载模式：每个浏览器+IP 过盾一次后连续下同域名多篇（整页存 .html）。不用身份池。"""
     db = _open_db(args)
     if args.urls:
         _import(db, args.urls, url_type=_url_type(args))
@@ -712,24 +731,26 @@ def main() -> None:
 
     cfg, proxy = _load(args.config)                 # produce / download / run --curl
     _require_geoip(cfg)                             # curl 模式过盾也用浏览器，同样需要 GeoIP 库
-    store = IdentityStore(cfg.redis_url, cfg.key_prefix)
-    store.ping()
-    if args.cmd == "produce":
-        db = _open_db(args)
-        host = db.host()
-        if not host:
-            db.close()
-            raise SystemExit("任务队列是空的，先 import")
-        producer = _ProducerThread(cfg, store, proxy, host, sample_url=lambda: db.q.sample_pending_url(host))
-        try:
-            while not producer.finished.wait(1):
-                pass
-        except KeyboardInterrupt:
-            producer.shutdown(cfg.pass_timeout_s + 30)
-        finally:
-            db.close()
-    else:
-        _download(args, cfg, proxy, store, with_producer=args.cmd == "run")
+    store = _open_store(args)
+    try:
+        if args.cmd == "produce":
+            db = _open_db(args)
+            host = db.host()
+            if not host:
+                db.close()
+                raise SystemExit("任务队列是空的，先 import")
+            producer = _ProducerThread(cfg, store, proxy, host, sample_url=lambda: db.q.sample_pending_url(host))
+            try:
+                while not producer.finished.wait(1):
+                    pass
+            except KeyboardInterrupt:
+                producer.shutdown(cfg.pass_timeout_s + 30)
+            finally:
+                db.close()
+        else:
+            _download(args, cfg, proxy, store, with_producer=args.cmd == "run")
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

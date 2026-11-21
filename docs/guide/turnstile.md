@@ -1,6 +1,6 @@
 # Turnstile token
 
-PaperLite 可以为任意页面求解 Cloudflare Turnstile，不依赖任务库和 Redis。
+PaperLite 可以为任意页面求解 Cloudflare Turnstile，不依赖任务队列和身份池。
 
 ## 命令行
 

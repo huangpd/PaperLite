@@ -21,7 +21,8 @@ from paperlite.producer import Producer
 from paperlite.proxy import Lease, ProxySettings, parse_deadline
 from paperlite.store import Identity
 from paperlite.tasks import Status, UrlType, derive_doi, pdf_path, url_key, url_problem
-from tests.pgutil import DSN, execute, make_source, needs_pg, new_schema, pg_config, row as pg_row, rows as pg_rows
+from tests.pgutil import (DSN, execute, make_source, make_store, needs_pg, new_schema, pg_config, row as pg_row,
+                          rows as pg_rows)
 
 FAKE_PDF = b"%PDF-1.4\n" + b"0" * 2048          # 超过最小文件大小（1024 字节）
 PROXY = ProxySettings(api_url="https://api.example/get?key=k", username="u", password="p@ss")
@@ -727,7 +728,7 @@ class ProducerReplayTest(unittest.TestCase):
         store.add.assert_called_once()
         self.assertEqual(store.add.call_args.args[0].expires_at, lease.expires_at)
 
-    def test_rejected_replay_never_enters_redis(self):
+    def test_rejected_replay_never_enters_pool(self):
         import asyncio
         from paperlite import producer as producer_mod
         from paperlite.browser import PassResult
@@ -964,7 +965,7 @@ class DownloaderTest(unittest.TestCase):
             {"name": "cf_clearance", "value": "first", "domain": ".acm.org", "path": "/", "secure": True},
             {"name": "cf_clearance", "value": "second", "domain": "dl.acm.org", "path": "/doi", "secure": True},
         ])
-        restored = Identity.from_redis(original.to_redis())
+        restored = Identity.from_dict(original.to_dict())
         session = Downloader._session(None, restored)
         try:
             cookies = list(session.cookies.jar)
@@ -1346,16 +1347,13 @@ class BrowserPoolTest(unittest.TestCase):
             self.assertFalse(is_proxy_net_error(e), e)
 
 
-@unittest.skipUnless(os.environ.get("PAPERLITE_TEST_REDIS"), "设置 PAPERLITE_TEST_REDIS=redis://... 才跑")
-class RedisStoreTest(unittest.TestCase):
-    def setUp(self):
-        from paperlite.store import IdentityStore
-        self.store = IdentityStore(os.environ["PAPERLITE_TEST_REDIS"], prefix=f"cp_test_{uuid.uuid4().hex[:6]}")
-        self.host = "dl.acm.org"
+@needs_pg
+class IdentityStoreTest(unittest.TestCase):
+    """curl 模式身份池（PostgreSQL）。"""
 
-    def tearDown(self):
-        for k in self.store.r.scan_iter(f"{self.store.prefix}:*"):
-            self.store.r.delete(k)
+    def setUp(self):
+        self.store = make_store(self)
+        self.host = "dl.acm.org"
 
     def test_pending_reports_sum_expire_and_clear(self):
         """可领取任务数：多个下载进程求和；超时未更新的上报作废；进程退出撤掉；无上报为 None"""
@@ -1365,10 +1363,10 @@ class RedisStoreTest(unittest.TestCase):
         self.store.report_pending(self.host, "m2-200", 5)
         self.assertEqual(self.store.pending(self.host), 8)
         self.assertEqual(self.store.stats(self.host).pending, 8)
-        self.store.r.hset(self.store._k(self.host, "pending"), "dead-1",
-                          f"50:{time.time() - store_mod.PENDING_STALE_S - 5:.0f}")     # 崩溃进程的旧上报
+        self.store._x("INSERT INTO pl_id_pending VALUES (%s, 'dead-1', 50, %s)",
+                      (self.host, time.time() - store_mod.PENDING_STALE_S - 5))          # 崩溃进程的旧上报
         self.assertEqual(self.store.pending(self.host), 8)
-        self.assertFalse(self.store.r.hexists(self.store._k(self.host, "pending"), "dead-1"))   # 顺手清掉
+        self.assertIsNone(self.store._one("SELECT 1 FROM pl_id_pending WHERE consumer = 'dead-1'"))   # 顺手清掉
         self.store.clear_pending(self.host, "m1-100")
         self.store.report_pending(self.host, "m2-200", 0)
         self.assertEqual(self.store.pending(self.host), 0)   # 有上报但没活：0（不是 None），生产者停产
@@ -1394,7 +1392,7 @@ class RedisStoreTest(unittest.TestCase):
         self.store.release(a)
         self.assertEqual(self.store.stats(self.host).ready, 1)
         a = self.store.claim(self.host, "w", 20, 60)
-        self.store.r.delete(self.store._k(self.host, "lease", a.id))     # 模拟占用者崩溃
+        self.store._x("UPDATE pl_identities SET lease_until = 0 WHERE id = %s", (a.id,))   # 模拟占用者崩溃：租约过期
         self.assertEqual(self.store.reap(self.host), 1)
         a = self.store.claim(self.host, "w", 20, 60)
         self.store.discard(a)
@@ -1419,6 +1417,30 @@ class RedisStoreTest(unittest.TestCase):
         self.store.trip(self.host, 60, threshold=5)
         self.assertGreater(self.store.paused_for(self.host), 50)
         self.assertEqual(self.store.fresh_rejects(self.host), 4)   # 恢复后再被拒一个就再熔断
+
+    def test_concurrent_claims_never_share_an_identity(self):
+        """多个进程（各自一条连接）同时领：SKIP LOCKED 保证一个身份只被一个线程拿到。"""
+        stores = [self.store] + [make_store(self, schema=self.store._one("SELECT current_schema()")[0])
+                                 for _ in range(3)]
+        for i in range(20):
+            self.store.add(ident(exit_ip=f"10.0.0.{i}", expires_at=time.time() + 300 + i))
+        got, lock = [], threading.Lock()
+
+        def worker(st, n):
+            while (x := st.claim(self.host, f"w{n}", 20, 60)) is not None:
+                with lock:
+                    got.append(x.id)
+        ts = [threading.Thread(target=worker, args=(st, n)) for n, st in enumerate(stores * 2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual((len(got), len(set(got))), (20, 20))
+
+    def test_good_url_shared(self):
+        self.assertIsNone(self.store.good_url(self.host))
+        self.store.note_good_url(self.host, "https://dl.acm.org/doi/pdf/10.1145/1")
+        self.assertEqual(self.store.good_url(self.host), "https://dl.acm.org/doi/pdf/10.1145/1")
 
     def test_stats_counts_workers_and_healthy(self):
         self.store.add(ident(expires_at=time.time() + 60))
@@ -1497,7 +1519,7 @@ def test_cf_probe_scripts_are_not_challenge():
 
 # ──────────────────────────────────────────────────────────────────────────
 # 命令行契约：断言 docs/reference/cli.md 与 configuration.md 描述的子命令、参数、默认值、
-# choices 与真实的 argparse 定义一致。只测参数解析（纯函数），不碰 Redis/网络。
+# choices 与真实的 argparse 定义一致。只测参数解析（纯函数），不碰数据库/网络。
 # 改了 CLI 的命令集或参数默认值而没更新文档时，这里会红。
 # ──────────────────────────────────────────────────────────────────────────
 class CliArgsTest(unittest.TestCase):
