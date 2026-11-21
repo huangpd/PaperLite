@@ -15,7 +15,9 @@ paperlite/browser_pool.py
 适用于 ScienceDirect 这类"每个请求都重新挑战、cf_clearance 无法交给 curl 复用"的站：
 请求必须整篇留在浏览器里。不走 Redis 身份池，也不用 curl —— 浏览器本身就是 worker。
 
-只处理 url_type=html 的任务：整页存为 .html。worker 数就是同时打开的浏览器数，受 max_browsers 约束。
+浏览器只能把页面整页存成 .html：url_type=html 的任务记 success；url_type=pdf 的任务打开的却是网页
+（摘要页、订阅页、404 页），记 non_pdf（error_kind 按 classify.py 分类），网页存到 <out>/non_pdf/，
+与 curl 模式一致——不能把"要 PDF 却拿到网页"记成成功。worker 数就是同时打开的浏览器数，受 max_browsers 约束。
 """
 
 import asyncio
@@ -30,6 +32,7 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from paperlite.browser import BrowserSession
+from paperlite.classify import classify_html
 from paperlite.config import Limits
 from paperlite.inspect import WindowInspector
 from paperlite.logutil import log_event
@@ -57,6 +60,7 @@ _NO_IP_WAIT_S = 5.0
 class BrowserStats:
     success: int = 0
     failed: int = 0
+    non_pdf: int = 0         # 要 PDF 却打开的是网页
     pages: int = 0           # 成功保存的页数（= success）
     browsers: int = 0        # 首篇打开成功（验证可用）的浏览器数
     probe_failed: int = 0    # 新浏览器首篇失败、换掉 IP 的次数
@@ -266,6 +270,21 @@ class BrowserPool:
             await self._observe(task, r)      # 失效页也进巡检：整批 404 同标题可归纳规则、跳过其余 pending
             self.stats.add("failed")
             logger.info("网页 HTTP %d %s %s", code, task.url, r.title)
+            return "ok"
+
+        if task.url_type == UrlType.PDF:
+            # 浏览器拿到的只能是网页：要 PDF 的任务记 non_pdf，不记成功；网页留在 non_pdf/ 里备查
+            kind = classify_html(r.html)
+            body = r.html.encode("utf-8")
+            keep = self.out / "non_pdf" / dest.name
+            keep.parent.mkdir(parents=True, exist_ok=True)
+            keep.write_bytes(body)
+            await asyncio.to_thread(self.db.finish, task, Status.NON_PDF, http_status=code, file_size=len(body),
+                                    elapsed_ms=elapsed, exit_ip=lease.exit_ip, error_kind=kind,
+                                    title=r.title or None, final_url=r.url or None)
+            await self._observe(task, r)
+            self.stats.add("non_pdf")
+            logger.info("non_pdf %s %s %s", kind, task.url, r.title)
             return "ok"
 
         body = r.html.encode("utf-8")

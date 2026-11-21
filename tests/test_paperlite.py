@@ -1201,6 +1201,20 @@ class BrowserPoolTest(unittest.TestCase):
         self.assertEqual(sum(r["status"] == "success" for r in rows), 3)
         self.assertEqual(self.db.q.skip_counts(), {"title_dup": 3})
 
+    def test_pdf_task_getting_a_web_page_is_non_pdf(self):
+        """浏览器只能拿到网页：要 PDF 的任务打开的是摘要页，记 non_pdf（按页面分类），不能记成功。"""
+        from paperlite.browser import RenderResult
+        url = "https://linkinghub.elsevier.com/retrieve/pii/0001691855900019"
+        self.db.import_urls([{"url": url, "url_type": "pdf"}])
+        pool = self.run_pool(lambda u: RenderResult(ok=True, seconds=1.0, url="https://www.sciencedirect.com/x",
+                                                    status=200, title="Abstract page", html="<title>Abstract</title>"),
+                             [])
+        self.assertEqual((pool.stats.success, pool.stats.non_pdf, pool.stats.failed), (0, 1, 0))
+        r = self.row(url)
+        self.assertEqual((r["status"], r["error_kind"], r["url_type"], r["file_path"]),
+                         ("non_pdf", "landing_page", "pdf", None))
+        self.assertEqual(len(list((self.out / "non_pdf").glob("*.html"))), 1)       # 网页留在 non_pdf/ 备查
+
     def test_404_fails_without_retry(self):
         from paperlite.browser import RenderResult
         gone = "https://www.sciencedirect.com/science/article/abs/pii/404"
@@ -1497,21 +1511,29 @@ class CliArgsTest(unittest.TestCase):
         self.fails("status", "--out", "o")        # --out 已移除
         self.fails("import", "--host", "h")       # --host 已移除
 
-    # 文档 import 行：--urls 必填；--type 为 pdf|html 默认 pdf
+    # 文档 import 行：--urls 必填；--type 为 pdf|html，不写时取配置 [run] url_type（没有则 pdf）
     def test_import(self):
-        from paperlite.tasks import UrlType
+        from paperlite.cli import _url_type
+        import argparse
         self.fails("import")                                   # 缺 --urls
         ns = self.parse("import", "--urls", "acm.txt")
-        self.assertEqual(ns.type, UrlType.PDF)
+        self.assertIsNone(ns.type)
         self.assertEqual(self.parse("import", "--urls", "x", "--type", "html").type, "html")
         self.fails("import", "--urls", "x", "--type", "xml")   # 非法 choice
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "c.toml"
+            ns = lambda t=None: argparse.Namespace(config=str(cfg), type=t)
+            self.assertEqual(_url_type(ns()), "pdf")           # 没有配置文件
+            cfg.write_text('[run]\nurl_type = "html"\n')
+            self.assertEqual(_url_type(ns()), "html")          # 跟配置走：以前这里固定是 pdf，整批类型记错
+            self.assertEqual(_url_type(ns("pdf")), "pdf")      # 命令行优先
 
     # 文档 run 行：--workers 默认 20；--curl/--browser 互斥；--no-proxy；--type
     def test_run(self):
         ns = self.parse("run")
         self.assertEqual(ns.workers, 20)
         self.assertFalse(ns.browser or ns.curl or ns.no_proxy)
-        self.assertEqual(ns.type, "pdf")
+        self.assertIsNone(ns.type)                             # 不写时取配置 [run] url_type
         self.assertIsNone(ns.config_file)                      # 裸 run：无配置文件，用 flag
         self.assertTrue(self.parse("run", "--browser", "--no-proxy").no_proxy)
         self.fails("run", "--browser", "--curl")               # 互斥

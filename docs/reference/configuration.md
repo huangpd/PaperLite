@@ -65,7 +65,7 @@
 | `proxy` | true | false 等同于 `--no-proxy`，仅浏览器模式 |
 | `workers` | 20 | 浏览器模式为并发浏览器数，curl 模式为下载线程数 |
 | `urls` | 空 | 启动时先导入的 URL 文件。多台机器时只在一台上填 |
-| `url_type` | `pdf` | `pdf`（期望拿到 PDF）或 `html`（保存网页本身）；CSV 的 `url_type` 列逐行覆盖 |
+| `url_type` | `pdf` | `pdf`（期望拿到 PDF）或 `html`（保存网页本身）。`run` 顺带导入和单独执行 `paperlite import`（不写 `--type` 时）都按它；CSV 的 `url_type` 列逐行覆盖 |
 | `headed` | false | 仅浏览器模式：显示浏览器窗口（调试） |
 
 ## `[limits]` 并发与行为

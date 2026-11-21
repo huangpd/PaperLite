@@ -21,11 +21,12 @@ pkill -f "paperlite run"                                          # 优雅停止
 
 ```bash
 paperlite import --urls batch.csv                 # 导入到 [pg] 的批次
-paperlite import --urls pages.txt --type html     # 要网页本身而不是 PDF
+paperlite import --urls pages.txt --type html     # 要网页本身而不是 PDF（不写 --type 时取配置 [run] url_type）
 ```
 
 - 文本文件一行一个 URL，保持原顺序。
 - CSV 需要 `url` 列，可选 `doi`、`source`、`batch_no`、`url_type`（逐行覆盖 `--type`）。
+- 链接类型要和下载方式对上：DOI 解析出来的文章页（`linkinghub.elsevier.com/retrieve/...` 这类）是网页，应导入为 `html`；浏览器模式下导入成 `pdf` 的任务只会得到网页，记为 `non_pdf`。
 - 入库时按 (主机, DOI) 排序、切成块（默认 1000 条，`[pg] chunk_size`）：同一出版商、同一期刊的 DOI 前缀相同，排序后连在一起，一块只打一个站点。没有 `doi` 列时从 URL 里认 DOI，认不出的用 URL 哈希。
 - CSV 格式错误（如未加引号的逗号）会报出行号并中止导入。
 - 明显下载不到的链接直接剔除、不入库：内网 / 本机 IP（`10.x`、`172.16–31.x`、`192.168.x`、`127.x` 等）、主机名不合法（`https://.asm.org/…`、`http://0`、`http://null/…`）、不是 http/https。日志里打一行按原因的计数，明细写到输入文件旁边的 `<文件名>.bad_url.csv`。公网 IP 形式的主机放行（有些小期刊就是 IP 建站），打不开的交给下载时处理。

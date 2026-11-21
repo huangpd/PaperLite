@@ -48,7 +48,7 @@ paperlite import --urls FILE [--type pdf|html] [--source S] [--batch B]
 | 参数 | 说明 |
 |---|---|
 | `--urls` | 一行一个 URL 的文本文件，或带 `url` 列的 CSV（可选 `doi`、`source`、`batch_no`、`url_type` 列） |
-| `--type` | `pdf`（默认，期望拿到 PDF）或 `html`（整页保存为 `.html`）；CSV 的 `url_type` 列逐行覆盖 |
+| `--type` | `pdf`（期望拿到 PDF）或 `html`（整页保存为 `.html`）。不写时取配置文件 `[run] url_type`，没有则 `pdf`；CSV 的 `url_type` 列逐行覆盖 |
 | `--source`、`--batch` | 写入 `source`、`batch_no` 列（`batch_no` 只是标注，批次由 `[pg] batch` 决定） |
 
 入库时按 (主机, DOI) 排序并切块。重复导入不会重置已有任务。详见[日常运维](../guide/operations.md#导入任务)。
