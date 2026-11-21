@@ -195,6 +195,12 @@ def heartbeat(**snapshot: Any) -> None:
     _reporter.emit(schema.HEARTBEAT, **snapshot)
 
 
+def task_snapshot(mode: str, counts: dict[str, int], online: int, workers: int) -> dict[str, Any]:
+    """心跳内容：在线浏览器数 + 任务队列按状态的计数（监控面板「实时任务」）。"""
+    return {"mode": mode, "browsers_online": online, "workers": workers, "pending": counts["pending"],
+            "running": counts["running"], "success": counts["success"], "failed": counts["failed"]}
+
+
 class Heartbeat:
     """后台线程每 heartbeat_s 调 snapshot() 上报一次实时量；未启用上报时不建线程。"""
 

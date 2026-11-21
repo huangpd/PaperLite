@@ -30,23 +30,21 @@ import os
 import signal
 import socket
 import sys
-import threading
-import time
 from datetime import datetime
 from pathlib import Path
 
 from paperlite import __version__
 from paperlite import config as config_mod
 from paperlite.config import Limits, Paths, RunConfig
-from paperlite.browser.pool import BrowserPool
-from paperlite.curl.downloader import Downloader
+from paperlite.browser.runner import run_browser
+from paperlite.browser.session import require_geoip
+from paperlite.config import ProxySettings
+from paperlite.curl.identity import IdentityStore
+from paperlite.curl.runner import run_curl, run_producer
+from paperlite.errors import UserError
 from paperlite import logutil
 from paperlite.logutil import setup_logging
-from paperlite.curl.producer import Producer
-from paperlite.config import ProxySettings
-from paperlite.proxy import IpSource
-from paperlite.curl.identity import IdentityStore
-from paperlite.taskq import PgTaskQueue, PgTaskSource
+from paperlite.taskq import PgTaskQueue, PgTaskSource, importer
 from paperlite.tasks import ERROR_KINDS, Status, UrlType
 
 logger = logging.getLogger("paperlite")
@@ -128,76 +126,6 @@ def _open_store(args) -> IdentityStore:
         raise SystemExit(f"连接 PostgreSQL 失败: {e}")
 
 
-def _require_geoip(cfg) -> None:
-    """geoip=true：启动前确保 GeoIP 库就位——缺失则限时下载一次；下不动就快速报错给手动预置指引
-    （而不是让 cloakbrowser 每次启动都卡 5 分钟重试）。"""
-    if not cfg.geoip:
-        return
-    from paperlite.browser.session import ensure_geoip_db
-    ok, path, url = ensure_geoip_db()
-    if ok:
-        return
-    raise SystemExit(
-        f"geoip = true，但 GeoIP 库下载不下来（服务器/受限网络常连不上 GitHub），这里先拦下不让它卡死。\n"
-        f"目标路径：{path}\n"
-        f"请手动装好再跑，二选一：\n"
-        f"  1) 能连 GitHub 的机器上下载后放到该路径（或在别处下好 scp 过去）：\n"
-        f"     curl -L --create-dirs -o '{path}' '{url}'\n"
-        f"  2) 不用 geoip（WebRTC 伪造仍由 webrtc_spoof 保留）：在 config.toml 的 [limits] 设 geoip = false")
-
-
-def _read_url_file(path: str):
-    """txt：一行一个链接；CSV：表头含 url（或旧名 pdf_url），可选 doi / source / batch_no / url_type。"""
-    with open(path, encoding="utf-8-sig", newline="") as f:
-        first = f.readline()
-        f.seek(0)
-        if "url" in first or "pdf_url" in first:
-            yield from _read_csv_clustered(path)
-        else:
-            yield from ({"url": line.strip()} for line in f if line.strip().startswith("http"))
-
-
-def _read_csv_clustered(path: str):
-    """
-    用 DuckDB 读 CSV，按 (DOI, url) 排序后逐行产出，字段与 csv.DictReader 相同（空单元格为 None）。
-    不写任何出版商规则：DOI 是"前缀/后缀"结构，按字符串排序后同一前缀（出版商）、同一后缀开头（期刊代码）
-    的任务自然连在一起（"." "/" 排在字母数字之前，j.ajog.* 与 j.ajogmf.* 不会交错）。任务按 id 领取，
-    同一期刊的任务连号，浏览器少在站点间来回切。
-    没有 doi 列时从 URL 里认 DOI；认不出 DOI 的行排在最后。url（或 pdf_url）为空的行跳过。
-    """
-    import duckdb
-    safe = str(Path(path).resolve()).replace("'", "''")
-    src = f"read_csv('{safe}', header=true, all_varchar=true, delim=',', quote='\"', escape='\"')"
-    con = duckdb.connect()
-    try:
-        try:
-            cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()]
-        except duckdb.Error as e:
-            raise SystemExit(f"读取 CSV 失败 {path}: {e}")
-        quoted = {c: '"' + c.replace('"', '""') + '"' for c in cols}
-        url_cols = [quoted[c] for c in ("url", "pdf_url") if c in quoted]
-        if not url_cols:
-            return
-        url = "coalesce(" + ", ".join(f"nullif(trim({c}), '')" for c in url_cols) + ")"
-        doi = ", ".join(f"nullif(trim({quoted[c]}), '')" for c in ("doi", "paper_uid") if c in quoted)
-        doi_key = (f"lower(coalesce({doi + ', ' if doi else ''}"
-             f"nullif(regexp_extract({url}, '(10\\.[0-9]{{4,9}}/[^\\s?#]+)', 1), '')))")
-        sql = (f"SELECT {', '.join(quoted[c] for c in cols)} FROM (SELECT *, {doi_key} AS __pl_doi FROM {src}) "
-               f"WHERE {url} IS NOT NULL ORDER BY __pl_doi NULLS LAST, {url}")
-        try:
-            cur = con.execute(sql)
-        except duckdb.Error as e:
-            raise SystemExit(f"读取 CSV 失败 {path}: {e}")
-        while True:
-            chunk = cur.fetchmany(50000)
-            if not chunk:
-                return
-            for row in chunk:
-                yield dict(zip(cols, row))
-    finally:
-        con.close()
-
-
 def _url_type(args) -> str:
     """导入的默认链接类型：命令行 --type > 配置文件 [run] url_type > pdf。
     以前 import 不写 --type 就固定是 pdf，和配置里写的 url_type = "html" 对不上，整批类型会记错。"""
@@ -211,138 +139,40 @@ def _url_type(args) -> str:
         raise SystemExit(f"配置错误: {e}")
 
 
-def _import(db: PgTaskSource, path: str, source: str = "", batch: str = "", url_type: str = UrlType.PDF) -> None:
-    """url_type 是整批的默认类型；CSV 里的 url_type 列逐行覆盖。"""
-    rows = ({**r, "source": r.get("source") or source, "batch_no": r.get("batch_no") or batch,
-             "url_type": (r.get("url_type") or "").strip() or url_type}
-            for r in _read_url_file(path))
-    try:
-        added, existed = db.import_urls(rows)
-    except ValueError as e:
-        raise SystemExit(str(e))
-    logger.info("导入 %s：新增 %d，已存在 %d（已存在的不重置）", path, added, existed)
-    _report_rejected(path, db.q.last_rejected)
+def _attach_monitor(args):
+    """返回给 runner 的挂监控函数：[monitor] enabled 时启用上报 + 心跳，未配置返回 None。批次名 = 配置文件名（不含扩展名）。"""
+    from paperlite.monitor import reporter as mon
+    path = config_mod.resolve_path(args.config)
 
-
-def _report_rejected(path: str, rejected: list) -> None:
-    """明显坏的链接没入库：按原因打一行日志，明细写到输入文件旁边的 <文件名>.bad_url.csv。"""
-    if not rejected:
-        return
-    from collections import Counter
-    by = Counter(reason for _, reason in rejected)
-    out = Path(path).with_name(Path(path).name + ".bad_url.csv")
-    try:
-        with open(out, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["doi", "url", "reason"])
-            for r, reason in rejected:
-                w.writerow([r.get("doi") or r.get("paper_uid") or "", r.get("url") or r.get("pdf_url") or "", reason])
-        where = f"，明细见 {out}"
-    except OSError as e:
-        where = f"（明细写不了 {out}: {e}）"
-    logger.warning("剔除明显下载不到的链接 %d 条，未入库：%s%s", len(rejected),
-                   "，".join(f"{k} {n}" for k, n in by.most_common()), where)
-
-
-class _ProducerThread:
-    """后台线程跑生产者。结束用 finished 事件判断：信号打断 Thread.join() 后 is_alive() 可能误报已结束。"""
-
-    def __init__(self, cfg, store, proxy, host, sample_url=None) -> None:
-        self.stop = threading.Event()
-        self.finished = threading.Event()
-        self._producer = Producer(cfg, store, IpSource(proxy), host, sample_url=sample_url)
-        threading.Thread(target=self._run, name="producer", daemon=True).start()
-
-    def _run(self) -> None:
+    def attach(snapshot):
         try:
-            asyncio.run(self._producer.run(self.stop))
-        finally:
-            self.finished.set()
+            return mon.attach(path, path.stem, snapshot)
+        except (TypeError, ValueError) as e:
+            raise UserError(f"配置错误: {e}") from e
+    return attach
 
-    def shutdown(self, timeout_s: float) -> None:
-        self.stop.set()
-        if not self.finished.wait(timeout_s):
-            logger.warning("生产者 %.0fs 内未退出", timeout_s)
+
+def _open_for_run(args) -> tuple[PgTaskSource, Path]:
+    """run / download 前的准备：打开任务队列、导入 --urls（有的话）、定输出目录。之后 db 交给 runner 关闭。"""
+    db = _open_db(args)
+    try:
+        if args.urls:
+            importer.import_file(db, args.urls, url_type=_url_type(args))
+        return db, _storage_dir(args, _paths(args))
+    except BaseException:
+        db.close()
+        raise
+
+
+def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
+    db, out = _open_for_run(args)
+    run_browser(cfg, proxy, db, out, args.workers, no_proxy=no_proxy, attach_monitor=_attach_monitor(args))
 
 
 def _download(args, cfg, proxy, store, with_producer: bool) -> None:
-    db = _open_db(args)
-    if args.urls:
-        _import(db, args.urls, url_type=_url_type(args))
-    hs = db.hosts()
-    if len(hs) > 1:
-        db.close()
-        raise SystemExit(f"curl 模式需单主机，本库有 {len(hs)} 个：{'、'.join(hs[:5])}。"
-                         f"混多主机请去掉 --curl 用浏览器模式")
-    out = _storage_dir(args, _paths(args))
-    try:
-        dl = Downloader(cfg, store, proxy, db, out, args.workers)
-    except ValueError as e:
-        db.close()
-        raise SystemExit(str(e))
-    c = db.counts()
-    logger.info("输出目录 %s，任务队列 %s", out, db.path)
-    logger.info("%s：待下载 %d，已成功 %d，non_pdf %d，失败 %d；下载线程 %d", dl.host, c[Status.PENDING],
-                c[Status.SUCCESS], c[Status.NON_PDF], c[Status.FAILED], args.workers)
-    if not c[Status.PENDING]:
-        db.close()
-        return
-    producer = (_ProducerThread(cfg, store, proxy, dl.host, sample_url=lambda: db.q.sample_pending_url(dl.host))
-                if with_producer else None)
-    stop = threading.Event()
-    threading.Thread(target=_report, args=(dl, store, cfg, stop), daemon=True, name="report").start()
-    monitor = _attach_monitor(args, lambda: _snapshot("curl", dl.db, dl.stats, 0, args.workers))
-    t0 = time.monotonic()
-    try:
-        dl.run(stop)
-    except KeyboardInterrupt:
-        logger.info("中断：结果已写回，没做完的块已交还，可重跑继续")
-    finally:
-        stop.set()
-        if producer is not None:
-            producer.shutdown(cfg.pass_timeout_s + 30)
-        if monitor is not None:
-            monitor.close()
-        db.close()
-    s = dl.stats
-    logger.info("结束: 用时 %.1f 分钟，success %d，non_pdf %d，failed %d，用身份 %d 个，丢弃身份 %d 次，"
-                "URL 被单独挑战 %d 次", (time.monotonic() - t0) / 60, s.success,
-                s.non_pdf, s.failed, s.identities, s.rejected, s.challenged)
-
-
-def _attach_monitor(args, snapshot):
-    """[monitor] enabled 时启用监控上报 + 心跳；未配置返回 None。批次名 = 配置文件名（不含扩展名）。"""
-    from paperlite.monitor import reporter as mon
-    path = config_mod.resolve_path(args.config)
-    try:
-        return mon.attach(path, path.stem, snapshot)
-    except (TypeError, ValueError) as e:
-        raise SystemExit(f"配置错误: {e}")
-
-
-def _snapshot(mode: str, db: PgTaskSource, stats, online: int, workers: int) -> dict:
-    """心跳内容：在线浏览器数 + 任务队列计数（监控面板「实时任务」）。"""
-    c = db.counts()
-    return {"mode": mode, "browsers_online": online, "workers": workers, "pending": c[Status.PENDING],
-            "running": c[Status.RUNNING], "success": c[Status.SUCCESS], "failed": c[Status.FAILED]}
-
-
-def _report(dl: Downloader, store: IdentityStore, cfg: Limits, stop: threading.Event) -> None:
-    """每 30s 一行。速度按"已处理"（成功 + non_pdf + failed）算：non_pdf 成片时只看成功数会误以为变慢。
-    成功含 PDF 任务和网页任务（url_type=html 存 .html），文案不写 PDF。"""
-    s = dl.stats
-    last_done, last_pdf, last_t = 0, 0, time.monotonic()
-    while not stop.wait(30):
-        st = store.stats(dl.host, cfg.refill_before_s)
-        c = dl.db.counts()
-        now = time.monotonic()
-        done = s.success + s.non_pdf + s.failed
-        minutes = (now - last_t) / 60
-        logger.info("进度: 已处理 %d（成功 %d，non_pdf %d，失败 %d），待下载 %d | 身份 空闲 %d 占用 %d "
-                    "| 近 30s 处理 %.0f 条/分钟，其中成功 %.0f 篇/分钟",
-                    done, s.success, s.non_pdf, s.failed, c[Status.PENDING] + c[Status.RUNNING],
-                    st.ready, st.inuse, (done - last_done) / minutes, (s.success - last_pdf) / minutes)
-        last_done, last_pdf, last_t = done, s.success, now
+    db, out = _open_for_run(args)
+    run_curl(cfg, proxy, store, db, out, args.workers, with_producer=with_producer,
+             attach_monitor=_attach_monitor(args))
 
 
 def _status(args, cfg) -> None:
@@ -429,42 +259,6 @@ def _turnstile(args, parser) -> None:
         sys.exit(f"失败: {r.error}")
 
 
-def _browse(args, cfg, proxy, no_proxy: bool = False) -> None:
-    """浏览器下载模式：每个浏览器+IP 过盾一次后连续下同域名多篇（整页存 .html）。不用身份池。"""
-    db = _open_db(args)
-    if args.urls:
-        _import(db, args.urls, url_type=_url_type(args))
-    out = _storage_dir(args, _paths(args))
-    try:
-        pool = BrowserPool(cfg, proxy, db, out, args.workers, no_proxy=no_proxy)
-    except ValueError as e:
-        db.close()
-        raise SystemExit(str(e))
-    c = db.counts()
-    logger.info("输出目录 %s，任务队列 %s", out, db.path)
-    logger.info("%s：待下载 %d，已成功 %d，失败 %d；浏览器 %d", pool.host, c[Status.PENDING],
-                c[Status.SUCCESS], c[Status.FAILED], pool.workers)
-    if not c[Status.PENDING]:
-        db.close()
-        return
-    stop = threading.Event()
-    threading.Thread(target=_browse_report, args=(pool, cfg, stop), daemon=True, name="report").start()
-    monitor = _attach_monitor(args, lambda: _snapshot("browser", pool.db, pool.stats, pool.online(), pool.workers))
-    t0 = time.monotonic()
-    try:
-        pool.run(stop)
-    except KeyboardInterrupt:
-        logger.info("中断：结果已写回，没做完的块已交还，可重跑继续")
-    finally:
-        stop.set()
-        if monitor is not None:
-            monitor.close()
-        db.close()
-    s = pool.stats
-    logger.info("结束: 用时 %.1f 分钟，success %d，non_pdf %d，failed %d，启动浏览器 %d 个",
-                (time.monotonic() - t0) / 60, s.success, s.non_pdf, s.failed, s.browsers)
-
-
 def _inspect(args) -> None:
     """巡检（全批次）：同标题重复到阈值就归纳 doi/url 规则，命中的未采任务记跳过、不再领取。
     下载时浏览器模式另有块内实时巡检（PgTaskSource），规则同样记入 pl_skip_rules。"""
@@ -494,19 +288,6 @@ def _inspect(args) -> None:
               f"累计规则 {len(q.skip_rules())} 条、跳过 {q.skip_counts().get('title_dup', 0)} 条")
     finally:
         db.close()
-
-
-def _browse_report(pool: BrowserPool, cfg: Limits, stop: threading.Event) -> None:
-    s = pool.stats
-    last_done, last_t = 0, time.monotonic()
-    while not stop.wait(30):
-        c = pool.db.counts()
-        now = time.monotonic()
-        done = s.success + s.non_pdf + s.failed
-        rate = (done - last_done) / max((now - last_t) / 60, 1e-9)
-        last_done, last_t = done, now
-        logger.info("进度: 成功 %d non_pdf %d 失败 %d 待下载 %d running %d | 浏览器 %d | 近 30s %.0f 篇/分钟",
-                    s.success, s.non_pdf, s.failed, c[Status.PENDING], c[Status.RUNNING], pool.workers, rate)
 
 
 def _raise_interrupt(signum, frame):
@@ -641,6 +422,13 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
 
 
 def main() -> None:
+    try:
+        _main()
+    except UserError as e:
+        raise SystemExit(str(e)) from None
+
+
+def _main() -> None:
     ap, parsers = _build_parser()
     args = ap.parse_args()
     if args.cmd is None:
@@ -690,7 +478,7 @@ def main() -> None:
     if args.cmd == "import":
         db = _open_db(args)
         try:
-            _import(db, args.urls, args.source, args.batch, _url_type(args))
+            importer.import_file(db, args.urls, args.source, args.batch, _url_type(args))
             logger.info("任务队列 %s", db.path)
         finally:
             db.close()
@@ -719,7 +507,7 @@ def main() -> None:
             cfg, proxy = _load(args.config)
         if args.headed:
             cfg = dataclasses.replace(cfg, headed=True)
-        _require_geoip(cfg)
+        require_geoip(cfg)
         _browse(args, cfg, proxy, no_proxy=args.no_proxy)
         return
 
@@ -731,23 +519,11 @@ def main() -> None:
         return
 
     cfg, proxy = _load(args.config)                 # produce / download / run --curl
-    _require_geoip(cfg)                             # curl 模式过盾也用浏览器，同样需要 GeoIP 库
+    require_geoip(cfg)                              # curl 模式过盾也用浏览器，同样需要 GeoIP 库
     store = _open_store(args)
     try:
         if args.cmd == "produce":
-            db = _open_db(args)
-            host = db.host()
-            if not host:
-                db.close()
-                raise SystemExit("任务队列是空的，先 import")
-            producer = _ProducerThread(cfg, store, proxy, host, sample_url=lambda: db.q.sample_pending_url(host))
-            try:
-                while not producer.finished.wait(1):
-                    pass
-            except KeyboardInterrupt:
-                producer.shutdown(cfg.pass_timeout_s + 30)
-            finally:
-                db.close()
+            run_producer(cfg, proxy, store, _open_db(args))
         else:
             _download(args, cfg, proxy, store, with_producer=args.cmd == "run")
     finally:
