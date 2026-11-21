@@ -46,13 +46,14 @@ class PdfCapture:
     """一个页面一次下载用；用完 close()。result 在截到合格的 PDF 后完成，errors 记校验失败原因。"""
 
     def __init__(self, session: Any, target_url: str, dest: Path, max_bytes: int, min_bytes: int,
-                 proxy_auth: Optional[tuple[str, str]]) -> None:
+                 proxy_auth: Optional[tuple[str, str]], stall_s: float = 120) -> None:
         self.session = session
         self.target_url = target_url
         self.dest = Path(dest)
         self.max_bytes = max_bytes
         self.min_bytes = min_bytes
         self.proxy_auth = proxy_auth
+        self.stall_s = stall_s                 # 连续这么久读不到新数据算卡死（与 curl 模式的 download_timeout_s 一致，不限总时长）
         self.result: asyncio.Future[CapturedPdf] = asyncio.get_running_loop().create_future()
         self.errors: list[str] = []
         self._tasks: set[asyncio.Task] = set()
@@ -61,9 +62,10 @@ class PdfCapture:
 
     @classmethod
     async def create(cls, context: Any, page: Any, target_url: str, dest: Path, *, max_bytes: int,
-                     min_bytes: int, proxy_auth: Optional[tuple[str, str]] = None) -> "PdfCapture":
+                     min_bytes: int, proxy_auth: Optional[tuple[str, str]] = None,
+                     stall_s: float = 120) -> "PdfCapture":
         session = await context.new_cdp_session(page)
-        cap = cls(session, target_url, dest, max_bytes, min_bytes, proxy_auth)
+        cap = cls(session, target_url, dest, max_bytes, min_bytes, proxy_auth, stall_s)
         session.on("Fetch.requestPaused", cap._schedule)
         session.on("Fetch.authRequired", cap._schedule_auth)
         await session.send("Fetch.enable", {
@@ -157,7 +159,11 @@ class PdfCapture:
             raw = written = 0
             with open(part, "wb") as out:
                 while True:
-                    item = await self.session.send("IO.read", {"handle": handle, "size": 1024 * 1024})
+                    try:
+                        item = await asyncio.wait_for(
+                            self.session.send("IO.read", {"handle": handle, "size": 1024 * 1024}), self.stall_s)
+                    except asyncio.TimeoutError:
+                        raise ValueError(f"下载卡住：{self.stall_s:.0f}s 内没有收到新数据（已收 {raw} 字节）") from None
                     data = item.get("data", "")
                     # 块恰为合法 UTF-8 时 Chrome 返回文本：按 UTF-8 还原就是原始字节（latin-1 会写坏 PDF）
                     chunk = base64.b64decode(data) if item.get("base64Encoded") else data.encode("utf-8")

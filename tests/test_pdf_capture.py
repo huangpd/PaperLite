@@ -70,6 +70,31 @@ class PdfCaptureTest(unittest.TestCase):
             self.assertIn(needle, cap.last_error)
             self.assertFalse(self.dest.exists() or self.dest.with_name("x.pdf.part").exists(), needle)
 
+    def test_stalled_stream_gives_up(self):
+        """连续 stall_s 秒读不到新数据算卡死：放弃、删掉半截文件，不无限等。"""
+        class Stalling(FakeCdp):
+            reads = 0
+
+            async def send(self, method, params=None):
+                if method == "IO.read":
+                    self.reads += 1
+                    if self.reads == 1:                     # 第一块正常、没结束
+                        data = b"%PDF-1.4" + b"x" * 2000
+                        return {"data": base64.b64encode(data).decode(), "base64Encoded": True, "eof": False}
+                    await asyncio.sleep(10)                 # 之后再也不来数据
+                return await super().send(method, params)
+
+        async def go():
+            cdp = Stalling([])
+            cap = PdfCapture(cdp, "https://x.org/a.pdf", self.dest, 10_000, 10, None, stall_s=0.05)
+            await cap._on_paused(paused("https://x.org/a.pdf", headers={"Content-Type": "application/pdf"}))
+            return cap, cdp
+        cap, cdp = asyncio.run(go())
+        self.assertFalse(cap.result.done())
+        self.assertIn("下载卡住", cap.last_error)
+        self.assertFalse(self.dest.exists() or self.dest.with_name("x.pdf.part").exists())
+        self.assertIn("Fetch.failRequest", cdp.methods())          # 取走了响应流，只能中止原请求
+
     def test_html_response_passes_through(self):
         cap, cdp = self.run_capture([], {"Content-Type": "text/html; charset=utf-8"})
         self.assertFalse(cap.result.done())

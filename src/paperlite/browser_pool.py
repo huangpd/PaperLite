@@ -220,7 +220,8 @@ class BrowserPool:
         want_pdf = task.url_type == UrlType.PDF
         r = await session.render(task.url, self.cfg.pass_timeout_s,
                                  pdf_dest=pdf_path(self.out, task.doi) if want_pdf else None,
-                                 max_bytes=self.cfg.max_file_size_mb * 1024 * 1024, min_bytes=self.cfg.min_file_size)
+                                 max_bytes=self.cfg.max_file_size_mb * 1024 * 1024, min_bytes=self.cfg.min_file_size,
+                                 stall_s=self.cfg.download_timeout_s)
         elapsed = int((time.monotonic() - t0) * 1000)
         host = urlsplit(task.url).hostname or ""
         code = r.status or 200

@@ -289,7 +289,7 @@ class BrowserSession:
         self.clicker = TurnstileClicker()
 
     async def render(self, url: str, timeout_s: float, settle_s: float = 2.0, *, pdf_dest: Optional[Path] = None,
-                     max_bytes: int = 200 * 1024 * 1024, min_bytes: int = 1024) -> RenderResult:
+                     max_bytes: int = 200 * 1024 * 1024, min_bytes: int = 1024, stall_s: float = 120) -> RenderResult:
         """
         在常驻浏览器里打开 url，让它自己完成跳转（HTTP 3xx、meta refresh、JS 跳转）和 Cloudflare 挑战
         （交互式 Turnstile 自动点），等页面不再是挑战页、无待执行 meta refresh、地址 settle_s 秒不变后返回。
@@ -310,7 +310,7 @@ class BrowserSession:
                 auth = ((self.proxy["username"], self.proxy.get("password", ""))
                         if self.proxy and self.proxy.get("username") else None)
                 capture = await PdfCapture.create(self.context, page, url, pdf_dest, max_bytes=max_bytes,
-                                                  min_bytes=min_bytes, proxy_auth=auth)
+                                                  min_bytes=min_bytes, proxy_auth=auth, stall_s=stall_s)
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
             except Exception:
