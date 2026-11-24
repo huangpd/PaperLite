@@ -1,6 +1,16 @@
-# PostgreSQL（任务队列 + 监控面板数据）。用法见 docs/guide/postgres.md：
-#   echo "PG_PASS=$(openssl rand -hex 24)" > .env && chmod 600 .env && docker compose up -d
-# 各机器 config.toml：[pg] dsn = "postgresql://paperlite:<PG_PASS>@<本机 IP>:5432/paperlite"
+# PaperLite PostgreSQL：任务队列、身份池、监控数据。说明见 docs/guide/postgres.md
+#
+# 启动：
+#   echo "PG_PASS=$(openssl rand -hex 24)" > .env && chmod 600 .env
+#   docker compose up -d
+#
+# 客户端（config.toml）：
+#   [pg] dsn = "postgresql://paperlite:<PG_PASS>@<PG 主机 IP>:5432/paperlite"
+#
+# 数据：Docker 命名卷 paperlite-pg-data，由 Docker 管理。
+#   查看位置：docker volume inspect paperlite-pg-data --format '{{ .Mountpoint }}'
+#   备份：    docker exec paperlite-pg pg_dump -U paperlite -Fc paperlite > paperlite.dump
+
 services:
   postgres:
     image: postgres:16
@@ -10,17 +20,39 @@ services:
       POSTGRES_USER: paperlite
       POSTGRES_PASSWORD: ${PG_PASS:?请先在 .env 里设 PG_PASS}
       POSTGRES_DB: paperlite
-    # 按 16GB 内存的机器配：shared_buffers ≈ 内存 1/4（2GB 起），effective_cache_size ≈ 1/2
-    # random_page_cost / effective_io_concurrency 按 SSD（云盘）配；pg_stat_statements 只能启动时加载
-    command: ["postgres", "-c", "max_connections=300", "-c", "shared_buffers=2GB",
-              "-c", "effective_cache_size=8GB", "-c", "maintenance_work_mem=512MB", "-c", "max_wal_size=4GB",
-              "-c", "work_mem=16MB", "-c", "random_page_cost=1.1", "-c", "effective_io_concurrency=200",
-              "-c", "shared_preload_libraries=pg_stat_statements"]
-    shm_size: 1g                      # Docker 默认 64MB，大查询会报 could not resize shared memory
-    oom_score_adj: -800               # 内存紧张时内核先杀浏览器，别先杀 PG（不设 mem_limit：那是让 PG 先被杀）
+      # 不要设置 PGDATA：已有数据在卷根目录，改成子目录会初始化出一个空库
+    command:
+      - postgres
+      # 连接：每个下载进程 1 条；超过时前面加 pgbouncer（transaction 模式）
+      - -c
+      - max_connections=300
+      # 内存：按 16GB 主机配置，其他规格按比例调整
+      - -c
+      - shared_buffers=2GB            # 约内存 1/4
+      - -c
+      - effective_cache_size=8GB      # 约内存 1/2
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=512MB
+      # 写入：大批量导入时减少检查点
+      - -c
+      - max_wal_size=4GB
+      # 存储：SSD / 云盘
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      # 扩展：只能在启动时加载
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+    shm_size: 1g                      # 默认 64MB，并行查询可能报 "could not resize shared memory"
+    oom_score_adj: -800               # 内存不足时降低被 OOM killer 选中的优先级
     ports:
-      - "5432:5432"                   # 只对内网开放：安全组 / 防火墙限制来源网段；也可写成 "<内网IP>:5432:5432" 只绑内网网卡
+      - "5432:5432"                   # 仅允许内网访问（安全组 / 防火墙）；或写 "<内网 IP>:5432:5432"
     volumes:
       - pg-data:/var/lib/postgresql/data
+
 volumes:
   pg-data:
+    name: paperlite-pg-data           # 固定卷名，不随 compose 项目名变化；已存在则直接沿用
