@@ -43,6 +43,17 @@ class PgQueueTest(unittest.TestCase):
         self.queues.append(q)
         return q
 
+    def test_schema_sets_autovacuum_once(self):
+        """建表时就把任务表的 autovacuum 阈值设好（不靠人记得手动执行）；再次打开不重复 ALTER。"""
+        import psycopg
+        self.q(), self.q(worker="w2")
+        with psycopg.connect(DSN) as c:
+            opts = c.execute("SELECT reloptions FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                             "WHERE n.nspname = %s AND c.relname = 'pl_tasks'", (self.schema,)).fetchone()[0]
+        self.assertIn("autovacuum_vacuum_scale_factor=0.02", opts)
+        self.assertIn("autovacuum_analyze_scale_factor=0.02", opts)
+        self.assertIn("fillfactor=80", opts)
+
     def test_import_sorts_dedups_and_chunks_per_host(self):
         q = self.q()
         rows = _rows(2500, hosts=("a.com", "a.com", "b.com"))

@@ -36,20 +36,16 @@ batch = "10.1016-2026-11"
 | 项目 | 说明 |
 |---|---|
 | 连接数 | 每个下载进程 1 条连接，监控面板 1 条。compose 里 `max_connections=300`，够 100 台 × 1 进程；进程更多时加 pgbouncer（transaction 模式） |
-| `shared_buffers` | compose 里是 1GB，按内存的 25% 左右调 |
+| 内存参数 | compose 按 16GB 内存的机器配：`shared_buffers=2GB`（约内存 1/4）、`effective_cache_size=8GB`（约 1/2）、`maintenance_work_mem=512MB`（导入建索引、清理更快）、`max_wal_size=4GB`（大批量导入少做检查点）。机器内存不同按比例调 |
+| `shm_size` | compose 里是 1g。Docker 默认只有 64MB，大查询会报 `could not resize shared memory` |
+| 监听地址 | 只有本机用时绑 `127.0.0.1`；多机时绑内网 IP（`-p <内网IP>:5432:5432`），可同时绑两个 |
 | 访问控制 | 5432 只对下载机和面板机所在的内网网段开放（云安全组 / 防火墙）。**Docker 发布的端口不受 ufw 控制**，要靠安全组 |
 | 主从 / 高可用 | 程序不需要。要高可用可配流复制，但 `dsn` 必须指向**主库**，程序不读从库 |
 | 已有 PG | 不用 compose 也行：建一个库和用户，`dsn` 指过去即可。表在第一次 `import` 时自动建 |
 
 ## 第一次导入之后
 
-表会自动建好。任务表的状态更新很频繁，执行一次让 autovacuum 跟得上：
-
-```sql
-ALTER TABLE pl_tasks SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
-```
-
-用了 `[pg] schema` 的话，先 `SET search_path TO <schema>;`。
+表会自动建好，不用手动执行任何 SQL。任务表状态更新频繁、行数上百万，建表时已把它的 autovacuum 阈值调到 2%（默认 20%，四百万行要攒八十万死行才清理一次）。
 
 ## 表都在哪
 
