@@ -66,6 +66,13 @@ CREATE TABLE IF NOT EXISTS pl_tasks (
 ALTER TABLE pl_tasks ADD COLUMN IF NOT EXISTS skip_reason text;
 ALTER TABLE pl_tasks ADD COLUMN IF NOT EXISTS source text;
 ALTER TABLE pl_tasks ADD COLUMN IF NOT EXISTS batch_no text;
+-- 状态更新频繁、行数上百万：默认 20% 死行才清理太迟，改 2%。已设过就不再 ALTER（免得每次启动抢锁）
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = 'pl_tasks'::regclass
+                   AND 'autovacuum_vacuum_scale_factor=0.02' = ANY (coalesce(reloptions, '{{}}'))) THEN
+        ALTER TABLE pl_tasks SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS pl_tasks_chunk   ON pl_tasks (chunk_id, challenge_count, id) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS pl_tasks_unchunk ON pl_tasks (batch, id) WHERE status = 'pending' AND chunk_id IS NULL;
 CREATE INDEX IF NOT EXISTS pl_tasks_status  ON pl_tasks (batch, status, error_kind);
