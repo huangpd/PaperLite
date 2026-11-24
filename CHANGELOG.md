@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 变更
+
+- `deploy/pg/docker-compose.yml` 的数据目录从 Docker 命名卷改为宿主机目录 `/data/paperlite-pg`（`.env` 里 `PG_DATA` 可改），在宿主机上直接看得到；`docs/guide/postgres.md` 写明数据在哪、怎么查。已经用命名卷跑着的不受影响。`.gitignore` 补上 `deploy/pg/.env`（存数据库密码）。
+
 ## [0.4.0] - 2026-11-24
 
 > 0.3.0 只改了版本号、没有发布到 PyPI；它的内容随本版一起发布（从 0.2.5 升级请同时看下面 0.3.0 的不兼容变更）。

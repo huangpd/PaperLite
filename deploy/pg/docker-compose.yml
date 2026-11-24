@@ -1,5 +1,6 @@
 # PostgreSQL（任务队列 + 监控面板数据）。用法见 docs/guide/postgres.md：
 #   echo "PG_PASS=$(openssl rand -hex 24)" > .env && chmod 600 .env && docker compose up -d
+# 数据在宿主机 /data/paperlite-pg（换位置：.env 里加 PG_DATA=/你的/目录），备份 / 迁移 / 看占用都看这个目录
 # 各机器 config.toml：[pg] dsn = "postgresql://paperlite:<PG_PASS>@<本机 IP>:5432/paperlite"
 services:
   postgres:
@@ -21,6 +22,6 @@ services:
     ports:
       - "5432:5432"                   # 只对内网开放：安全组 / 防火墙限制来源网段；也可写成 "<内网IP>:5432:5432" 只绑内网网卡
     volumes:
-      - pg-data:/var/lib/postgresql/data
-volumes:
-  pg-data:
+      # 左边是宿主机目录（数据实际存这里，不存在会自动建），右边是容器里 PG 的数据目录（固定，别改）。
+      # 别用 apt 装的 PostgreSQL 的 /var/lib/postgresql/16/main 去找，那是另一套、跟这里无关
+      - ${PG_DATA:-/data/paperlite-pg}:/var/lib/postgresql/data

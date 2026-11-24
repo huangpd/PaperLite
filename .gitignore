@@ -37,4 +37,5 @@ dist/
 deploy/monitor/certs/
 deploy/monitor/mq-certs/
 deploy/monitor/.env
+deploy/pg/.env
 *.key
