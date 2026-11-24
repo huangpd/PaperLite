@@ -9,7 +9,7 @@
 - 浏览器模式下载 PDF 的文件头校验改为和 curl 模式同一条规则：`%PDF-` 之前只允许空白 / BOM。以前浏览器模式只要求前 1024 字节里出现 `%PDF-`，正文里提到 `%PDF-` 的网页会被从那里截断存成 PDF；现在判为不是 PDF（`extract_failed`）。
 
 - 任务表 `pl_tasks` 建表时自动把 autovacuum 阈值设为 2%（以前要按文档手动执行 `ALTER TABLE`，容易漏）。已有的库下次启动时补上，只执行一次。
-- `deploy/pg/docker-compose.yml` 调整 PG 参数：`shared_buffers` 2GB、`effective_cache_size` 8GB、`maintenance_work_mem` 512MB、`max_wal_size` 4GB、`shm_size` 1g。
+- `deploy/pg/docker-compose.yml` 调整 PG 参数：`shared_buffers` 2GB、`effective_cache_size` 8GB、`maintenance_work_mem` 512MB、`max_wal_size` 4GB、`work_mem` 16MB、`random_page_cost` 1.1、`effective_io_concurrency` 200、预加载 `pg_stat_statements`、`shm_size` 1g、`oom_score_adj` -800。
 
 ### 内部
 
