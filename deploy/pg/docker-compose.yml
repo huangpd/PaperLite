@@ -1,6 +1,6 @@
 # PostgreSQL（任务队列 + 监控面板数据）。用法见 docs/guide/postgres.md：
 #   echo "PG_PASS=$(openssl rand -hex 24)" > .env && chmod 600 .env && docker compose up -d
-# 数据在宿主机 /data/paperlite-pg（换位置：.env 里加 PG_DATA=/你的/目录），备份 / 迁移 / 看占用都看这个目录
+# 数据在 Docker 卷 paperlite-pg-data，宿主机路径 /var/lib/docker/volumes/paperlite-pg-data/_data（看占用用这个；备份用 pg_dump）
 # 各机器 config.toml：[pg] dsn = "postgresql://paperlite:<PG_PASS>@<本机 IP>:5432/paperlite"
 services:
   postgres:
@@ -22,6 +22,13 @@ services:
     ports:
       - "5432:5432"                   # 只对内网开放：安全组 / 防火墙限制来源网段；也可写成 "<内网IP>:5432:5432" 只绑内网网卡
     volumes:
-      # 左边是宿主机目录（数据实际存这里，不存在会自动建），右边是容器里 PG 的数据目录（固定，别改）。
+      # 左边是 Docker 卷名（见文件末尾），右边是容器里 PG 的数据目录（固定，别改）。
       # 别用 apt 装的 PostgreSQL 的 /var/lib/postgresql/16/main 去找，那是另一套、跟这里无关
-      - ${PG_DATA:-/data/paperlite-pg}:/var/lib/postgresql/data
+      - pg-data:/var/lib/postgresql/data
+volumes:
+  pg-data:
+    # 固定卷名，不随 compose 项目名变：宿主机上就是 /var/lib/docker/volumes/paperlite-pg-data/_data。
+    # 已有同名卷（比如用 docker run -v paperlite-pg-data:... 起过）直接沿用，不用迁移。
+    # 别把这个 _data 目录当普通目录挂载（- /var/lib/docker/volumes/...:...）：那样卷看起来没人用，
+    # docker volume prune / docker system prune --volumes 会把它连数据一起删掉
+    name: paperlite-pg-data

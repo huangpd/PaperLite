@@ -25,13 +25,16 @@ echo "PG_PASS=$(openssl rand -hex 24)" > .env && chmod 600 .env
 docker compose up -d
 ```
 
-**数据存在宿主机的 `/data/paperlite-pg`**（compose 里 `volumes` 左边那一项；想放别处，在 `.env` 里加 `PG_DATA=/你的/目录`）。右边的 `/var/lib/postgresql/data` 是容器内部的路径，在宿主机上看不到。
+**数据存在 Docker 卷 `paperlite-pg-data` 里，宿主机路径是 `/var/lib/docker/volumes/paperlite-pg-data/_data`**（要 root 才能进）。compose 里 `volumes` 那一行右边的 `/var/lib/postgresql/data` 是容器内部的路径，在宿主机上看不到。卷名是固定的：以前用 `docker run -v paperlite-pg-data:/var/lib/postgresql/data` 起过的，换成 compose 会直接沿用原来的数据。
 
-不是用这份 compose 起的、而是用 Docker 命名卷（`-v 卷名:/var/lib/postgresql/data`）起的 PG，数据在 `/var/lib/docker/volumes/<卷名>/_data`。不确定时问容器：
+不确定数据在哪时问容器：
 
 ```bash
 docker inspect paperlite-pg --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
+du -sh /var/lib/docker/volumes/paperlite-pg-data/_data
 ```
+
+**别清理这个卷**：`docker volume prune`、`docker system prune --volumes` 会删掉没有容器在用的卷——PG 容器删掉重建的间隙里卷就是"没人用"的。清理 Docker 时只用 `docker image prune` / `docker container prune`。
 
 宿主机上如果还有 apt 装的 PostgreSQL，它的 `/var/lib/postgresql/16/main` 是另一套库，跟 PaperLite 无关。备份不要直接复制数据目录，用 `pg_dump`（见下面「备份」）。
 
