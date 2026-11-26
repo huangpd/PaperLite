@@ -6,14 +6,18 @@
 
 **English** | [简体中文](https://github.com/huangpd/PaperLite/blob/main/README.zh-CN.md)
 
-PaperLite is a high-volume downloader for PDFs and web pages served behind bot-protection layers such as Cloudflare. It drives real browsers through rotating short-lived proxies, keeps every task in a PostgreSQL queue shared by one or many machines, and resumes cleanly after interruption.
+**PaperLite** is a high-concurrency, distributed crawling cluster built for collecting tens of millions of papers and web pages. A fleet of fingerprinted real browsers, driven through rotating short-lived proxies, passes Cloudflare-class bot protection natively. Task scheduling, the identity pool and telemetry all live in a single PostgreSQL — no Redis, no message queue, no extra middleware — so one machine and a hundred machines run the same architecture.
 
-- **One config file, one batch.** URLs from any number of hosts go into one queue and run together.
-- **Real browsers by default.** Each worker owns one browser and one IP, passes the challenge once, then downloads continuously, following redirects and saving PDFs or full HTML pages.
-- **Resumable.** `Ctrl+C` returns in-flight tasks to the queue; running the same command again picks up where it stopped.
-- **One machine or many.** Every machine pointing at the same PostgreSQL batch takes chunks of work with a lease; add or remove machines at any time.
-- **Self-protecting.** Proxy health checks, IP rotation on mid-lease failure, a circuit breaker for exhausted proxy quotas, and heuristics that skip dead or duplicate content.
-- **Observable.** Per-task error classes and metrics in PostgreSQL, plus an optional fleet dashboard.
+## 🚀 Highlights
+
+- **Fingerprinted browser fleet.** Built on CloakBrowser's fingerprinted Chromium + Playwright. Each worker owns one browser and one exit IP, with timezone, locale and WebRTC aligned to that IP; it passes the challenge once, then downloads continuously and follows redirects.
+- **Streaming PDF capture.** PDFs are intercepted at the network layer over CDP and streamed to disk — no rendering, no clicking. HTML pages are saved whole.
+- **Distributed scheduling.** Work is handed out in leased chunks; machines join or leave at any time, and chunks from dead nodes are reclaimed by others. A single batch scales to tens of millions of tasks.
+- **Zero middleware.** Task queue, identity pool and telemetry all run on PostgreSQL (`SKIP LOCKED` claims + advisory-lock coordination). One database is the whole deployment.
+- **Two engines.** Browser mode (default) for mixed-host batches; curl mode turns browser-solved sessions into a cookie identity pool and downloads single-site batches at high speed with `curl_cffi` TLS impersonation.
+- **Self-healing.** Four-phase proxy probes (TCP / TLS / TTFB / total) with exit-IP verification, automatic IP rotation on mid-lease failure, a circuit breaker that stops burning proxy quota when fresh identities keep getting rejected, and title-duplicate rules that skip dead or duplicate content.
+- **Resumable.** `Ctrl+C` hands in-flight work back immediately; restarting picks up where it stopped. Results are written at least once, and duplicates are harmless.
+- **Observable end to end.** Per-task error classes and timings in the database, plus a real-time multi-machine dashboard (success rate, proxy quality, WAF mix, browser health).
 
 ## Installation
 
