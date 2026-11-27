@@ -127,6 +127,15 @@ curl 模式的身份池（`curl/identity.py`）和任务队列在同一个库、
 
 只管 PDF 直链。打开的是文章摘要页（要在页面上点"下载 PDF"）时记 `non_pdf`；按站点点按钮不做。
 
+## 浏览器模式收网页：等文档解析完、等正文，收页后再判能不能用
+
+`BrowserSession.render()` 判断"页面稳定可以收"的条件，以及 `browser/pool.py` 记成功前的检查：
+
+- **不是挑战页、没有待执行的 meta refresh、地址 `settle_s`（2 秒）不变**：防 HTTP 跳转、meta refresh、JS 改地址和 Cloudflare 挑战。挑战页判定只看响应头 `cf-mitigated`，挑战期间不在页面主环境执行 JS（会让挑战明显难过）。
+- **当前文档已解析完（DOMContentLoaded），且从最近一次换文档起计时**：过盾后真页面常与挑战页同一 URL，只看"地址不变"会在挑战期间就满足条件，真页面响应头一到就收页，存下的 HTML 只有 `<head>`（hw1 实测 OUP / Science / T&F 过盾后的首篇都这样）。
+- **要网页的任务再等正文**（`content_wait_s`，默认 10 秒）：站点自己（`rules.page.site_key` 相同）的 XHR / fetch / 脚本请求都结束、可见文字约 1 秒不变、且不少于 `min_page_text`（HTTP ≥ 400 不看字数），最多再等 `content_wait_s`。单页应用（IEEE Xplore 正文在页面加载完 5~10 秒后才由接口填进来）靠这条；服务端渲染的页面在那 2 秒地址稳定期里就满足，不多等。不用 `networkidle`：第三方统计/广告请求不断，很多页面永远等不到。网络状态只听 Playwright 事件，文字用 `page.content()` 取，都不在页面主环境执行 JS。
+- **收页后判能不能用**（`rules.page.page_problem`，状态 < 400 的页）：站点自己的人机验证页（OUP "Validate User"：状态 200、不带 `cf-mitigated`）按过盾失败处理，不存盘、不进巡检——同标题的验证页进巡检会被归纳成跳过规则；可见文字仍少于 `min_page_text` 的空壳按 `extract_failed` 重试。验证页只在正文很短（≤ 3000 字）时认，且只认较具体的说法，免得正常页面被误判。
+
 ## 流式下载
 
 超时按卡顿时长计算（`download_timeout_s` 内收不到数据），而不是总时长，因此慢代理上的大文件也能完整下载。有效 PDF 必须在前 1024 字节内包含 `%PDF-`。

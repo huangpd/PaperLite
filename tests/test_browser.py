@@ -10,7 +10,7 @@ from paperlite.config import Limits
 from paperlite.proxy import Lease
 from paperlite.rules.tasks import Status, pdf_path
 from tests.pgutil import make_source, needs_pg, row as pg_row, rows as pg_rows
-from tests.fakes import FAKE_PDF, PROXY
+from tests.fakes import FAKE_PDF, PROXY, page_html
 
 
 
@@ -115,7 +115,7 @@ class BrowserPoolTest(unittest.TestCase):
     def _ok(self, url):
         from paperlite.browser.session import RenderResult
         final = url + "#final"
-        return RenderResult(ok=True, seconds=1.0, url=final, status=200, title="Paper", html=f"<html>{url}</html>")
+        return RenderResult(ok=True, seconds=1.0, url=final, status=200, title="Paper", html=page_html(url))
 
     def test_downloads_pages_in_browser(self):
         urls = [f"https://www.sciencedirect.com/science/article/abs/pii/{i}" for i in range(3)]
@@ -126,7 +126,7 @@ class BrowserPoolTest(unittest.TestCase):
         self.assertEqual((r["status"], r["url_type"]), ("success", "html"))
         self.assertEqual(r["final_url"], urls[0] + "#final")
         self.assertEqual(Path(r["file_path"]).suffix, ".html")
-        self.assertEqual(Path(r["file_path"]).read_bytes(), f"<html>{urls[0]}</html>".encode())
+        self.assertEqual(Path(r["file_path"]).read_bytes(), page_html(urls[0]).encode())
 
     def test_realtime_inspector_stops_matching_pending_pages(self):
         from paperlite.browser.session import RenderResult
@@ -137,7 +137,7 @@ class BrowserPoolTest(unittest.TestCase):
 
         def cover(url):
             return RenderResult(ok=True, seconds=1.0, url=url, status=200,
-                                title="Outside Front Cover", html="<html>cover</html>")
+                                title="Outside Front Cover", html=page_html("cover"))
 
         pool = self.run_pool(cover, urls)
         self.assertEqual(pool.stats.success, 3)
@@ -214,6 +214,41 @@ class BrowserPoolTest(unittest.TestCase):
         self.assertEqual((pool.stats.success, pool.stats.failed, pool.stats.probe_failed), (0, 1, 3))
         r = self.row(url)
         self.assertEqual((r["status"], r["error_kind"], r["challenge_count"]), ("failed", "challenge_failed", 2))
+
+    def test_site_bot_check_page_is_not_success(self):
+        """状态 200 的站点人机验证页（OUP "Validate User"）：按过盾失败处理（首篇换 IP、之后计挑战次数），
+        不存盘、不记成功、不进巡检——同标题的验证页进巡检会被归纳成跳过规则。"""
+        from paperlite.browser.session import RenderResult
+        self.cfg = Limits(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, max_url_challenges=2,
+                          title_dup_trigger=2, title_window_size=10, rule_min_support=2, rule_min_precision=1.0)
+        urls = [f"https://academic.oup.com/jof/article/{i}" for i in range(3)]
+        bot = "<title>Validate User</title><body>We are experiencing unusual traffic. Confirm you are not a robot.</body>"
+        pool = self.run_pool(lambda u: RenderResult(ok=True, seconds=1.0, url=u, status=200, title="Validate User",
+                                                    html=bot), urls, n_leases=9)
+        self.assertEqual(pool.stats.success, 0)
+        rows = pg_rows(self.db)
+        self.assertTrue(all(r["status"] != "success" and r["file_path"] is None for r in rows))
+        self.assertTrue(any(r["error_kind"] == "challenge_failed" for r in rows))
+        self.assertEqual(self.db.q.skip_counts(), {})                       # 没被巡检归纳成跳过规则
+
+    def test_incomplete_page_retried_then_failed(self):
+        """正文没渲染出来的空壳（只有标题）：不记成功，按 extract_failed 重试，max_tries 用完判 failed。"""
+        from paperlite.browser.session import RenderResult
+        self.cfg = Limits(page_interval_s=(0, 0), pass_timeout_s=5, min_left_s=1, max_tries=2)
+        url = "https://ieeexplore.ieee.org/document/1/"
+        seen = {}
+
+        def resp(u, **kw):
+            seen.update(kw)
+            return RenderResult(ok=True, seconds=1.0, url=u, status=200, title="Hierarchical inference",
+                                html="<html><head><title>Hierarchical inference</title></head><body><div id=app></div></body></html>")
+        pool = self.run_pool(resp, [url])
+        r = self.row(url)
+        self.assertEqual((r["status"], r["error_kind"], r["retry_count"], r["file_path"]),
+                         ("failed", "extract_failed", 1, None))
+        self.assertIn("页面不完整", r["error_message"])
+        self.assertEqual(pool.stats.success, 0)
+        self.assertEqual((seen["content_wait_s"], seen["min_text"]), (10, 500))   # 要网页的任务让 render 等正文
 
     def test_first_page_failure_blamed_on_ip_not_task(self):
         """不热身：新浏览器第一篇就打不开 → 换 IP、任务放回不计次数；下一个 IP 打开了就照常连续下。"""

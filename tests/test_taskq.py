@@ -354,7 +354,7 @@ class PgTaskSourceTest(unittest.TestCase):
 
     def test_browser_pools_on_two_machines_share_one_batch(self):
         """浏览器模式：2 个 BrowserPool（模拟 2 台机器）各 2 个浏览器；标题各不相同，巡检开着也不跳过任何任务。"""
-        from tests.fakes import PROXY
+        from tests.fakes import PROXY, page_html
         from paperlite.browser import pool as bp
         from paperlite.browser.session import RenderResult
         from paperlite.config import Limits
@@ -372,7 +372,7 @@ class PgTaskSourceTest(unittest.TestCase):
             async def render(s, url, timeout_s, settle_s=2.0, **kw):
                 with lock:
                     hits[url] = hits.get(url, 0) + 1
-                return RenderResult(ok=True, seconds=0.1, url=url, status=200, title=f"P{url}", html="<html/>")
+                return RenderResult(ok=True, seconds=0.1, url=url, status=200, title=f"P{url}", html=page_html())
             async def close(s):
                 pass
 
@@ -430,7 +430,7 @@ class PgTaskSourceTest(unittest.TestCase):
 
     def test_browser_title_dup_skips_rest_in_chunk(self):
         """浏览器模式块内巡检：一段 URL 全是同一个"Deleted DOI"页，触发后本块里剩下的同前缀任务不再渲染。"""
-        from tests.fakes import PROXY
+        from tests.fakes import PROXY, page_html
         from paperlite.browser import pool as bp
         from paperlite.browser.session import RenderResult
         from paperlite.config import Limits
@@ -451,7 +451,7 @@ class PgTaskSourceTest(unittest.TestCase):
                 if "/pii/" in url:
                     rendered.append(url)
                 title = "Deleted DOI" if "/pii/A" in url else f"Paper {url[-3:]}"
-                return RenderResult(ok=True, seconds=0.1, url=url, status=200, title=title, html="<html/>")
+                return RenderResult(ok=True, seconds=0.1, url=url, status=200, title=title, html=page_html())
             async def close(s):
                 pass
 

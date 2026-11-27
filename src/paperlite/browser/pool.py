@@ -32,7 +32,7 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from paperlite.browser.session import BrowserSession
-from paperlite.rules.page import classify_html
+from paperlite.rules.page import classify_html, page_problem, visible_text_len
 from paperlite.config import Limits, ProxySettings
 from paperlite.taskq.title_dup import WindowInspector
 from paperlite.logutil import log_event
@@ -221,12 +221,22 @@ class BrowserPool:
         r = await session.render(task.url, self.cfg.pass_timeout_s,
                                  pdf_dest=pdf_path(self.out, task.doi) if want_pdf else None,
                                  max_bytes=self.cfg.max_file_size_mb * 1024 * 1024, min_bytes=self.cfg.min_file_size,
-                                 stall_s=self.cfg.download_timeout_s)
+                                 stall_s=self.cfg.download_timeout_s,
+                                 content_wait_s=0 if want_pdf else self.cfg.content_wait_s,
+                                 min_text=self.cfg.min_page_text)
         elapsed = int((time.monotonic() - t0) * 1000)
         host = urlsplit(task.url).hostname or ""
         code = r.status or 200
-        mon.page(host, passed=r.ok, ok=r.ok and code < 400, status=code if r.ok else None, waf=r.waf,
-                 elapsed_ms=elapsed, error="" if r.ok else r.error)
+        # 打开了、状态正常的网页也可能不能用：站点自己的人机验证页按过盾失败处理（换 IP / 计挑战次数，不进巡检，
+        # 否则同标题的验证页会被巡检归纳成跳过规则）；正文没渲染出来的空壳下面按 extract_failed 重试
+        problem = ""
+        if r.ok and r.pdf is None and not r.pdf_error and code < 400:
+            problem = page_problem(r.html, 0 if want_pdf else self.cfg.min_page_text)
+            if problem == "blocked":
+                r.ok, r.error = False, f"站点人机验证页: {r.title[:80]}"
+        mon.page(host, passed=r.ok, ok=r.ok and code < 400 and not problem, status=code if r.ok else None,
+                 waf=r.waf, elapsed_ms=elapsed,
+                 error=r.error if not r.ok else ("页面不完整" if problem else ""))
         if probe:
             if r.ok:                                   # 页面打开了（不管 HTTP 状态）：这个浏览器 + IP 可用
                 self._probe_streak[host] = 0
@@ -312,6 +322,20 @@ class BrowserPool:
             await self._observe(task, r)
             self.stats.add("non_pdf")
             logger.info("non_pdf %s %s %s", kind, task.url, r.title)
+            return "ok"
+
+        if problem == "incomplete":
+            msg = f"页面不完整：可见文字 {visible_text_len(r.html)} 字，少于 {self.cfg.min_page_text}（{r.title[:80]}）"
+            if task.retry_count + 1 < self.cfg.max_tries:
+                await asyncio.to_thread(self.db.retry_later, task, count=True, error_kind="extract_failed",
+                                        error_message=msg[:500], exit_ip=lease.exit_ip or None)
+                logger.info("%s %s，稍后重试 %s", name, msg, task.url)
+            else:
+                await asyncio.to_thread(self.db.finish, task, Status.FAILED, http_status=code, elapsed_ms=elapsed,
+                                        exit_ip=lease.exit_ip, error_kind="extract_failed", error_message=msg[:500],
+                                        final_url=r.url or None, title=r.title or None)
+                self.stats.add("failed")
+                logger.info("%s %s，判失败 %s", name, msg, task.url)
             return "ok"
 
         body = r.html.encode("utf-8")

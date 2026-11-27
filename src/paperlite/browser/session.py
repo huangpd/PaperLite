@@ -20,7 +20,9 @@ from typing import TYPE_CHECKING, Optional
 from paperlite.browser.env import browser_env
 from paperlite.config import ProxySettings
 from paperlite.errors import UserError
-from paperlite.rules.page import classify_waf
+from urllib.parse import urlsplit
+
+from paperlite.rules.page import classify_waf, site_key, visible_text_len
 from paperlite.proxy import Lease
 from paperlite.browser.turnstile import TurnstileClicker
 
@@ -46,12 +48,18 @@ class DocTracker:
         self.status: Optional[int] = None
         self.challenged: Optional[bool] = None     # 还没收到文档响应时为 None
         self.waf: str = ""                         # 本次导航途中见到的 WAF（监控用；跳转链上任一主文档识别到即记）
+        # 当前主文档有没有解析完（DOMContentLoaded）。过盾后真页面与挑战页常是同一 URL，只看"地址不变"会在
+        # 真页面响应头刚到、<body> 还没解析时就收页（实测存下的 HTML 只有 <head>）
+        self.loaded: bool = False
+        self.doc_at: float = 0.0                   # 最近一次主文档响应的时刻（monotonic）
         page.on("response", self._on_response)
+        page.on("domcontentloaded", self._on_dcl)
 
     def _on_response(self, resp) -> None:
         try:
             if resp.request.is_navigation_request() and resp.frame == self.page.main_frame:
                 self.url, self.status = resp.url, resp.status
+                self.loaded, self.doc_at = False, time.monotonic()
                 self.challenged = bool(resp.headers.get("cf-mitigated"))
                 waf = classify_waf(resp.headers)
                 if waf != "none" or not self.waf:
@@ -59,10 +67,50 @@ class DocTracker:
         except Exception:
             pass
 
+    def _on_dcl(self, _page=None) -> None:
+        self.loaded = True
+
     def reset(self) -> None:
         """下一次导航前清状态，避免用上一页的 challenged 判断新页（challenged=None 视作"跳转中"）。"""
         self.url, self.status, self.challenged = "", None, None
         self.waf = ""
+        self.loaded, self.doc_at = False, 0.0
+
+
+class SiteRequests:
+    """
+    记录页面发出、还没结束的 XHR / fetch / 脚本请求，供"内容是否加载完"判断：只算站点自己（与当前页面同一
+    site_key）的请求——单页应用（IEEE Xplore 等）靠它们拉正文；第三方统计/广告请求可能一直不断，不算。
+    只听 Playwright 的网络事件，不在页面里执行 JS。
+    """
+
+    TYPES = frozenset({"xhr", "fetch", "script"})
+    STALE_S = 15.0                                 # 挂这么久还没结束的（长轮询、推送）不再算"在加载"
+
+    def __init__(self, page) -> None:
+        self.page = page
+        self._open: dict = {}                      # request → (主机, 开始时刻)
+        page.on("request", self._on_request)
+        page.on("requestfinished", self._on_done)
+        page.on("requestfailed", self._on_done)
+
+    def _on_request(self, req) -> None:
+        try:
+            if req.resource_type in self.TYPES:
+                self._open[req] = (urlsplit(req.url).hostname or "", time.monotonic())
+        except Exception:
+            pass
+
+    def _on_done(self, req) -> None:
+        self._open.pop(req, None)
+
+    def pending(self) -> int:
+        site = site_key(urlsplit(self.page.url).hostname or "")
+        now = time.monotonic()
+        for req, (_, t) in list(self._open.items()):
+            if now - t > 60:                       # 漏了结束事件的，别一直占着
+                self._open.pop(req, None)
+        return sum(1 for h, t in self._open.values() if now - t <= self.STALE_S and site_key(h) == site)
 
 
 @dataclass
@@ -272,6 +320,7 @@ class BrowserSession:
         self.context = None
         self.page = None
         self.doc: Optional[DocTracker] = None
+        self.reqs: Optional[SiteRequests] = None
         self.clicker = None
 
     async def start(self) -> None:
@@ -287,14 +336,20 @@ class BrowserSession:
         self.context = await self.browser.new_context()
         self.page = await self.context.new_page()
         self.doc = DocTracker(self.page)
+        self.reqs = SiteRequests(self.page)
         self.clicker = TurnstileClicker()
 
     async def render(self, url: str, timeout_s: float, settle_s: float = 2.0, *, pdf_dest: Optional[Path] = None,
-                     max_bytes: int = 200 * 1024 * 1024, min_bytes: int = 1024, stall_s: float = 120) -> RenderResult:
+                     max_bytes: int = 200 * 1024 * 1024, min_bytes: int = 1024, stall_s: float = 120,
+                     content_wait_s: float = 0, min_text: int = 0) -> RenderResult:
         """
         在常驻浏览器里打开 url，让它自己完成跳转（HTTP 3xx、meta refresh、JS 跳转）和 Cloudflare 挑战
         （交互式 Turnstile 自动点），等页面不再是挑战页、无待执行 meta refresh、地址 settle_s 秒不变后返回。
         clicks 记本次新增的点击数。失败（超时/异常）时 ok=False，浏览器仍可复用于下一篇。
+
+        content_wait_s > 0（只用于要网页的任务）：地址稳定后再等正文加载完——站点自己的请求都结束、可见文字
+        约 1 秒不变、且不少于 min_text（HTTP ≥ 400 的错误页不看字数），最多再等 content_wait_s 秒，到时照常收页
+        （是否空壳由调用方用 rules.page.page_problem 判）。服务端渲染的页面在地址稳定的那 settle_s 秒里就满足，不多等。
 
         给了 pdf_dest：打开前开 CDP 拦截（pdf_capture.PdfCapture），途中任何一个响应是 PDF 就流式写到 pdf_dest，
         立刻返回（result.pdf）；最后停在网页上就照常返回网页（调用方按 non_pdf 处理）。
@@ -320,10 +375,13 @@ class BrowserSession:
                     raise
             deadline = t0 + timeout_s
             last_url, stable_since = "", time.monotonic()
+            wait_content = content_wait_s > 0 and capture is None
+            html, text_len, text_since = "", -1, 0.0
+            content_from: Optional[float] = None     # 地址稳定（可以收页）的时刻；内容等待从这里算
             while True:
                 if capture and capture.result.done():
                     break
-                busy = doc.challenged is not False
+                busy = doc.challenged is not False or not doc.loaded
                 if not busy:
                     try:
                         busy = bool(await page.evaluate(PENDING_REFRESH_JS))
@@ -332,8 +390,27 @@ class BrowserSession:
                 now = time.monotonic()
                 if page.url != last_url:
                     last_url, stable_since = page.url, now
+                stable_since = max(stable_since, doc.doc_at)          # 同一 URL 换了文档（过盾后）也重新计时
+                if busy:
+                    content_from, text_len = None, -1
+                elif wait_content:
+                    try:
+                        html = await page.content()
+                    except Exception:
+                        html = ""                 # 正在换文档
+                    n = visible_text_len(html)
+                    if n != text_len:
+                        text_len, text_since = n, now
                 if not busy and now - stable_since >= settle_s:
-                    break
+                    if not wait_content:
+                        break
+                    content_from = content_from or now
+                    enough = text_len >= min_text or (doc.status or 200) >= 400
+                    if (html and enough and now - text_since >= 1.0 and self.reqs.pending() == 0) \
+                            or now - content_from >= content_wait_s:
+                        break
+                if now > deadline and content_from is not None:
+                    break                         # 页面已可收，只是在等正文：到总时限就按现状收（空壳由调用方判）
                 if now > deadline and not (capture and capture.streaming):     # 正在写 PDF：慢但没坏，接着等
                     raise TimeoutError(f"{timeout_s:.0f}s 内页面未稳定（{await _title(page)!r}，{page.url[:120]}，点击 {clicker.clicks - clicks0} 次）")
                 if doc.challenged:
@@ -347,7 +424,7 @@ class BrowserSession:
             result.url = page.url
             result.status = doc.status
             result.title = await _title(page)
-            result.html = await page.content()
+            result.html = html if wait_content and html else await page.content()
             result.ok = True
             if capture:
                 result.pdf_error = capture.last_error
