@@ -114,6 +114,8 @@ class Limits:
     lease_ttl_s: float = 120          # 下载线程占用身份的心跳 TTL；进程崩溃后到期自动归还
     request_gap_s: tuple[float, float] = (3.0, 5.0)   # 同一 IP 两次请求的随机间隔
     page_interval_s: tuple[float, float] = (10.0, 30.0)   # 浏览器模式：同一浏览器两篇之间的随机间隔
+    content_wait_s: float = 10        # 浏览器模式：页面地址稳定后，最多再等这么久让 JS 把正文填完（站点自己的请求结束、文字不再变）；0 不等
+    min_page_text: int = 500          # 浏览器模式：网页可见文字少于这么多字算没渲染完整（空壳），不记成功、按 extract_failed 重试；0 不判
     connect_timeout_s: float = 15
     download_timeout_s: float = 120   # 流式下载的卡顿超时：连续这么久收不到数据才算超时（不是总时长上限）
     min_file_size: int = 1024         # PDF 小于此字节数视为不完整，计一次重试

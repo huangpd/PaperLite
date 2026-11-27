@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 浏览器模式不再把不能用的网页记成成功：
+  - 站点自己的人机验证页（如 OUP 的 "Validate User … unusual traffic"，状态 200、不带 `cf-mitigated`）按过盾失败处理——新浏览器首篇换 IP，之后计挑战次数，不存盘，也不进标题巡检（同标题的验证页以前可能被归纳成跳过规则）。hw1 上已记成功的 120 篇网页里有 19 篇是这种页面。
+  - 过盾后的真页面与挑战页常是同一 URL，以前"地址 2 秒不变"在挑战期间就已满足，真页面响应头一到就收页，存下的 HTML 只有 `<head>`。现在要等当前文档解析完（DOMContentLoaded），并从换文档时重新计时。
+  - 正文靠 JS 后加载的页面（IEEE Xplore 等）地址稳定后再等正文：站点自己的请求结束、可见文字约 1 秒不变且够字数才收页，最多再等 `content_wait_s`（默认 10 秒）；服务端渲染的页面不多等。
+  - 收页后可见文字仍少于 `min_page_text`（默认 500）的空壳不记成功，按 `extract_failed` 重试，用完 `max_tries` 记 `failed`。
+- `[limits]` 新增 `content_wait_s`、`min_page_text`，见 `docs/reference/configuration.md`。
+
 ### 变更
 
 - `deploy/pg/docker-compose.yml` 的数据卷固定命名为 `paperlite-pg-data`（宿主机 `/var/lib/docker/volumes/paperlite-pg-data/_data`），不再随 compose 项目名变成 `pg_pg-data`；用 `docker run -v paperlite-pg-data:...` 起过的 PG 换成 compose 直接沿用数据。`docs/guide/postgres.md` 写明数据在哪、怎么查、别 prune 卷。`.gitignore` 补上 `deploy/pg/.env`（存数据库密码）。

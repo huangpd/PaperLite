@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from paperlite.browser.session import RenderResult
+from tests.fakes import page_html
 from paperlite.rules.page import classify_waf
 from paperlite.monitor import reporter as mon
 from paperlite.monitor import schema
@@ -375,7 +376,7 @@ class BrowserPoolMonitorWiringTest(unittest.TestCase):
     def test_success_404_and_timeout(self):
         url = "https://www.sciencedirect.com/science/article/pii/S1"
         pool = self._pool(url)
-        p = self._run(pool, RenderResult(ok=True, seconds=1, status=200, url=url, title="T", html="x",
+        p = self._run(pool, RenderResult(ok=True, seconds=1, status=200, url=url, title="T", html=page_html(),
                                          waf="cloudflare"))
         args, kw = p.call_args
         self.assertEqual(args[0], "www.sciencedirect.com")
@@ -406,7 +407,7 @@ class BrowserPoolMonitorWiringTest(unittest.TestCase):
                 pass
             async def render(s, url, timeout_s, settle_s=2.0, **kw):
                 seen.append(pool.online())
-                return RenderResult(ok=True, seconds=1, status=200, url=url, title="T", html="x", waf="none")
+                return RenderResult(ok=True, seconds=1, status=200, url=url, title="T", html=page_html(), waf="none")
             async def close(s):
                 pass
 

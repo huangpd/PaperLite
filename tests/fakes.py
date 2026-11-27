@@ -7,6 +7,14 @@ from paperlite.curl.identity import Identity
 from paperlite.config import ProxySettings
 
 FAKE_PDF = b"%PDF-1.4\n" + b"0" * 2048          # 超过最小文件大小（1024 字节）
+# 浏览器模式的"正常网页"：可见文字够 min_page_text（默认 500），不会被当成空壳
+PAGE_TEXT = "Abstract. This paper studies an example problem in detail. " * 12
+
+
+def page_html(head: str = "") -> str:
+    return f"<html><head><title>Paper</title></head><body>{head} {PAGE_TEXT}</body></html>"
+
+
 PROXY = ProxySettings(api_url="https://api.example/get?key=k", username="u", password="p@ss")
 
 

@@ -1,7 +1,7 @@
 """rules/：URL 校验（tasks.py）、页面判定（page.py）、PDF 文件头（pdf.py）。"""
 import unittest
 
-from paperlite.rules.page import classify_html
+from paperlite.rules.page import classify_html, page_problem, site_key, visible_text_len
 from paperlite.rules.tasks import url_problem
 
 
@@ -18,6 +18,45 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(classify_html("<title>ACM Error: IP blocked</title>"), "blocked")
         # 导航栏的 Basic Edition 每页都有，不算订阅
         self.assertEqual(classify_html(f"<title>Paper</title>{self.NAV}"), "landing_page")
+
+
+class PageProblemTest(unittest.TestCase):
+    """浏览器拿到的网页能不能记成功（hw1 实测样本的缩写）。"""
+
+    ARTICLE = "<html><head><title>Paper</title><script>var x='" + "s" * 5000 + "'</script></head><body>" \
+              + "Abstract. Results and discussion. " * 30 + "</body></html>"
+
+    def test_visible_text_skips_scripts_and_tags(self):
+        self.assertEqual(visible_text_len("<title>T</title><script>abc</script><style>p{}</style><p> a  b </p>"),
+                         len("T a b"))
+
+    def test_normal_article(self):
+        self.assertEqual(page_problem(self.ARTICLE, 500), "")
+
+    def test_site_bot_check_is_blocked(self):
+        # OUP 的人机验证页：状态 200、无 cf-mitigated，hw1 上 120 篇"成功"里有 19 篇是它
+        oup = ("<html><head><title>Validate User</title></head><body><h1>Validate User</h1>We are sorry, but we "
+               "are experiencing unusual traffic at this time. Please help us confirm that you are not a robot "
+               "and we will take you to your content.<form id='captchaForm'></form></body></html>")
+        self.assertEqual(page_problem(oup, 500), "blocked")
+        self.assertEqual(page_problem(oup, 0), "blocked")          # 不判空壳时也认验证页
+
+    def test_long_article_mentioning_captcha_is_fine(self):
+        self.assertEqual(page_problem(self.ARTICLE.replace("Results", "CAPTCHA results"), 500), "")
+
+    def test_shells_are_incomplete(self):
+        head_only = "<html><head><title>Influence of Insects | Journal of Forestry</title><script></script></head>"
+        spa_shell = "<html><head><title>Hierarchical inference | IEEE Xplore</title></head><body><div id=app></div></body></html>"
+        self.assertEqual(page_problem(head_only, 500), "incomplete")
+        self.assertEqual(page_problem(spa_shell, 500), "incomplete")
+        self.assertEqual(page_problem(spa_shell, 0), "")             # min_text=0 关闭
+
+    def test_site_key(self):
+        self.assertEqual(site_key("ieeexplore.ieee.org"), "ieee.org")
+        self.assertEqual(site_key("ieee.org"), "ieee.org")
+        self.assertEqual(site_key("www.jstage.jst.go.jp"), "jst.go.jp")
+        self.assertEqual(site_key("www.ox.ac.uk"), "ox.ac.uk")
+        self.assertNotEqual(site_key("www.google-analytics.com"), site_key("www.sciencedirect.com"))
 
 
 class UrlProblemTest(unittest.TestCase):

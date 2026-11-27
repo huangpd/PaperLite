@@ -7,6 +7,8 @@ paperlite/rules/page.py
 
   is_challenge / is_cf_denied   响应是不是 Cloudflare 挑战页 / 封禁页（curl 模式判身份）
   classify_waf                  站点前面是哪家 WAF（仅供监控统计）
+  visible_text_len / site_key   页面可见文字长度、主机的站点键（浏览器模式等内容加载完时用）
+  page_problem                  浏览器拿到的网页能不能记成功：站点人机验证页（blocked）、没渲染出正文的空壳（incomplete）
   classify_html                 PDF 链接返回 HTML 时判断原因，写进 error_kind（取值与 paper_downloader 站点监控一致）：
                                   not_found     站点 404 页（DOI 不存在）
                                   blocked       站点封了该 IP（ACM："IP blocked"）
@@ -27,6 +29,55 @@ _BLOCKED_MARKERS = ("IP blocked",)
 def page_title(html: str) -> str:
     m = _TITLE_RE.search(html)
     return " ".join(m.group(1).split()) if m else ""
+
+
+_HIDDEN_RE = re.compile(r"(?is)<(script|style|noscript|template)\b[^>]*>.*?</\1\s*>")
+_TAG_RE = re.compile(r"(?s)<[^>]+>")
+_TWO_LEVEL = {"ac", "co", "com", "edu", "gov", "go", "ne", "net", "or", "org"}
+
+# 站点自己的人机验证 / 限流页（不是 Cloudflare 挑战：响应头不带 cf-mitigated，状态码常是 200）。
+# 只在正文很短的页面上认、只用较具体的说法（不单认 captcha），免得正常页面被误判
+_BOT_TITLES = ("validate user", "just a moment", "attention required", "access denied", "are you a robot",
+               "robot check", "security check", "bot verification", "verify you are human", "request rejected")
+_BOT_TEXTS = ("unusual traffic", "not a robot", "verify you are human", "verify you are a human",
+              "complete the security check", "automated requests")
+_BOT_MAX_TEXT = 3000
+
+
+def visible_text(html: str) -> str:
+    """去掉脚本、样式和标签后的可见文字（含 <title>），空白压成单个空格。"""
+    return " ".join(_TAG_RE.sub(" ", _HIDDEN_RE.sub(" ", html or "")).split())
+
+
+def visible_text_len(html: str) -> int:
+    return len(visible_text(html))
+
+
+def site_key(host: str) -> str:
+    """主机所属站点（粗略的可注册域名）：ieeexplore.ieee.org → ieee.org，www.jstage.jst.go.jp → jst.go.jp。
+    用来区分"站点自己的数据请求"和第三方统计/广告请求；不求精确，判错只影响多等或少等几秒。"""
+    labels = (host or "").lower().rstrip(".").split(".")
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _TWO_LEVEL:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def page_problem(html: str, min_text: int) -> str:
+    """
+    浏览器打开、HTTP 状态正常（< 400）的网页能不能记成功：
+      blocked     站点人机验证 / 限流页（OUP "Validate User"…unusual traffic），换 IP 重来
+      incomplete  可见文字少于 min_text：正文没渲染出来（JS 页面还在加载、文档只解析了 <head>）
+      ""          正常
+    min_text <= 0 时不判 incomplete。
+    """
+    text = visible_text(html)
+    if len(text) <= _BOT_MAX_TEXT:
+        title, low = page_title(html).lower(), text.lower()
+        if any(t in title for t in _BOT_TITLES) or any(t in low for t in _BOT_TEXTS):
+            return "blocked"
+    if min_text > 0 and len(text) < min_text:
+        return "incomplete"
+    return ""
 
 
 def classify_html(html: str) -> str:
