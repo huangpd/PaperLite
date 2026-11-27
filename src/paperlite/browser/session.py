@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CLEARANCE = "cf_clearance"
+_REQ_GRACE_S = 2.0          # 正文已够字数且稳定时，最多再等站点在途请求这么久
 
 
 class DocTracker:
@@ -347,8 +348,9 @@ class BrowserSession:
         （交互式 Turnstile 自动点），等页面不再是挑战页、无待执行 meta refresh、地址 settle_s 秒不变后返回。
         clicks 记本次新增的点击数。失败（超时/异常）时 ok=False，浏览器仍可复用于下一篇。
 
-        content_wait_s > 0（只用于要网页的任务）：地址稳定后再等正文加载完——站点自己的请求都结束、可见文字
-        约 1 秒不变、且不少于 min_text（HTTP ≥ 400 的错误页不看字数），最多再等 content_wait_s 秒，到时照常收页
+        content_wait_s > 0（只用于要网页的任务）：地址稳定后再等正文加载完——可见文字约 1 秒不变（±2%）、不少于
+        min_text（HTTP ≥ 400 的错误页不看字数），且站点自己的请求都结束（字数够时最多再给它们 2 秒），
+        最多再等 content_wait_s 秒，到时照常收页
         （是否空壳由调用方用 rules.page.page_problem 判）。服务端渲染的页面在地址稳定的那 settle_s 秒里就满足，不多等。
 
         给了 pdf_dest：打开前开 CDP 拦截（pdf_capture.PdfCapture），途中任何一个响应是 PDF 就流式写到 pdf_dest，
@@ -399,14 +401,17 @@ class BrowserSession:
                     except Exception:
                         html = ""                 # 正在换文档
                     n = visible_text_len(html)
-                    if n != text_len:
+                    if abs(n - text_len) > max(50, text_len // 50):     # 2% 以内的变动（计数器、广告）算没变
                         text_len, text_since = n, now
                 if not busy and now - stable_since >= settle_s:
                     if not wait_content:
                         break
                     content_from = content_from or now
                     enough = text_len >= min_text or (doc.status or 200) >= 400
-                    if (html and enough and now - text_since >= 1.0 and self.reqs.pending() == 0) \
+                    # 字数够且 1 秒没变：站点请求都结束就收；还有请求在途也最多再给 _REQ_GRACE_S
+                    # （服务端渲染的页面常有站点自己的埋点/推荐脚本迟迟不结束，不必等它们）
+                    settled = html and enough and now - text_since >= 1.0
+                    if (settled and (self.reqs.pending() == 0 or now - content_from >= _REQ_GRACE_S)) \
                             or now - content_from >= content_wait_s:
                         break
                 if now > deadline and content_from is not None:
